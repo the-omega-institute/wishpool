@@ -1,0 +1,14 @@
+# TeX Live's font and format caches, kept across worker restarts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wishpool-tex-cache
+  namespace: wishpool
+  labels:
+    app.kubernetes.io/name: wishpool-worker
+    app.kubernetes.io/part-of: wishpool
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi

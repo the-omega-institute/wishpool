@@ -1,0 +1,82 @@
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    # rsa is a dev-dependency only (cargo tree -i rsa -e normal is empty): the
+    # NyxID sign-in tests generate a throwaway signing key at runtime. No
+    # shipped binary performs RSA private-key operations, so the network
+    # timing side channel this advisory describes has nothing to observe.
+    # Production verifies RS256 with jsonwebtoken's aws-lc-rs backend.
+    { id = "RUSTSEC-2023-0071", reason = "dev-only test key generation; no private-key operation in shipped code" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+# An allowance that never matches is not an error. The list is deliberately
+# broader than today's graph so adding a dependency does not fail the build for
+# a licence we already accept.
+unused-allowed-license = "allow"
+# Workspace crates are publish = false and carry no licence field; cargo-deny
+# would otherwise report them as unlicensed.
+private = { ignore = true }
+
+# One narrowly scoped exception, not a widened allowlist.
+#
+# tiny-keccak is CC0-1.0, which is a public-domain dedication and strictly more
+# permissive than anything already allowed. It is absent from the list only
+# because nothing had pulled it in before.
+#
+# It reaches us solely through a proc-macro's build-time tree:
+#   mongodb -> mongodb-internal-macros -> macro_magic -> const-random -> tiny-keccak
+# so it is never linked into a shipped artifact and carries no distribution
+# obligation. Scoped to this one crate deliberately: a blanket CC0-1.0 entry, or
+# skipping build dependencies wholesale, would hide the next such arrival.
+[[licenses.exceptions]]
+name = "tiny-keccak"
+allow = ["CC0-1.0"]
+
+# A second narrowly scoped exception, on the same terms.
+#
+# webpki-roots is Mozilla's CA root store. Its licence is CDLA-Permissive-2.0
+# because the crate is data rather than code: the certificates are the content,
+# and that licence exists for exactly this case. It is permissive — use,
+# modification and redistribution are granted with no copyleft and no
+# obligation beyond preserving disclaimers — so it is no more restrictive than
+# anything already allowed.
+#
+# Unlike tiny-keccak this one *is* linked into shipped binaries, which is why it
+# is stated explicitly rather than waved through as a build dependency. It is
+# the trust anchor set for outbound TLS and arrives through two independent
+# paths:
+#   mongodb  -> webpki-roots
+#   reqwest  -> hyper-rustls -> webpki-roots
+# Removing it would mean shipping without a CA bundle or sourcing one at
+# runtime, both of which are worse than accepting a permissive data licence.
+#
+# Scoped to this crate on purpose: a blanket CDLA-Permissive-2.0 entry would
+# silently accept the next piece of bundled data, which is the thing this gate
+# exists to make someone look at.
+[[licenses.exceptions]]
+name = "webpki-roots"
+allow = ["CDLA-Permissive-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Intra-workspace path dependencies carry no version and would otherwise be
+# reported as wildcards.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

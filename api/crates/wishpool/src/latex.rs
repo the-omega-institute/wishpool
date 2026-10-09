@@ -1,0 +1,174 @@
+//! LaTeX sources through Layer 3: reading the structure for Layer 2, the
+//! inlined text for review models, and compiling the PDF.
+
+use std::{path::PathBuf, time::Duration};
+
+use wishpool_core::{
+    model::ClaimKind,
+    ports::{PaperReader, ReadPaper, ReadStatement},
+};
+use wishpool_latex::{
+    LatexError, StatementKind,
+    archive::{Limits, unpack},
+    compile::Compiler,
+    parse,
+};
+
+fn kind(kind: StatementKind) -> ClaimKind {
+    match kind {
+        StatementKind::Theorem => ClaimKind::Theorem,
+        StatementKind::Proposition => ClaimKind::Proposition,
+        StatementKind::Lemma => ClaimKind::Lemma,
+        StatementKind::Corollary => ClaimKind::Corollary,
+        StatementKind::Claim => ClaimKind::Claim,
+        StatementKind::Conjecture => ClaimKind::Conjecture,
+        StatementKind::Question => ClaimKind::Question,
+    }
+}
+
+fn reason(error: LatexError) -> String {
+    match error {
+        LatexError::Archive(e) => format!("the upload could not be unpacked: {e}"),
+        LatexError::NoMainFile(e) => format!("no main .tex file: {e}"),
+        LatexError::Compile(e) => e,
+    }
+}
+
+pub struct LatexReader;
+
+impl PaperReader for LatexReader {
+    fn read(&self, bytes: &[u8], filename: &str) -> Result<ReadPaper, String> {
+        let files = unpack(bytes, filename, Limits::default()).map_err(reason)?;
+        let paper = parse::parse(&files).map_err(reason)?;
+        Ok(ReadPaper {
+            main_file: paper.main_file,
+            title: paper.title,
+            authors: paper.authors,
+            abstract_text: paper.abstract_text,
+            statements: paper
+                .statements
+                .into_iter()
+                .map(|s| ReadStatement {
+                    kind: kind(s.kind),
+                    display_name: s.display_name,
+                    title: s.title,
+                    latex_label: s.label,
+                    body: s.body,
+                    has_proof: s.has_proof,
+                    section: s.section,
+                })
+                .collect(),
+            macros: paper.macros,
+            warnings: paper.warnings,
+        })
+    }
+}
+
+/// The source with inputs inlined and comments removed, for review models.
+pub fn source_text(bytes: &[u8], filename: &str) -> Result<String, String> {
+    let files = unpack(bytes, filename, Limits::default()).map_err(reason)?;
+    let main = parse::main_file(&files).map_err(reason)?;
+    let mut warnings = Vec::new();
+    Ok(parse::strip_comments(&parse::expand(
+        &files,
+        &main,
+        &mut warnings,
+    )))
+}
+
+/// A search query from a statement: its words without math or commands,
+/// or `fallback` when too few remain.
+pub fn search_query(statement: &str, fallback: &str) -> String {
+    let text = parse::plain(statement);
+    let mut words = Vec::new();
+    let mut in_math = false;
+    for token in text.split_whitespace() {
+        let dollars = token.matches('$').count();
+        let was_math = in_math;
+        if dollars % 2 == 1 {
+            in_math = !in_math;
+        }
+        if was_math || dollars > 0 || token.starts_with('\\') {
+            continue;
+        }
+        let word: String = token
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .collect();
+        if word.len() > 2 {
+            words.push(word);
+        }
+    }
+    if words.len() < 4 {
+        return fallback.to_owned();
+    }
+    words.truncate(20);
+    words.join(" ")
+}
+
+pub struct Compile {
+    /// The TeX Live bin directory.
+    pub tex_bin: PathBuf,
+    /// Writable cache for TeX's fonts and formats.
+    pub cache_dir: PathBuf,
+    /// Extra texmf tree with packages beyond the distribution.
+    pub texmf_home: Option<PathBuf>,
+    pub timeout: Duration,
+}
+
+impl Compile {
+    /// Compile an uploaded source in a fresh temporary directory. Runs on a
+    /// blocking thread. `Err` carries the message for the author.
+    pub async fn pdf(&self, bytes: Vec<u8>, filename: String) -> Result<Vec<u8>, String> {
+        let compiler = Compiler {
+            bin_dir: self.tex_bin.clone(),
+            cache_dir: self.cache_dir.clone(),
+            texmf_home: self.texmf_home.clone(),
+            timeout: self.timeout,
+        };
+        tokio::task::spawn_blocking(move || {
+            let files = unpack(&bytes, &filename, Limits::default()).map_err(reason)?;
+            let main = parse::main_file(&files).map_err(reason)?;
+            let work = tempfile::tempdir().map_err(|e| e.to_string())?;
+            compiler
+                .compile(&files, &main, work.path())
+                .map(|c| c.pdf)
+                .map_err(reason)
+        })
+        .await
+        .map_err(|e| format!("the compiler task failed: {e}"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queries_drop_math_and_commands() {
+        let q = search_query(
+            "For every prime $p > 3$ the gap \\emph{between} consecutive zero runs is bounded by a constant",
+            "Title",
+        );
+        assert!(!q.contains('$') && !q.contains('>'), "{q}");
+        assert!(q.starts_with("For every prime the gap"), "{q}");
+        assert_eq!(search_query("$x$", "Title"), "Title");
+    }
+
+    #[test]
+    fn reads_a_single_file_paper() {
+        let source = br"\documentclass{article}
+\newtheorem{theorem}{Theorem}
+\title{Gaps}\author{A. Author}
+\begin{document}\maketitle
+\begin{theorem}\label{thm:main} Every gap is finite. \end{theorem}
+\begin{proof} Trivial. \end{proof}
+\end{document}";
+        let read = LatexReader.read(source, "paper.tex").unwrap();
+        assert_eq!(read.title.as_deref(), Some("Gaps"));
+        assert_eq!(read.statements.len(), 1);
+        assert_eq!(read.statements[0].kind, ClaimKind::Theorem);
+        assert!(read.statements[0].has_proof);
+        assert!(LatexReader.read(b"not latex", "paper.tex").is_err());
+    }
+}

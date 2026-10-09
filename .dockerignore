@@ -1,0 +1,5 @@
+api/target
+web/node_modules
+web/dist
+.git
+sdk/*/target

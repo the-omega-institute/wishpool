@@ -1,0 +1,47 @@
+[package]
+name = "wishpool"
+description = "Composition, persistence, NyxID sign-in and production adapters."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wishpool"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = "0.10"
+wishpool-core = { workspace = true }
+wishpool-public = { workspace = true }
+wishpool-review = { workspace = true }
+wishpool-latex = { workspace = true }
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+base64 = { workspace = true }
+bson = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+jsonwebtoken = { workspace = true }
+mongodb = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = "3"
+url = { workspace = true }
+
+[dev-dependencies]
+rsa = { version = "0.9", features = ["pem"] }
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }

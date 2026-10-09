@@ -1,0 +1,18 @@
+[package]
+name = "wishpool-latex"
+description = "Layer 3: read a LaTeX paper (single file, zip or tar.gz) into its title, abstract and statement environments; compile it to PDF with TeX Live."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+flate2 = "1"
+serde = { workspace = true }
+tar = "0.4"
+thiserror = { workspace = true }
+zip = { version = "6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+tempfile = "3"

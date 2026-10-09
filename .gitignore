@@ -1,0 +1,10 @@
+/api/target/
+/web/node_modules/
+/web/dist/
+/web/coverage/
+.DS_Store
+*.log
+.env
+.env.*
+.gstack/
+/sdk/*/target/

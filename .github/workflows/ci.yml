@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  structure:
+    name: Repository structure and layer rule
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Root contains only the allowed entries
+        run: |
+          allowed=".git .github .gitignore .dockerignore CLAUDE.md README.md api web sdk infra docs"
+          for entry in $(ls -A); do
+            case " $allowed " in *" $entry "*) ;; *) echo "::error::unexpected root entry: $entry"; exit 1 ;; esac
+          done
+      - name: infra contains only the fixed file list
+        run: |
+          expected="infra/api/Dockerfile infra/api/configmap.yaml infra/api/deployment.yaml infra/api/secret.yaml infra/api/service.yaml infra/web/Dockerfile infra/web/deployment.yaml infra/web/nginx.conf infra/web/service.yaml infra/worker/deployment.yaml infra/worker/pvc.yaml"
+          actual=$(find infra -type f | sort | tr '\n' ' ')
+          [ "$(echo $expected | tr ' ' '\n' | sort | tr '\n' ' ')" = "$actual" ] || { echo "::error::infra/ diverged: $actual"; exit 1; }
+      - name: Layer dependency rule
+        run: |
+          production_dependencies() {
+            awk '/^\[dependencies\]$/ { d=1; next } /^\[/ { d=0 } d { print }' "$1"
+          }
+          fail=0
+          production_dependencies api/crates/layer2-core/Cargo.toml | grep -qE 'wishpool-(public|review|latex)|mongodb|axum|reqwest|jsonwebtoken' \
+            && { echo "::error::layer2-core must not depend on Layer 1, Layer 3 or I/O crates"; fail=1; }
+          production_dependencies api/crates/layer1-public/Cargo.toml | grep -qE 'wishpool-(review|latex)|mongodb|reqwest' \
+            && { echo "::error::layer1-public may depend only on layer2-core"; fail=1; }
+          for crate in layer3-review layer3-latex; do
+            production_dependencies api/crates/$crate/Cargo.toml | grep -qE 'wishpool-(core|public)' \
+              && { echo "::error::$crate must not depend on Layer 1 or Layer 2"; fail=1; }
+          done
+          exit $fail
+      - name: Every config key is declared in infra
+        run: |
+          keys=$(grep -ohE '"(WISHPOOL|CHRONO)_[A-Z_]+"' api/crates/wishpool/src/config.rs | tr -d '"' | sort -u)
+          for key in $keys; do
+            grep -q "^  $key:" infra/api/configmap.yaml infra/api/secret.yaml || { echo "::error::$key missing from infra/api"; exit 1; }
+          done
+
+  api:
+    name: API (fmt, clippy, tests, deny)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: api
+    services:
+      mongo:
+        image: mongo:8.0
+        ports: ["27017:27017"]
+    env:
+      WISHPOOL_TEST_MONGODB_URI: mongodb://127.0.0.1:27017
+      WISHPOOL_TEST_TEX_BIN: /usr/bin
+    steps:
+      - uses: actions/checkout@v4
+      - name: TeX Live for the compile tests
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends texlive-latex-base
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: api
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --workspace
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: api/Cargo.toml
+
+  sdk:
+    name: Contributor SDK (fmt, clippy, tests)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sdk/contribute
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sdk/contribute
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  web:
+    name: Web (format, lint, types, tests, build, audit)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test
+      - run: npm run build
+      - run: npm audit --audit-level=high
+
+  secrets:
+    name: Secret scanning
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  images:
+    name: Images and manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - run: docker build -f infra/api/Dockerfile -t wishpool-api:ci .
+      - run: docker build -f infra/web/Dockerfile -t wishpool-web:ci .
+      - name: kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          ./kubeconform -strict -summary infra/api/*.yaml infra/web/*.yaml infra/worker/*.yaml

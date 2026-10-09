@@ -1,0 +1,58 @@
+# Every non-secret key read by api/crates/wishpool/src/config.rs. The worker
+# deployment uses the same map and overrides WISHPOOL_ROLE.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: wishpool-api
+  namespace: wishpool
+  labels:
+    app.kubernetes.io/name: wishpool-api
+    app.kubernetes.io/part-of: wishpool
+data:
+  WISHPOOL_BIND: "0.0.0.0:8080"
+  WISHPOOL_PUBLIC_URL: "https://wishpool.example.org"
+  WISHPOOL_ROLE: "api"
+  WISHPOOL_STORAGE: "mongo"
+  WISHPOOL_MONGODB_DATABASE: "wishpool"
+  WISHPOOL_AUTH_MODE: "nyxid"
+  CHRONO_NYXID_BASE_URL: "https://nyx.chrono-ai.fun"
+  # Comma-separated NyxID subjects granted Admin on sign-in.
+  WISHPOOL_ADMIN_SUBJECTS: ""
+  WISHPOOL_REVIEW_ACCOUNT: "wishpool:review-engine"
+  # OpenAI-compatible base URL of the review model; the NyxID LLM gateway.
+  WISHPOOL_REVIEW_MODEL_BASE_URL: "https://nyx.chrono-ai.fun/api/v1/llm/gateway/v1"
+  WISHPOOL_REVIEW_MODEL: "claude-opus-5-5"
+  # LaTeX compilation (worker role) with the image's TeX Live; font and
+  # format caches live on the worker volume.
+  WISHPOOL_TEX_BIN: "/usr/bin"
+  WISHPOOL_TEX_CACHE: "/var/cache/texmf"
+  # Optional extra texmf tree for packages beyond the image's TeX Live.
+  WISHPOOL_TEXMF_HOME: ""
+  WISHPOOL_COMPILE_TIMEOUT_SECS: "180"
+  # Donated quota through NyxID delegated access; off until confirmed with
+  # the NyxID owners.
+  WISHPOOL_HOSTED_DONATIONS: "false"
+  WISHPOOL_LLM_GATEWAY_URL: "https://nyx.chrono-ai.fun/api/v1/llm/gateway/v1"
+  WISHPOOL_DONATION_SCOPE: "openid offline_access proxy"
+  WISHPOOL_DONATION_SERVICE_IDS: ""
+  WISHPOOL_DONATION_MODEL: "claude-opus-5-5"
+  WISHPOOL_HOSTED_INTERVAL_SECS: "30"
+  WISHPOOL_OPENALEX_URL: "https://api.openalex.org"
+  RUST_LOG: "info"
+  # Referee rounds are opt-in. CLI modes are refused on this production bind.
+  WISHPOOL_ORACLE: ""
+  WISHPOOL_ORACLE_BASE_URL: "https://nyx.chrono-ai.fun"
+  WISHPOOL_ORACLE_POOL: "chrono-chatgpt-pro-500-pool,company-chatgpt-pro"
+  WISHPOOL_ORACLE_MODEL: "chatgpt-6-pro"
+  WISHPOOL_ORACLE_CLI: "nyxid"
+  WISHPOOL_ORACLE_POLL_SECS: "60"
+  WISHPOOL_REFEREE_ACCOUNT: "wishpool:referee"
+  WISHPOOL_ADVISOR: ""
+  WISHPOOL_CODEX_BIN: "codex"
+  WISHPOOL_CODEX_MODEL: ""
+  WISHPOOL_ADVISOR_MODEL: "gpt-5.5"
+  WISHPOOL_ADVISOR_TIMEOUT_SECS: "1200"
+  WISHPOOL_ADVISOR_WORK_DIR: "/tmp/wishpool-advisor"
+  WISHPOOL_LEAN_WORKSPACE: ""
+  # Codex: at most 1200 seconds; the whole formal step is bounded by 25 minutes.
+  WISHPOOL_FORMAL_TIMEOUT_SECS: "1200"
