@@ -14,6 +14,59 @@ use crate::{
 };
 
 impl App {
+    pub async fn agent_steps(
+        &self,
+        caller: &Caller,
+        id: &SubmissionId,
+    ) -> CoreResult<std::collections::BTreeMap<String, crate::model::AgentStep>> {
+        caller.require(Role::Reviewer)?;
+        self.submission(caller, id).await?;
+        Ok(self.referee_file(id).await?.0.agent_steps)
+    }
+
+    pub async fn agent_step(
+        &self,
+        caller: &Caller,
+        id: &SubmissionId,
+        key: &str,
+    ) -> CoreResult<Option<crate::model::AgentStep>> {
+        caller.require(Role::Reviewer)?;
+        self.submission(caller, id).await?;
+        Ok(self.referee_file(id).await?.0.agent_steps.get(key).cloned())
+    }
+    pub async fn save_agent_step(
+        &self,
+        caller: &Caller,
+        id: &SubmissionId,
+        key: &str,
+        step: crate::model::AgentStep,
+    ) -> CoreResult<()> {
+        caller.require(Role::Reviewer)?;
+        let submission = self.submission(caller, id).await?;
+        let (mut file, stored) = self.referee_file(id).await?;
+        if file.agent_steps.get(key).is_some_and(|existing| {
+            existing.version != step.version || existing.claims_revision != step.claims_revision
+        }) {
+            return Err(CoreError::conflict("agent step identity cannot change"));
+        }
+        // Existing obsolete steps may record cleanup, but cannot create new work.
+        if !file.agent_steps.contains_key(key)
+            && (step.version != Self::version_number(&submission)?
+                || step.claims_revision != submission.claims_revision
+                || submission.status == SubmissionStatus::Withdrawn)
+        {
+            return Err(CoreError::conflict("agent inputs superseded"));
+        }
+        if key.is_empty()
+            || key.len() > 240
+            || serde_json::to_vec(&step.progress).map_or(true, |v| v.len() > 4_100_000)
+        {
+            return Err(CoreError::invalid("agent step exceeds its limit"));
+        }
+        file.agent_steps.insert(key.into(), step);
+        self.store_referee_file(&mut file, stored).await
+    }
+
     /// Staff see every round; the submitting author and co-authors see the
     /// reports, audits, sent letters and probe outcomes; advice/files stay private.
     pub async fn referee(&self, caller: &Caller, id: &SubmissionId) -> CoreResult<RefereeView> {
@@ -404,7 +457,7 @@ impl App {
                     StagePayload::Literature {
                         prior,
                         searched: vec![
-                            "Paper source and works named in the referee report; offline audit."
+                            "Networked referee and Codex audit; opened sources are model-reported, not venue-verified."
                                 .into(),
                         ],
                     },
@@ -430,7 +483,7 @@ impl App {
                     }],
                     reviewer: ReviewerIdentity::Machine {
                         account: caller.person.clone(),
-                        engine: "codex-cli".into(),
+                        engine: round.audit.engine.clone().unwrap_or_else(|| "codex-cli".into()),
                         model: round.audit.model.clone(),
                     },
                     claims_revision: round.claims_revision,

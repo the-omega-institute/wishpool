@@ -32,8 +32,8 @@ fn prompts_carry_evidence_consent_and_letter_rules() {
     let audit = referee_prompts::audit(&input());
     for requirement in [
         "not_checkable",
-        "Network access is disabled",
-        "./scratch",
+        "You may search the literature and open sources",
+        "worktree",
         "per confirmed statement",
         "Never invent",
         "full answer",
@@ -42,8 +42,8 @@ fn prompts_carry_evidence_consent_and_letter_rules() {
     }
     let advice = referee_prompts::advice(&input());
     for requirement in [
-        "./scratch",
-        "Do not modify ./source",
+        "worktree",
+        "reported, never venue-verified",
         "evidence",
         "author's consent",
         "Lean 4",

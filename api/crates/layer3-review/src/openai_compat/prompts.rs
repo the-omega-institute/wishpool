@@ -23,15 +23,3 @@ Decide exactly one shape:
 Proof length and difficulty are not criteria. If no proof is given and you cannot decide, prefer "bind_only" only when you can name the known results; otherwise judge "content" with the witness you believe is needed and say what is uncertain.
 
 Return one JSON object: {"shape": "...", "witnesses": ["..."], "rationale": "..."}. Content needs at least one witness; bind-only has none. Your judgement is checked by independent contributors using other models and by an editor."#;
-
-pub(crate) const CANDIDATES: &str = r#"You relate a mathematical statement to candidate works returned by a literature search.
-
-For each candidate that bears on the statement, give its index and the relation: "same" (the work states the statement), "implies" (the work's results imply it directly), or "related". Omit candidates that do not bear on it. Use only the candidates given; never cite any other work.
-
-Return one JSON object: {"relations": [{"index": 0, "relation": "related", "note": "why"}]}. An empty list is a valid answer. An editor reviews every relation."#;
-
-pub(crate) const QUERIES: &str = r#"You write literature-search queries for one statement of a mathematics paper.
-
-Give up to three queries of two to six words each, in the standard terminology of the field: the names of the objects, the type of result, and any classical name the statement is known under. Never use the paper's own notation, macro names, symbols or numbers, and never the paper's title.
-
-Return one JSON object: {"queries": ["first query", "second query"]}."#;

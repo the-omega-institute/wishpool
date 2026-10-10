@@ -115,10 +115,20 @@ impl Worker {
                 .map_err(Failure::Permanent)?;
             input.kind = "conjecture".into();
             input.statements = mapping::confirmed_statements(&claims);
-            let raw = tokio::time::timeout(self.audit_budget, advisor.audit(&input))
-                .await
-                .map_err(|_| Failure::Transient("problem audit deadline exceeded".into()))?
-                .map_err(|e| Failure::Transient(e.to_string()))?;
+            let raw = tokio::time::timeout(
+                self.audit_budget,
+                advisor.audit_with_store(
+                    &input,
+                    &self.agent_store(
+                        job,
+                        &paper,
+                        &format!("problem:{}:r{}:audit:a0", file.claim, file.review_round),
+                    ),
+                ),
+            )
+            .await
+            .map_err(|_| Failure::Transient("problem audit deadline exceeded".into()))?
+            .map_err(|e| Failure::Transient(e.to_string()))?;
             match mapping::audit(raw, &input, &claims) {
                 Ok(audit) => file.audit = Some(audit),
                 Err(error) => file.failure = Some(format!("Invalid problem audit: {error}")),

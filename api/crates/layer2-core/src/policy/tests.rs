@@ -99,7 +99,7 @@ fn literature(prior: Vec<PriorWork>, human: bool) -> StageReport {
         outcome,
         StagePayload::Literature {
             prior,
-            searched: vec!["OpenAlex".into()],
+            searched: vec!["reported source".into()],
         },
         human,
     )

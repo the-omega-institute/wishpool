@@ -96,7 +96,7 @@ describe('task page', () => {
     await user.selectOptions(screen.getByLabelText('Relation'), 'implies');
     await user.selectOptions(screen.getByLabelText('Kind'), 'arxiv');
     await user.type(screen.getByLabelText('Locator'), '1901.00001');
-    await user.type(screen.getByLabelText('Searched (one per line)'), 'OpenAlex');
+    await user.type(screen.getByLabelText('Searched (one per line)'), 'Reported sources');
     await user.type(screen.getByLabelText('Summary'), 'Implied by Theorem 3.');
     await user.click(screen.getByRole('button', { name: 'Submit' }));
     expect(submitContribution).toHaveBeenCalledWith('task-1', {
@@ -111,7 +111,7 @@ describe('task page', () => {
             note: '',
           },
         ],
-        searched: ['OpenAlex'],
+        searched: ['Reported sources'],
         summary: 'Implied by Theorem 3.',
       },
     });

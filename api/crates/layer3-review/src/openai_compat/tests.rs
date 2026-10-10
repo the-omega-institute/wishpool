@@ -84,21 +84,3 @@ fn rejects_replies_without_an_object() {
     assert!(parse_json_object::<Value>("no json here").is_err());
     assert!(parse_json_object::<Value>("} {").is_err());
 }
-
-#[tokio::test]
-async fn search_queries_are_cleaned_deduplicated_and_capped() {
-    let router = Router::new().route(
-        "/v1/chat/completions",
-        post(|| async {
-            let content = r#"{"queries":["nested  recurrence","$\\rep$ automatic","nested recurrence","Hofstadter","Walnut",""]}"#;
-            Json(json!({ "choices": [ { "message": { "content": content } } ] }))
-        }),
-    );
-    let base = serve(router).await;
-    let model = ChatModel::new(&base, "t".into(), "m".into()).unwrap();
-    let (queries, _) = model.search_queries("T", "A", "x").await.unwrap();
-    assert_eq!(
-        queries,
-        ["nested recurrence", "rep automatic", "Hofstadter"]
-    );
-}

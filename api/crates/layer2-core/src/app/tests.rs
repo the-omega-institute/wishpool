@@ -164,10 +164,10 @@ impl World {
     ) -> Submission {
         let draft = ReportDraft {
             outcome: Outcome::Pass,
-            summary: "Searched OpenAlex and arXiv.".into(),
+            summary: "Searched opened literature sources.".into(),
             payload: StagePayload::Literature {
                 prior,
-                searched: vec!["OpenAlex: zero runs gaps".into()],
+                searched: vec!["Opened source: zero runs gaps".into()],
             },
             evidence: vec![],
         };
@@ -187,6 +187,67 @@ fn agent(model: &str) -> AgentInfo {
         tool: "claude-code".into(),
         model: model.into(),
     }
+}
+
+#[tokio::test]
+async fn managed_agent_steps_keep_identity_and_allow_only_existing_cleanup_after_withdrawal() {
+    let w = World::new().await;
+    let author = w.person("author", &[]).await;
+    let reviewer = w.person("reviewer", &[Role::Reviewer]).await;
+    let paper = w.submit(&author, "t", false).await;
+    let paper = w.review_paper(&author, &paper).await;
+    let mut step = AgentStep {
+        version: 1,
+        claims_revision: paper.claims_revision,
+        progress: serde_json::json!({"agent_id":"agt_test"}),
+    };
+    assert!(
+        w.app
+            .save_agent_step(&author, &paper.id, "step", step.clone())
+            .await
+            .is_err()
+    );
+    w.app
+        .save_agent_step(&reviewer, &paper.id, "step", step.clone())
+        .await
+        .unwrap();
+    let changed = AgentStep {
+        version: 2,
+        ..step.clone()
+    };
+    assert!(matches!(
+        w.app
+            .save_agent_step(&reviewer, &paper.id, "step", changed)
+            .await,
+        Err(CoreError::Conflict(_))
+    ));
+    w.app.withdraw(&author, &paper.id).await.unwrap();
+    step.progress["deleted"] = serde_json::json!(true);
+    w.app
+        .save_agent_step(&reviewer, &paper.id, "step", step.clone())
+        .await
+        .unwrap();
+    assert!(matches!(
+        w.app
+            .save_agent_step(&reviewer, &paper.id, "new-step", step)
+            .await,
+        Err(CoreError::Conflict(_))
+    ));
+    assert_eq!(
+        w.app
+            .agent_step(&reviewer, &paper.id, "step")
+            .await
+            .unwrap()
+            .unwrap()
+            .progress["deleted"],
+        true
+    );
+    assert!(w.app.agent_steps(&author, &paper.id).await.is_err());
+    assert!(
+        !serde_json::to_string(&w.app.referee(&author, &paper.id).await.unwrap())
+            .unwrap()
+            .contains("agt_test")
+    );
 }
 
 #[tokio::test]

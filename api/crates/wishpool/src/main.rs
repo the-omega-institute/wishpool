@@ -2,6 +2,7 @@
 //! LaTeX compiler and the machine review worker.
 
 mod auth;
+mod cma_tokens;
 mod composition;
 mod config;
 mod donations;

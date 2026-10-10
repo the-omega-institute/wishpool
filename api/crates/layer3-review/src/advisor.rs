@@ -33,10 +33,35 @@ pub struct AdvisorInput {
 
 #[async_trait]
 pub trait Advisor: Send + Sync {
+    fn managed_client(&self) -> Option<&crate::cma::Client> {
+        None
+    }
     fn engine(&self) -> &str;
     fn model(&self) -> &str;
     async fn audit(&self, _input: &AdvisorInput) -> ReviewResult<AuditOut> {
         Err(ReviewError::Output("a Codex auditor is required".into()))
+    }
+    async fn audit_with_store(
+        &self,
+        input: &AdvisorInput,
+        _store: &dyn crate::cma::RunStore,
+    ) -> ReviewResult<AuditOut> {
+        self.audit(input).await
+    }
+    async fn advise_with_store(
+        &self,
+        input: &AdvisorInput,
+        _store: &dyn crate::cma::RunStore,
+    ) -> ReviewResult<AdviceOut> {
+        self.advise(input).await
+    }
+    async fn letter_with_store(
+        &self,
+        input: &AdvisorInput,
+        advice: Option<&AdviceOut>,
+        _store: &dyn crate::cma::RunStore,
+    ) -> ReviewResult<LetterOut> {
+        self.draft_letter(input, advice).await
     }
     async fn advise(&self, input: &AdvisorInput) -> ReviewResult<AdviceOut>;
     /// Draft the decision letter before any formalization probe.

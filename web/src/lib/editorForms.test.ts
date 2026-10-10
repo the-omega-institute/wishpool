@@ -30,7 +30,7 @@ describe('editor forms', () => {
         knownBy: 0,
         question: '',
         summary: ' Nothing states it. ',
-        searched: 'OpenAlex\n\nzbMATH Open',
+        searched: 'Reported sources\n\nzbMATH Open',
         prior: [prior[0]!],
       }),
     ).toEqual({
@@ -42,7 +42,7 @@ describe('editor forms', () => {
           payload: {
             stage: 'literature',
             prior: [prior[0]],
-            searched: ['OpenAlex', 'zbMATH Open'],
+            searched: ['Reported sources', 'zbMATH Open'],
           },
         },
       },
@@ -55,7 +55,7 @@ describe('editor forms', () => {
       knownBy: 1,
       question: '',
       summary: 'Known.',
-      searched: 'OpenAlex',
+      searched: 'Reported sources',
       prior,
     });
     expect(built.ok && built.value.report.outcome).toEqual({

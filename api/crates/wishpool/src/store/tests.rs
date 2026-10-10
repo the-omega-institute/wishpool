@@ -398,10 +398,10 @@ async fn paper_flow_against_mongo() {
 
     let literature = ReportDraft {
         outcome: Outcome::Pass,
-        summary: "Searched OpenAlex.".into(),
+        summary: "Inspected reported sources.".into(),
         payload: StagePayload::Literature {
             prior: vec![],
-            searched: vec!["OpenAlex: zero run gaps".into()],
+            searched: vec!["Opened source: zero run gaps".into()],
         },
         evidence: vec![],
     };
@@ -557,6 +557,7 @@ async fn referee_files_are_unique_and_revision_fenced() {
     };
     let s = &db.store;
     let mut file = RefereeFile::new("paper".into());
+    file.agent_steps.insert("wishpool:p:r1:audit:a0".into(),AgentStep{version:1,claims_revision:2,progress:serde_json::json!({"agent_id":"agt_saved","response_id":"resp_saved","next_chunk":2,"deadline":1800000000,"answer":null})});
     assert!(RefereeStore::get(s, &file.id).await.unwrap().is_none());
     RefereeStore::insert(s, &file).await.unwrap();
     assert!(matches!(
@@ -577,6 +578,7 @@ async fn referee_files_are_unique_and_revision_fenced() {
     let stored = RefereeStore::get(s, &file.id).await.unwrap().unwrap();
     assert_eq!(stored.revision, 1);
     assert_eq!(stored.letters, file.letters);
+    assert_eq!(stored.agent_steps, file.agent_steps);
     assert!(matches!(
         RefereeStore::replace(s, &file, 0).await,
         Err(CoreError::StaleRevision { .. })

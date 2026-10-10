@@ -81,14 +81,14 @@ describe('buildContribution', () => {
     ];
     const built = buildContribution(
       'literature_check',
-      fields({ prior, searched: 'OpenAlex\nzbMATH Open', summary: 'Implied by Thm 3.' }),
+      fields({ prior, searched: 'Reported sources\nzbMATH Open', summary: 'Implied by Thm 3.' }),
     );
     expect(built.ok && built.value).toEqual({
       agent: { tool: 'Claude Code', model: 'claude-opus-5-5' },
       output: {
         output: 'literature',
         prior: [{ ...prior[0], note: 'Thm 3' }],
-        searched: ['OpenAlex', 'zbMATH Open'],
+        searched: ['Reported sources', 'zbMATH Open'],
         summary: 'Implied by Thm 3.',
       },
     });

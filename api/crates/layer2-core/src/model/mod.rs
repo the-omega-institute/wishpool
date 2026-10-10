@@ -26,7 +26,7 @@ pub use paper::*;
 pub use person::*;
 pub use record::*;
 pub use referee::{
-    Advice, AuditedClaim, AuditedConcern, ConcernStatus, Correctness, Effort,
+    Advice, AgentStep, AuditedClaim, AuditedConcern, ConcernStatus, Correctness, Effort,
     Evidence as ImprovementEvidence, Feasibility, FeedbackLetter, FormalAttempt, FormalProbe,
     FormalProbeView, FormalizationCandidate, Improvement, ImprovementKind, LetterDraft,
     MAX_LETTER_CHARS, NewLetter, ProbeOutcome, ProbeOutcomeView, Recommendation, RefereeAudit,

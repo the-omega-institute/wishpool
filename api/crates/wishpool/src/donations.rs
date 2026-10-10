@@ -23,16 +23,16 @@ use wishpool_core::{
     app::App,
     ids::PersonId,
     model::{
-        AgentInfo, Caller, ContributionMode, ContributionOutput, NewContribution, PriorWork,
-        TaskKind, TaskStatus, TokenUsage, VerifiedIdentity,
+        AgentInfo, Caller, ContributionMode, NewContribution, TaskKind, TaskStatus, TokenUsage,
+        VerifiedIdentity,
     },
     ports::TaskFilter,
 };
-use wishpool_review::{ReviewModel, openai_compat::ChatModel, openalex::OpenAlex};
+use wishpool_review::{ReviewModel, openai_compat::ChatModel};
 
 use crate::{
     auth::nyxid::NyxIdClient,
-    review::{SearchedPaper, mapping, search_statement},
+    review::mapping,
     store::{MongoStore, unavailable, write_error},
 };
 
@@ -168,7 +168,6 @@ pub struct HostedWorker {
     pub app: Arc<App>,
     pub nyxid: Arc<NyxIdClient>,
     pub donations: Arc<Donations>,
-    pub openalex: Arc<OpenAlex>,
     pub interval: Duration,
 }
 
@@ -218,7 +217,7 @@ impl HostedWorker {
         Ok(done)
     }
 
-    async fn access_token(&self, donor: &PersonId) -> CoreResult<String> {
+    pub(crate) async fn access_token(&self, donor: &PersonId) -> CoreResult<String> {
         let sealed = self
             .donations
             .tokens
@@ -237,7 +236,7 @@ impl HostedWorker {
     }
 
     async fn pick(&self, donor: &Caller) -> CoreResult<Option<wishpool_core::model::Task>> {
-        for kind in [TaskKind::JudgeEscape, TaskKind::LiteratureCheck] {
+        for kind in [TaskKind::JudgeEscape] {
             let page = self
                 .app
                 .list_tasks(
@@ -335,46 +334,9 @@ impl HostedWorker {
                 })?;
                 (output, usage)
             }
-            TaskKind::LiteratureCheck => {
-                let paper = SearchedPaper {
-                    title: &context.paper_title,
-                    abstract_text: &context.abstract_text,
-                    doi: None,
-                };
-                let (found, usage) = search_statement(
-                    &chat,
-                    &self.openalex,
-                    &paper,
-                    &context.claim.id,
-                    &context.claim.statement,
-                )
-                .await
-                .map_err(review)?;
-                let draft = mapping::literature(std::slice::from_ref(&found), model);
-                let prior: Vec<PriorWork> = match draft.payload {
-                    wishpool_core::model::StagePayload::Literature { prior, .. } => prior,
-                    _ => vec![],
-                };
-                let summary = format!(
-                    "{} of {} OpenAlex candidates bear on {} (model {model}); an editor checks each.",
-                    prior.len(),
-                    found.candidates.len(),
-                    context.claim.label
-                );
-                (
-                    ContributionOutput::Literature {
-                        prior,
-                        searched: found
-                            .queries
-                            .iter()
-                            .map(|q| format!("OpenAlex works search: {q}"))
-                            .collect(),
-                        summary,
-                    },
-                    usage,
-                )
+            TaskKind::LiteratureCheck | TaskKind::Formalize | TaskKind::Probe => {
+                return Ok(Outcome::Idle);
             }
-            TaskKind::Formalize | TaskKind::Probe => return Ok(Outcome::Idle),
         };
         let tokens = TokenUsage {
             input: usage.input,

@@ -65,60 +65,73 @@ user tree (e.g. BasicTeX with `tlmgr --usermode`) are found when
 
 Machine clients in dev mode authenticate with `Authorization: Bearer dev:<name>`.
 
-## Local referee preview
+## Referee and managed Codex agents
 
-Install and sign in to `nyxid` and `codex` using your own operator accounts. The
-NyxID account must be allowed to submit to the Oracle pool. From the repository
-root, run the API with development sign-in, memory storage and the local backends:
+GPT Pro referees through the Oracle broker and every Codex step runs on CMA
+through NyxID: audit, advice, letter, conjecture target generation, private
+accepted-paper Lean probes and paper open-problem audits. Configure an existing
+ready CMA workspace; wishpool creates a dedicated Agent/conversation for each
+step and stops/deletes it when the step finishes or fails.
+
+For a local preview, sign in to the NyxID CLI with a user account authorized for
+both services, then run:
 
 ```bash
 cd api
 WISHPOOL_BIND=127.0.0.1:8080 \
 WISHPOOL_PUBLIC_URL=http://127.0.0.1:5173 \
 WISHPOOL_AUTH_MODE=dev WISHPOOL_STORAGE=memory \
-WISHPOOL_ADMIN_SUBJECTS=dev:admin \
-WISHPOOL_TEX_BIN=$(dirname "$(command -v pdflatex)") \
-WISHPOOL_ORACLE=cli WISHPOOL_ADVISOR=codex \
-WISHPOOL_ORACLE_POOL=chrono-chatgpt-pro-pool \
-WISHPOOL_ORACLE_POLL_SECS=60 \
+WISHPOOL_ORACLE=cli WISHPOOL_AGENT_BACKEND=cma \
+WISHPOOL_CMA_TRANSPORT=cli WISHPOOL_CMA_WORKSPACE=wks_YOUR_WORKSPACE \
 cargo run -p wishpool
 ```
 
-Submit a paper, wait for its PDF, and confirm the statements. The referee reads
-the PDF through the standalone Oracle broker, reached with
-`nyxid proxy request oracle api/v1/oracle/...`; hours of latency are normal.
-The durable task is polled between other jobs. Codex audits the report against a
-fresh source copy, offline, and Layer 2 files the audited literature and escape
-analysis, then applies `Policy::decide` automatically. The model recommendation
-is feedback; escape content decides acceptance. Advice follows for every audited
-paper, then an English letter is delivered automatically in-app, stating the
-decision and record or reasons. Lean runs afterwards, only for accepted work: proof probes for papers/notes and author-confirmed targets for conjectures.
-Authors see the checked statement table, full referee report and probe outcomes;
-advice and proof-probe files remain staff-only, and publishing proof files needs author agreement. Conjecture targets are shown to their authors for exact-digest confirmation.
-Editors remain optional: inspect `GET /api/v1/submissions/{id}/referee`, restart
-settled reviews in review with `POST .../referee/restart`, or send an additional
-`{subject, body, note?, assessment?}` through `POST .../referee/letters`.
-Memory mode loses state on exit; use a dedicated MongoDB database to exercise
-recovery across restarts. Chat-only advice cannot perform the Codex audit.
+Production uses `WISHPOOL_ORACLE=http` with its separately provisioned Oracle
+credential, and CMA HTTP through
+`https://nyx-api.chrono-ai.fun/api/v1/proxy/s/cma`. CMA requires a NyxID **user**
+access token; `nyxid_ag_` agent keys are refused. Set `WISHPOOL_CMA_TOKEN_FILE`
+to a mounted token file, or select a stored delegated credential with
+`WISHPOOL_CMA_TOKEN_ACCOUNT` when delegated-token storage is enabled. Delegated
+credentials use the existing sealed refresh/rotation plumbing; the file is the
+fallback if refresh is unavailable. CMA v2 requires the resulting token to be
+an ordinary, unrestricted user access token: resource-scoped or delegated
+execution tokens are refused by CMA. Reusing refresh-token storage does not
+relax that contract; use a mounted user token when the stored grant is restricted.
+Tokens and deployment configuration never enter CMA input, state or logs.
 
-`WISHPOOL_ORACLE_CLI` and `WISHPOOL_CODEX_BIN` select executables;
-`WISHPOOL_CODEX_MODEL` is optional. Advisor work directories default to
-`/tmp/wishpool-advisor` and the deadline to 1,200 seconds. Child processes receive
-only `PATH` and `HOME`; Codex's workspace sandbox has network access disabled.
-Both CLI modes are refused on a non-loopback bind. Unset `WISHPOOL_ORACLE`
-disables rounds. A configured Oracle with no advisor records failed advisor
-steps; configure both for the full preview.
+Submit a paper, wait for its PDF and confirm the statements. GPT Pro reads the
+PDF. CMA receives the main TeX with needed inputs inline, confirmed statements
+and report data, in turns of at most 200 KiB of content. Both networked models
+may search literature and open sources. Named works carry the exact source the
+model states it opened, e.g. `Title [opened: https://...]`,
+`Title [opened: DOI:10.../...]` or `Title [opened: arXiv:NNNN.NNNNN]`.
+These are reported sources, never venue-verified citations. External facts
+that could not be opened remain `not_checkable`.
 
-For production use `WISHPOOL_ORACLE=http`, its base URL and a separately
-provisioned `WISHPOOL_ORACLE_TOKEN` (NyxID agent key or user token, not a delegated
-gateway token). The default broker base is
-`https://nyx-api.chrono-ai.fun/api/v1/proxy/s/oracle`.
-`WISHPOOL_ADVISOR=chat` uses the existing review model gateway
-endpoint/token and `WISHPOOL_ADVISOR_MODEL` (default `gpt-5.5`). Chat advice has
-source text and no computation harness; it cannot perform the required Codex
-audit. For automatic publication, run the Codex worker on a loopback bind with
-the shared durable queue and the HTTP Oracle backend. Recommendations remain
-feedback; only the audited escape analysis through `Policy::decide` accepts papers.
+Layer 2 files the audited S2/S3 readings and applies `Policy::decide`; model
+recommendations are feedback. Advice follows the decision, then a letter is
+delivered in-app. Accepted papers/notes receive a private Lean probe, and
+accepted conjectures receive a target for exact-digest author confirmation.
+CMA returns full Lean text inside final JSON; the binary independently checks
+it against the local pinned workspace. The credential-free solution verifier
+is unchanged. Authors see reports, letters and projected Lean outcomes; advice
+and private probe files stay with staff. Publishing proof files requires author
+agreement.
+
+CMA agent ids, response ids, chunk progress, original deadline and terminal
+answer are durable in MongoDB. A worker restart resumes polling the same turn;
+uncertain mutations replay their original key and body. Each managed step is
+limited to 3,600 seconds, with the existing lease heartbeat. Memory mode loses
+this state on exit. Configure both Oracle and CMA for the full pipeline.
+Editors may inspect `GET /api/v1/submissions/{id}/referee`, restart settled rounds
+or send additional in-app letters through the existing API.
+
+For development without CMA, explicitly select
+`WISHPOOL_AGENT_BACKEND=codex-local` on a loopback bind and sign in to the local
+Codex CLI. This fallback uses a fresh source copy, a separate scratch directory,
+a cleared environment (`PATH`, `HOME` only) and disabled sandbox network. It is
+never the default. Legacy `WISHPOOL_ADVISOR=codex|chat` remains explicit
+compatibility configuration; chat advice cannot perform the required audit.
 
 ## Sign in with NyxID
 
@@ -138,9 +151,8 @@ grants their subject the `reviewer` role.
 Set `WISHPOOL_REVIEW_MODEL_BASE_URL` to the NyxID LLM gateway
 (`https://nyx.chrono-ai.fun/api/v1/llm/gateway/v1`), `WISHPOOL_REVIEW_MODEL_TOKEN`
 to a NyxID service-account token, and optionally `WISHPOOL_REVIEW_MODEL`.
-The optional gateway model supplies additional contributor judgements and
-literature leads. Oracle + Codex perform the automatic publication flow without
-this gateway model; without Oracle + Codex, compilation still runs and optional
+The optional gateway model supplies additional contributor judgements. Oracle + Codex perform the automatic publication flow without
+this gateway model; without Oracle + CMA, compilation still runs and optional
 editors/contributors may supply reports.
 
 ## Configuration
@@ -168,18 +180,27 @@ editors/contributors may supply reports.
 | `WISHPOOL_ORACLE_POLL_SECS` | `60` | positive poll/transport deferral interval |
 | `WISHPOOL_REFEREE_ACCOUNT` | `wishpool:referee` | separate machine reviewer account |
 | `WISHPOOL_AUDITOR_ACCOUNT` | `wishpool:auditor` | separate account for audit reports, automatic decisions and letters |
+| `WISHPOOL_AGENT_BACKEND` | `cma` when a workspace is configured; otherwise disabled | `cma` or explicit loopback-only `codex-local` |
+| `WISHPOOL_CMA_WORKSPACE` | unset | existing ready workspace id; required for cma |
+| `WISHPOOL_CMA_AGENT_PROFILE` | unset | optional published profile JSON `{ "id": "agp_...", "revision": 1 }` |
+| `WISHPOOL_CMA_TRANSPORT` | `http` | `http` or loopback-only `cli` |
+| `WISHPOOL_CMA_BASE_URL` | `https://nyx-api.chrono-ai.fun/api/v1/proxy/s/cma` | proxy base; HTTPS required except local test servers |
+| `WISHPOOL_CMA_TOKEN_FILE` | unset | HTTP token file path; token never logged |
+| `WISHPOOL_CMA_TOKEN_ACCOUNT` | unset | optional delegated-token owner subject; requires delegated-token storage |
+| `WISHPOOL_CMA_CLI` | `nyxid` | local proxy CLI executable |
+| `WISHPOOL_CMA_POLL_SECS` | `5` | positive CMA polling interval |
 | `WISHPOOL_ADVISOR` | unset | `codex` (loopback only) or `chat` |
 | `WISHPOOL_CODEX_BIN` | `codex` | local executable |
 | `WISHPOOL_CODEX_MODEL` | unset | optional Codex model override |
 | `WISHPOOL_ADVISOR_MODEL` | `gpt-5.5` | chat advisor model on the review endpoint |
 | `WISHPOOL_ADVISOR_TIMEOUT_SECS` | `1200` | advice/letter Codex deadline; maximum 3600 seconds (the worker renews its lease) |
-| `WISHPOOL_AUDIT_TIMEOUT_SECS` | `3600` | Codex audit deadline; maximum 7200 seconds |
-| `WISHPOOL_LEAN_WORKSPACE` | unset | prepared Lean/Mathlib project for proof probes and conjecture targets; requires Codex |
+| `WISHPOOL_AUDIT_TIMEOUT_SECS` | `3600` | audit deadline; maximum 3600 seconds on CMA, 7200 for local fallback |
+| `WISHPOOL_LEAN_WORKSPACE` | unset | prepared Lean/Mathlib project for proof probes and conjecture targets; requires CMA or explicit local Codex |
 | `WISHPOOL_VERIFIER_PROGRAM` | `wishpool-verifier` | local verifier executable |
 | `WISHPOOL_VERIFIER_URL` | unset | isolated verifier service base; empty selects subprocess |
 | `WISHPOOL_VERIFIER_TIMEOUT_SECS` | `1200` | verification deadline, maximum 3600 seconds |
 | `WISHPOOL_ATTEMPTS_PER_DAY` | `20` | attempts per entrant per conjecture in the preceding 24 hours |
-| `WISHPOOL_FORMAL_TIMEOUT_SECS` | `1200` | formalization Codex deadline; maximum 3600 seconds, plus 300 seconds for discovery/checks |
+| `WISHPOOL_FORMAL_TIMEOUT_SECS` | `1200` | formalization Codex deadline; maximum 3600 seconds; discovery/check margin is 300 seconds, with the CMA total capped at 3600 |
 | `WISHPOOL_ADVISOR_WORK_DIR` | `/tmp/wishpool-advisor` | parent for temporary source, Oracle and advisor workspaces |
 | `WISHPOOL_ROLE` | `all` | `api` (HTTP only), `worker` (background work, one replica), `all` |
 | `WISHPOOL_TEX_BIN` | `/usr/bin` | TeX Live bin directory (`pdflatex`, `xelatex`, `lualatex`, `bibtex`) |
@@ -191,13 +212,14 @@ editors/contributors may supply reports.
 | `WISHPOOL_LLM_GATEWAY_URL` | `<NyxID>/api/v1/llm/gateway/v1` | gateway for donated quota |
 | `WISHPOOL_DONATION_SCOPE` / `_SERVICE_IDS` / `_MODEL` | `openid offline_access proxy` / none / `claude-opus-5-5` | incremental consent request and default model |
 | `WISHPOOL_HOSTED_INTERVAL_SECS` | `30` | hosted worker period |
-| `WISHPOOL_OPENALEX_URL` / `_API_KEY` | `https://api.openalex.org` / unset | grounded literature checks; key is secret |
 
 Running jobs renew their own 30-minute lease about every five minutes. Audit
-and formalization outer budgets add 300 seconds to the configured timeouts for
-workspace preparation, parsing, Lean environment discovery and compiler checks. Audit transport timeouts
-retry the same job using the existing attempt limit; advice, letters and Lean
-remain pending while the audit retries.
+and formalization outer budgets add 300 seconds for workspace preparation,
+parsing, Lean discovery and checks, capped at 3,600 seconds on CMA. The CMA
+client reserves up to 60 seconds within its timeout for cleanup and keeps the
+original execution deadline on restart. Transient CMA requests replay the same
+intent within that deadline; local audit transport timeouts retain their
+existing job retry limit. Advice, letters and Lean wait for the audit.
 
 ## Tests
 

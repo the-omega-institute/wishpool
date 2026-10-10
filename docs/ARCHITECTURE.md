@@ -13,7 +13,7 @@ private review material never enters the public projection.
 | `layer2-core` | 2 | domain (people, papers and versions, statements, stage reports, judgements, records, formalization plans, conjecture follow-ups, tasks, contributions, donations), the threshold `Policy`, the per-paper analysis, ports, services, authorization; in-memory ports |
 | `layer1-public` | 1 | `/api/v1` REST projection, including multipart upload and file download |
 | `layer3-latex` | 3 | unpack `.tex`/`.zip`/`.tar.gz` with limits; find the main file, inline `\input`/`\include`, read title, authors, abstract and statement environments; compile with TeX Live |
-| `layer3-review` | 3 | OpenAI-compatible models through the NyxID LLM gateway (escape proposals, statement judgements, relating search candidates; metered usage); OpenAlex search |
+| `layer3-review` | 3 | Oracle broker and CMA agents through NyxID; optional LLM gateway contributor judgements with metered usage |
 | `wishpool-verifier` | 3 / binary | stateless Lean module checker, source scan, pinned workspace copy, bounded isolated processes, JSON receipt; no database or credentials |
 | `wishpool` | binary | composition, MongoDB stores and GridFS files, NyxID sign-in and delegated tokens, the paper worker (compile, S2 leads, S3 proposals), the hosted donation worker, lease reconciliation |
 | `sdk/contribute` | client | `wishpool-contribute`: CLI and MCP server for contributors' own agents |
@@ -53,15 +53,14 @@ upload ──► draft ──confirm──► in_review ──decide──► ac
   old set. Paper/note confirmation requires a proved main result; standalone
   conjectures require a main open claim.
 - **S2 literature / S3 escape**: GPT Pro referees, then Codex audits the report
-  against the source offline. Layer 2 appends machine reports derived only from
+  against inline source on networked CMA. Layer 2 appends machine reports derived only from
   the audit: named prior works in S2; main-result shape, witnesses, correctness
   and rationale in S3. Gap/error/not-checked main results have no escape witness
   and cannot ground an open-problem settlement. Older report and contributor
   workflows remain available for optional editorial intervention. Conjecture
   prompts instead request per-claim well-posedness, open/known/unclear status,
   reported work names, content/bind-only escape and sharpening suggestions.
-  The audit checks definitions, quantifiers, small cases and offline matches;
-  unverifiable external knowledge becomes unclear.
+  The audit checks definitions, quantifiers, small cases and source matches; unopened external knowledge becomes unclear.
 - **Decision**: `Policy::decide` is the only authority. The default human stages
   are `{Claims}`; deployment policy may require humans again. The audited
   recommendation remains feedback even when it differs from the publication
@@ -168,7 +167,7 @@ for thirty minutes, retried with backoff and parked after three attempts.
   Only the failing excerpt of the log is shown to the author.
 - Model output: sanitised in `review/mapping.rs`. A content judgement without
   a witness is dropped, not repaired; literature leads name only works
-  OpenAlex returned, as DOIs or OpenAlex pages.
+  the networked models report opening, with DOI, arXiv id or URL.
 
 ## 8. Deployment
 
@@ -176,7 +175,7 @@ One image (`infra/api/Dockerfile`, Debian trixie with TeX Live) serves two
 roles: `api` (stateless replicas; parsing uploads happens here) and `worker`
 (one replica; compiling, model calls, hosted donations, lease
 reconciliation; it owns the TeX cache volume). NyxID provides sign-in, the
-LLM gateway and delegated access; OpenAlex provides literature candidates.
+LLM gateway and delegated access; the networked referee and CMA audit report opened sources.
 
 
 ## 9. Referee rounds
@@ -248,24 +247,47 @@ review. Advice runs for
 every successfully audited paper after its decision is applied; failed advice
 still permits a letter from the audited feedback.
 
-`CodexCli` receives a fresh workspace with a copy of the bounded, unpacked
-source in `source/`, a named main file and report in `TASK.md`, and writable
-`scratch/` for computations. Source copies are read-only and the prompt forbids
-source edits. It runs ephemeral `codex exec` with `workspace-write`, explicitly
-disabled sandbox network access, a cleared environment (`PATH`, `HOME` only),
-null stdin, captured output, kill-on-drop and the configured deadline (default
-1,200 seconds for advice and letters). It reads the final JSON from
-`answer.md`. While a step runs, the worker renews its 30-minute job lease about
-every five minutes. Advice and letter deadlines are at most 3,600 seconds; the
-audit has its own default 3,600-second, 7,200-second maximum deadline and outer
-budget.
-Prompts are bounded at 500,000 characters and answers at 2,000,000 bytes. Temporary workspaces are
-removed after results are recorded. The production chat advisor uses the
-existing gateway endpoint/token with its own model label and source text; it
-has no computation tools and must identify those limits. Both use the same
-prompts and sanitisation. Checked improvements require reported evidence and
-outcomes; proposals carry empty evidence. Formalization candidates include
-Mathlib notions, missing pieces and a Lean sketch, never a verification receipt.
+`cma::Client` runs all Codex steps through a transport trait implemented by
+NyxID HTTP and the local proxy CLI. Agent creation and every mutation carry
+stable idempotency keys. Responses v2 requires `stream: true`; HTTP captures
+`X-CMA-Response-ID` and disconnects, while CLI `--stream` captures
+`response.created`. Neither disconnect cancels admitted execution. GET polls
+the durable response. The pinned Agent Profile owns execution configuration;
+optional profile references are JSON `{id, revision}`, never a bare profile id.
+
+The binary implements `RunStore` using private `RefereeFile.agent_steps`, fenced
+on the job lease and aggregate revision. Keys bind submission, version, claims
+revision, round/claim, step and attempt. Each state stores agent/response ids,
+chunk cursor, input digest, original deadline, terminal answer/failure and
+cleanup receipts. Every transition is saved before advancing. Recovery resumes
+the same response, and ambiguous POSTs replay identical keys and bodies.
+Cancelled/superseded input is fenced; cleanup uses the original Agent.
+
+CMA receives paper TeX and needed inputs inline, in UTF-8 chunks of at most
+200 KiB plus a small wrapper (below the 256 KiB input/2 MiB body bounds). Only
+paper/review data is sent. Network is on; named prior works include an opened
+DOI/arXiv/URL in `Title [opened: locator]` form. Such sources are model-reported,
+never venue-verified. Unopened facts stay `not_checkable`; opened-source matching
+arguments remain model-reported evidence. Final output must be one JSON object,
+capped at 2,000,000 bytes. Every managed step has an original deadline at most
+3,600 seconds; the existing lease heartbeat continues while it runs.
+The client reserves up to 60 seconds of that budget for bounded cleanup calls;
+the original execution deadline is retained across worker restarts.
+
+Final answers are persisted before best-effort Agent stop and deletion. Failure
+or cancellation first observes response controls (or queued cancellation) and
+retains the exact cancellation intent before sending it. Stop posts `{}`;
+stop/delete also require keys. Cleanup failures are logged without raw provider
+messages or credentials. HTTP rejects agent keys and can reuse the existing
+sealed refresh-token storage when selected, otherwise a mounted user token file.
+The refreshed token must satisfy CMA v2's ordinary, unrestricted user-token
+contract; restricted delegated/resource-scoped tokens are refused by CMA.
+
+`CodexCli` is an explicit loopback-only `codex-local` development fallback with
+fresh read-only source copies, writable scratch, cleared environment and network
+disabled. Its existing prompt/answer caps remain. Optional legacy chat advice
+has no computation harness and cannot audit. All carriers use the binary's
+existing sanitizers; checked improvements require reported evidence and outcomes.
 
 Referee readings are filed once on completion as machine judgements under the
 separate referee account (default `wishpool:referee`, engine `nyxid-oracle`).
@@ -281,11 +303,12 @@ uses report provenance and the unique record per submission. Publication of an
 actual formalization still needs the author's agreement.
 
 After the automatically delivered letter, only for accepted papers/notes, with `WISHPOOL_LEAN_WORKSPACE` naming a Lean project whose
-Mathlib is built (and the Codex advisor), the round runs a private
+Mathlib is built (and a CMA or explicit local Codex carrier), the round runs a private
 formalization probe on at most two proposed, proved statements that the advice
-did not call hard, most tractable first. Codex works in a fresh directory with a
-read-only source copy, writes `lean/<claim>.lean`, and compiles with a
-`check.sh` that runs the workspace's `lean` with the workspace's `LEAN_PATH`.
+did not call hard, most tractable first. CMA returns each complete `lean/<claim>.lean` text inside its final JSON.
+The binary validates file identities and limits, writes only expected files in
+its own fresh scratch, and uses the pinned workspace's Lean and `LEAN_PATH`.
+The local fallback can still generate files in its own scratch.
 The binary then checks every file itself: it refuses `sorry`, `admit`, `axiom`
 and `opaque` declarations, `implemented_by`, `extern`, `unsafe`, `#exit` and
 `debug.skipKernelTC`, compiles the file with `#print axioms` on the named
@@ -298,7 +321,8 @@ receive only claim, outcome and theorem name; publishing files needs their
 agreement. No second letter is required. The formal step budget is the
 configured `WISHPOOL_FORMAL_TIMEOUT_SECS` plus a margin for environment
 discovery and Lean checks. The timeout defaults to 1,200 seconds and is capped
-at 3,600 seconds. Environment discovery commands each have a 30-second
+at 3,600 seconds; CMA's total outer budget is also capped at 3,600 seconds.
+Environment discovery commands each have a 30-second
 deadline; each Lean check is limited to 120 seconds.
 
 The advisor writes an English letter after the applied decision, with a short

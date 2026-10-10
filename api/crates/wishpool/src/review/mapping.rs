@@ -4,14 +4,9 @@
 
 use wishpool_core::{
     ids::ClaimId,
-    model::{
-        Claim, ClaimRole, ContributionOutput, Outcome, PriorRelation, PriorWork, ProofShape,
-        ReportDraft, Source, SourceKind, StagePayload, TaskKind,
-    },
+    model::{Claim, ClaimRole, ContributionOutput, ProofShape, TaskKind},
 };
-use wishpool_review::{
-    CandidateRelation, EscapeProposal, JudgementDraft, Statement, openalex::Work,
-};
+use wishpool_review::{EscapeProposal, JudgementDraft, Statement};
 
 const MAX_WITNESSES: usize = 10;
 const MAX_WITNESS_CHARS: usize = 1_000;
@@ -30,96 +25,6 @@ pub(crate) fn statements(claims: &[Claim]) -> Vec<Statement> {
             depends_on: c.depends_on.iter().map(ToString::to_string).collect(),
         })
         .collect()
-}
-
-/// A work that exists, as a source: its DOI when it has one, else its
-/// OpenAlex page.
-pub(crate) fn source_of(work: &Work) -> Option<Source> {
-    let doi = work
-        .doi
-        .as_deref()
-        .map(|d| d.trim_start_matches("https://doi.org/"))
-        .filter(|d| d.starts_with("10.") && d.contains('/'));
-    let source = match doi {
-        Some(doi) => Source {
-            kind: SourceKind::Doi,
-            locator: doi.to_owned(),
-            year: work.year,
-        },
-        None => Source {
-            kind: SourceKind::Url,
-            locator: work.id.clone(),
-            year: work.year,
-        },
-    };
-    source.validate().is_ok().then_some(source)
-}
-
-fn relation(value: &str) -> Option<PriorRelation> {
-    match value {
-        "same" => Some(PriorRelation::Same),
-        "implies" => Some(PriorRelation::Implies),
-        "related" => Some(PriorRelation::Related),
-        _ => None,
-    }
-}
-
-/// What the literature search found for one statement.
-pub(crate) struct Found {
-    pub claim: ClaimId,
-    pub queries: Vec<String>,
-    pub candidates: Vec<Work>,
-    pub relations: Vec<CandidateRelation>,
-}
-
-/// Leads from a search engine, related to the statements by a model. Every
-/// lead names a work the search returned; the editor decides.
-pub(crate) fn literature(found: &[Found], model: &str) -> ReportDraft {
-    let mut prior = Vec::new();
-    let mut dropped = 0;
-    for f in found {
-        for r in &f.relations {
-            let (Some(work), Some(relation)) = (f.candidates.get(r.index), relation(&r.relation))
-            else {
-                dropped += 1;
-                continue;
-            };
-            match source_of(work) {
-                Some(source) => prior.push(PriorWork {
-                    claim: f.claim.clone(),
-                    source,
-                    relation,
-                    note: format!("{} — {}", work.title, r.note)
-                        .chars()
-                        .take(2_000)
-                        .collect(),
-                }),
-                None => dropped += 1,
-            }
-        }
-    }
-    let mut summary = format!(
-        "{} lead(s) among works OpenAlex returned, related by {model}. Leads are proposals; an editor checks each and files the literature report.",
-        prior.len()
-    );
-    if dropped > 0 {
-        summary.push_str(&format!(" {dropped} unusable relation(s) dropped."));
-    }
-    ReportDraft {
-        outcome: Outcome::NeedsHuman {
-            question: "Check each lead against the statement; file a human literature report."
-                .into(),
-        },
-        summary,
-        payload: StagePayload::Literature {
-            prior,
-            searched: found
-                .iter()
-                .flat_map(|f| f.queries.iter().map(|q| format!("OpenAlex: {q}")))
-                .collect(),
-        },
-        evidence: vec![],
-    }
 }
 
 fn witnesses(raw: &[String]) -> Vec<String> {
@@ -252,56 +157,6 @@ mod tests {
             matches!(&kept[0].1, ContributionOutput::Judgement { shape: ProofShape::BindOnly, witnesses, .. } if witnesses.is_empty())
         );
     }
-
-    #[test]
-    fn leads_name_only_returned_works() {
-        let work = |id: &str, doi: Option<&str>| Work {
-            id: format!("https://openalex.org/{id}"),
-            title: "Gaps".into(),
-            doi: doi.map(str::to_owned),
-            year: Some(2020),
-            abstract_text: String::new(),
-        };
-        let found = Found {
-            claim: "C1".into(),
-            queries: vec!["gaps".into()],
-            candidates: vec![
-                work("W1", Some("https://doi.org/10.1000/x")),
-                work("W2", None),
-            ],
-            relations: vec![
-                CandidateRelation {
-                    index: 0,
-                    relation: "implies".into(),
-                    note: "n".into(),
-                },
-                CandidateRelation {
-                    index: 1,
-                    relation: "related".into(),
-                    note: String::new(),
-                },
-                CandidateRelation {
-                    index: 7,
-                    relation: "same".into(),
-                    note: String::new(),
-                },
-                CandidateRelation {
-                    index: 0,
-                    relation: "proves".into(),
-                    note: String::new(),
-                },
-            ],
-        };
-        let draft = literature(&[found], "m");
-        let StagePayload::Literature { prior, searched } = draft.payload else {
-            panic!()
-        };
-        assert_eq!(prior.len(), 2);
-        assert_eq!(prior[0].source.locator, "10.1000/x");
-        assert_eq!(prior[1].source.kind, SourceKind::Url);
-        assert_eq!(searched, vec!["OpenAlex: gaps"]);
-        assert!(draft.summary.contains("2 unusable"));
-    }
 }
 
 pub(crate) fn confirmed_statements(claims: &[Claim]) -> Vec<Statement> {
@@ -343,9 +198,7 @@ fn conjecture_reading(
     };
     if raw.named_works.len() > 20
         || raw.named_works.iter().any(|w| {
-            w.trim().is_empty()
-                || w.chars().count() > 2_000
-                || named.is_some_and(|text| !text.contains(w.as_str()))
+            w.trim().is_empty() || w.chars().count() > 2_000 || !super::sources::reported_work(w)
         })
     {
         return None;
@@ -357,7 +210,9 @@ fn conjecture_reading(
                 | ConjectureStatus::KnownFalse
                 | ConjectureStatus::SpecialCaseOfKnown
         )
-        && (raw.status_basis != "offline" || raw.status_evidence.trim().is_empty())
+        && (!matches!(raw.status_basis.as_str(), "offline" | "opened_source")
+            || raw.status_evidence.trim().is_empty()
+            || raw.status_basis == "opened_source" && raw.named_works.is_empty())
     {
         status = ConjectureStatus::Unclear;
     }
@@ -412,6 +267,7 @@ pub(crate) fn referee_for_kind(
     let mut limits = raw.limits;
     let mut readings = Vec::new();
     let mut dropped_readings = 0;
+    let mut dropped_sources = 0;
     for reading in raw.claims {
         let Some(claim) = proved(&reading.claim) else {
             dropped_readings += 1;
@@ -458,12 +314,19 @@ pub(crate) fn referee_for_kind(
             dropped_readings += 1;
             continue;
         }
+        let known = reading.known.filter(|s| {
+            let usable = super::sources::reported_work(s);
+            if !usable {
+                dropped_sources += 1;
+            }
+            usable
+        });
         let reading = RefereeClaim {
             conjecture: None,
             claim: claim.id.clone(),
             shape,
             witnesses: witness,
-            known: reading.known.filter(|s| !s.trim().is_empty()),
+            known,
             note: reading.note,
         };
         if referee_judgement(&reading).is_none() {
@@ -504,6 +367,11 @@ pub(crate) fn referee_for_kind(
     }
     if dropped_concerns > 0 {
         limits.push(format!("{dropped_concerns} unusable concern(s) or concerns naming unknown or open statements dropped."));
+    }
+    if dropped_sources > 0 {
+        limits.push(format!(
+            "{dropped_sources} named prior work(s) without a usable reported opened source dropped."
+        ));
     }
     if recommendation.is_none() {
         limits.push(
@@ -656,7 +524,7 @@ pub(crate) fn audit(
         let known = r.known.filter(|k| !k.trim().is_empty());
         if known
             .as_ref()
-            .is_some_and(|k| k.chars().count() > 2_000 || !named.contains(k.as_str()))
+            .is_some_and(|k| !super::sources::reported_work(k))
         {
             dropped += 1;
             continue;
@@ -689,11 +557,18 @@ pub(crate) fn audit(
         }
     }
     let mut concerns = Vec::new();
+    const OPENED_EVIDENCE: &str = "\nReported opened-source evidence (not venue-verified): ";
     for c in raw.concerns {
         if c.concern.trim().is_empty()
             || c.note.trim().is_empty()
             || c.concern.chars().count() > 5_000
             || c.note.chars().count() > 10_000
+            || c.evidence.chars().count() > 8_000
+            || c.basis == "opened_source"
+                && c.note.chars().count()
+                    + c.evidence.chars().count()
+                    + OPENED_EVIDENCE.chars().count()
+                    > 10_000
         {
             dropped += 1;
             continue;
@@ -709,7 +584,6 @@ pub(crate) fn audit(
                     "citation",
                     "published",
                     "literature",
-                    "openalex",
                     "arxiv",
                 ]
                 .iter()
@@ -717,6 +591,20 @@ pub(crate) fn audit(
                 {
                     ConcernStatus::NotCheckable
                 } else if c.status == "confirmed" {
+                    ConcernStatus::Confirmed
+                } else {
+                    ConcernStatus::Refuted
+                }
+            }
+            "confirmed" | "refuted"
+                if c.basis == "opened_source"
+                    && !c.evidence.trim().is_empty()
+                    && c.evidence.lines().any(super::sources::reported_work)
+                    && c.evidence.lines().any(|line| {
+                        !line.trim().is_empty() && !super::sources::reported_work(line)
+                    }) =>
+            {
+                if c.status == "confirmed" {
                     ConcernStatus::Confirmed
                 } else {
                     ConcernStatus::Refuted
@@ -731,7 +619,11 @@ pub(crate) fn audit(
         concerns.push(AuditedConcern {
             concern: c.concern,
             status,
-            note: c.note,
+            note: if c.basis == "opened_source" {
+                format!("{}{OPENED_EVIDENCE}{}", c.note, c.evidence)
+            } else {
+                c.note
+            },
         });
     }
     let mut summary = raw.summary;
@@ -1018,6 +910,32 @@ mod referee_tests {
     }
 
     #[test]
+    fn referee_reports_omission_of_names_without_opened_sources() {
+        let report = referee(
+            RefereeOut {
+                claims: vec![ReadingOut {
+                    claim: "C1".into(),
+                    shape: "bind_only".into(),
+                    known: Some("Unsourced attribution".into()),
+                    note: "A matching argument".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            String::new(),
+            &claims(),
+        );
+        assert_eq!(report.claims.len(), 1);
+        assert!(report.claims[0].known.is_none());
+        assert!(
+            report
+                .limits
+                .iter()
+                .any(|limit| limit.contains("opened source dropped"))
+        );
+    }
+
+    #[test]
     fn referee_sanitises_ids_shapes_and_preserves_raw_text() {
         let raw = RefereeOut {
             recommendation: "accept".into(),
@@ -1231,7 +1149,7 @@ mod audit_tests {
             authors: vec![],
             statements: confirmed_statements(&claims),
             referee: RefereeOut {
-                text: "A named earlier work".into(),
+                text: "A named earlier work [opened: https://example.test/earlier-work]".into(),
                 ..Default::default()
             },
             text: Some("The paper cites A source in the paper.".into()),
@@ -1299,6 +1217,45 @@ mod audit_tests {
         assert_eq!(result.concerns[0].status, ConcernStatus::NotCheckable);
         assert_eq!(result.concerns[1].status, ConcernStatus::Refuted);
         assert_eq!(result.concerns[2].status, ConcernStatus::NotCheckable);
+        let oversized = audit(
+            AuditOut {
+                concerns: vec![
+                    AuditedConcernOut {
+                        concern: "A comparison".into(),
+                        status: "confirmed".into(),
+                        basis: "opened_source".into(),
+                        note: "n".repeat(9_000),
+                        evidence: format!(
+                            "Work [opened: https://example.test/work]\n{}",
+                            "e".repeat(2_000)
+                        ),
+                    },
+                    AuditedConcernOut {
+                        concern: "An argument".into(),
+                        status: "confirmed".into(),
+                        basis: "offline".into(),
+                        note: "A checked case".into(),
+                        evidence: "e".repeat(8_001),
+                    },
+                    AuditedConcernOut {
+                        concern: "A comparison without an argument".into(),
+                        status: "confirmed".into(),
+                        basis: "opened_source".into(),
+                        note: "A named work alone".into(),
+                        evidence: "Work [opened: https://example.test/work]".into(),
+                    },
+                ],
+                verdict: "accept".into(),
+                summary: "Check bounded source evidence.".into(),
+                ..Default::default()
+            },
+            &input,
+            &claims,
+        )
+        .unwrap();
+        assert_eq!(oversized.concerns.len(), 1);
+        assert_eq!(oversized.concerns[0].status, ConcernStatus::NotCheckable);
+        assert!(oversized.summary.contains("dropped"));
         let named = AuditOut {
             verdict: "reject".into(),
             summary: "Known main result.".into(),
@@ -1307,7 +1264,9 @@ mod audit_tests {
                 correctness: "correct".into(),
                 comment: "An instantiation of the named work.".into(),
                 shape: Some("bind_only".into()),
-                known: Some("A named earlier work".into()),
+                known: Some(
+                    "A named earlier work [opened: https://example.test/earlier-work]".into(),
+                ),
                 ..Default::default()
             }],
             ..Default::default()
@@ -1316,7 +1275,7 @@ mod audit_tests {
             audit(named, &input, &claims).unwrap().claims[0]
                 .known
                 .as_deref(),
-            Some("A named earlier work")
+            Some("A named earlier work [opened: https://example.test/earlier-work]")
         );
         assert!(
             audit(
@@ -1349,7 +1308,7 @@ mod conjecture_tests {
             status_reason: "No solution in the supplied material.".into(),
             escape: "content".into(),
             escape_reason: "Would require a new estimate.".into(),
-            named_works: vec!["Named source".into()],
+            named_works: vec!["Named source [opened: https://example.test/named-source]".into()],
             ..Default::default()
         }
     }
@@ -1363,7 +1322,7 @@ mod conjecture_tests {
     }
 
     #[test]
-    fn conjecture_audit_requires_source_identity_and_offline_known_status_evidence() {
+    fn conjecture_audit_requires_opened_source_identity_and_matching_evidence() {
         let claims = super::referee_tests::claims();
         let input = AdvisorInput {
             kind: "conjecture".into(),

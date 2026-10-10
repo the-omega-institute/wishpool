@@ -90,6 +90,7 @@ impl std::fmt::Debug for OracleToken {
 
 #[derive(Debug, Clone)]
 pub enum AdvisorConfig {
+    Cma(CmaConfig),
     Codex {
         program: String,
         model: Option<String>,
@@ -97,6 +98,18 @@ pub enum AdvisorConfig {
     Chat {
         model: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct CmaConfig {
+    pub workspace: String,
+    pub profile: Option<serde_json::Value>,
+    pub transport: String,
+    pub base_url: String,
+    pub token_file: Option<String>,
+    pub token_account: Option<PersonId>,
+    pub program: String,
+    pub poll_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -139,8 +152,6 @@ pub struct Config {
     pub compile_timeout_secs: u64,
     /// Donated quota, when enabled (requires NyxID sign-in).
     pub hosted: Option<HostedConfig>,
-    pub openalex_url: String,
-    pub openalex_api_key: Option<String>,
     pub role: Role,
 }
 
@@ -290,7 +301,13 @@ impl Config {
             Some("cli") => bail!("WISHPOOL_ORACLE=cli requires a loopback WISHPOOL_BIND"),
             Some(other) => bail!("WISHPOOL_ORACLE must be http or cli, not {other}"),
         };
-        let advisor = match get("WISHPOOL_ADVISOR").as_deref() {
+        let legacy_advisor =
+            if get("WISHPOOL_AGENT_BACKEND").is_none() && get("WISHPOOL_CMA_WORKSPACE").is_none() {
+                get("WISHPOOL_ADVISOR")
+            } else {
+                None
+            };
+        let mut advisor = match legacy_advisor.as_deref() {
             None => None,
             Some("codex") if loopback => Some(AdvisorConfig::Codex {
                 program: get("WISHPOOL_CODEX_BIN").unwrap_or_else(|| "codex".into()),
@@ -320,12 +337,107 @@ impl Config {
             }
             Ok(value)
         };
+        let workspace = get("WISHPOOL_CMA_WORKSPACE");
+        let backend =
+            get("WISHPOOL_AGENT_BACKEND").or_else(|| workspace.as_ref().map(|_| "cma".into()));
+        match backend.as_deref() {
+            Some("cma") => {
+                let workspace = workspace.context("WISHPOOL_CMA_WORKSPACE is required for cma")?;
+                if workspace.is_empty()
+                    || workspace.len() > 200
+                    || !workspace
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                {
+                    bail!("invalid WISHPOOL_CMA_WORKSPACE");
+                }
+                let transport = get("WISHPOOL_CMA_TRANSPORT").unwrap_or_else(|| "http".into());
+                if !matches!(transport.as_str(), "cli" | "http") {
+                    bail!("WISHPOOL_CMA_TRANSPORT must be cli or http");
+                }
+                if transport == "cli" && !loopback {
+                    bail!("CMA CLI requires a loopback WISHPOOL_BIND");
+                }
+                let base_url = get("WISHPOOL_CMA_BASE_URL")
+                    .unwrap_or_else(|| "https://nyx-api.chrono-ai.fun/api/v1/proxy/s/cma".into());
+                let url = Url::parse(&base_url).context("invalid WISHPOOL_CMA_BASE_URL")?;
+                if url.host_str().is_none()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                    || url.query().is_some()
+                    || url.fragment().is_some()
+                    || !(url.scheme() == "https"
+                        || url.scheme() == "http"
+                            && url.host_str().is_some_and(|h| {
+                                h == "localhost" || h == "127.0.0.1" || h == "[::1]"
+                            }))
+                {
+                    bail!(
+                        "CMA base URL requires HTTPS (HTTP only on loopback), without credentials/query/fragment"
+                    );
+                }
+                let token_file = get("WISHPOOL_CMA_TOKEN_FILE");
+                let token_account = get("WISHPOOL_CMA_TOKEN_ACCOUNT").map(PersonId);
+                if transport == "cli" && (token_file.is_some() || token_account.is_some()) {
+                    bail!("CMA token file/delegation is HTTP only; CLI uses operator sign-in");
+                }
+                if token_account.is_some()
+                    && get("WISHPOOL_HOSTED_DONATIONS").as_deref() != Some("true")
+                {
+                    bail!("CMA delegated tokens require WISHPOOL_HOSTED_DONATIONS=true");
+                }
+                if transport == "http" && token_file.is_none() && token_account.is_none() {
+                    bail!(
+                        "CMA HTTP requires WISHPOOL_CMA_TOKEN_FILE or a delegated WISHPOOL_CMA_TOKEN_ACCOUNT"
+                    );
+                }
+                let profile = get("WISHPOOL_CMA_AGENT_PROFILE")
+                    .map(|text| serde_json::from_str::<serde_json::Value>(&text))
+                    .transpose()
+                    .context("CMA agent profile must be JSON {id,revision}")?;
+                if profile.as_ref().is_some_and(|v| {
+                    v.as_object().is_none_or(|o| o.len() != 2)
+                        || v["id"].as_str().is_none_or(|id| {
+                            id.is_empty()
+                                || id.len() > 200
+                                || !id
+                                    .bytes()
+                                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+                        })
+                        || v["revision"].as_u64().is_none_or(|r| r == 0)
+                }) {
+                    bail!("CMA agent profile requires exactly id and positive revision");
+                }
+                advisor = Some(AdvisorConfig::Cma(CmaConfig {
+                    workspace,
+                    profile,
+                    transport,
+                    base_url,
+                    token_file,
+                    token_account,
+                    program: get("WISHPOOL_CMA_CLI").unwrap_or_else(|| "nyxid".into()),
+                    poll_secs: seconds("WISHPOOL_CMA_POLL_SECS", 5)?,
+                }));
+            }
+            Some("codex-local") if loopback => {
+                advisor = Some(AdvisorConfig::Codex {
+                    program: get("WISHPOOL_CODEX_BIN").unwrap_or_else(|| "codex".into()),
+                    model: get("WISHPOOL_CODEX_MODEL"),
+                })
+            }
+            Some("codex-local") => bail!("codex-local requires a loopback WISHPOOL_BIND"),
+            Some(_) => bail!("WISHPOOL_AGENT_BACKEND must be cma or codex-local"),
+            None => {}
+        }
         let oracle_poll_secs = seconds("WISHPOOL_ORACLE_POLL_SECS", 60)?;
         let advisor_timeout_secs = seconds("WISHPOOL_ADVISOR_TIMEOUT_SECS", 1200)?;
         if advisor_timeout_secs > 3600 {
             bail!("WISHPOOL_ADVISOR_TIMEOUT_SECS must be at most 3600 seconds");
         }
         let audit_timeout_secs = seconds("WISHPOOL_AUDIT_TIMEOUT_SECS", 3600)?;
+        if matches!(advisor, Some(AdvisorConfig::Cma(_))) && audit_timeout_secs > 3600 {
+            bail!("CMA audit timeout must be at most 3600 seconds");
+        }
         if audit_timeout_secs > 7200 {
             bail!("WISHPOOL_AUDIT_TIMEOUT_SECS must be at most 7200 seconds");
         }
@@ -334,8 +446,13 @@ impl Config {
             bail!("WISHPOOL_FORMAL_TIMEOUT_SECS must be at most 3600 seconds");
         }
         let lean_workspace = get("WISHPOOL_LEAN_WORKSPACE");
-        if lean_workspace.is_some() && !matches!(advisor, Some(AdvisorConfig::Codex { .. })) {
-            bail!("WISHPOOL_LEAN_WORKSPACE requires WISHPOOL_ADVISOR=codex");
+        if lean_workspace.is_some()
+            && !matches!(
+                advisor,
+                Some(AdvisorConfig::Codex { .. } | AdvisorConfig::Cma(_))
+            )
+        {
+            bail!("WISHPOOL_LEAN_WORKSPACE requires cma or codex-local");
         }
 
         let review_account = PersonId(
@@ -429,9 +546,6 @@ impl Config {
                 .transpose()
                 .context("WISHPOOL_COMPILE_TIMEOUT_SECS must be seconds")?
                 .unwrap_or(180),
-            openalex_url: get("WISHPOOL_OPENALEX_URL")
-                .unwrap_or_else(|| "https://api.openalex.org".into()),
-            openalex_api_key: get("WISHPOOL_OPENALEX_API_KEY"),
             role: match get("WISHPOOL_ROLE").as_deref().unwrap_or("all") {
                 "api" => Role::Api,
                 "worker" => Role::Worker,
@@ -517,6 +631,78 @@ mod tests {
 #[cfg(test)]
 mod referee_tests {
     use super::*;
+    #[test]
+    fn cma_configuration_defaults_and_bounds() {
+        let c = local(&[
+            ("WISHPOOL_CMA_WORKSPACE", "wks_example"),
+            ("WISHPOOL_CMA_TRANSPORT", "cli"),
+        ])
+        .unwrap();
+        assert!(
+            matches!(c.advisor,Some(AdvisorConfig::Cma(CmaConfig{workspace,transport,poll_secs:5,..})) if workspace=="wks_example" && transport=="cli")
+        );
+        let c = local(&[
+            ("WISHPOOL_CMA_WORKSPACE", "wks_example"),
+            ("WISHPOOL_CMA_TOKEN_FILE", "/mounted/user-token"),
+            (
+                "WISHPOOL_CMA_AGENT_PROFILE",
+                r#"{"id":"agp_example","revision":2}"#,
+            ),
+        ])
+        .unwrap();
+        assert!(
+            matches!(c.advisor,Some(AdvisorConfig::Cma(CmaConfig{profile:Some(_),transport,..})) if transport=="http")
+        );
+        for extra in [
+            ("WISHPOOL_CMA_TRANSPORT", "other"),
+            ("WISHPOOL_CMA_POLL_SECS", "0"),
+            ("WISHPOOL_CMA_AGENT_PROFILE", "agp_unpinned"),
+            (
+                "WISHPOOL_CMA_AGENT_PROFILE",
+                r#"{"id":"agp_example","revision":0}"#,
+            ),
+            (
+                "WISHPOOL_CMA_AGENT_PROFILE",
+                r#"{"id":"agp_example","revision":2,"token":"forbidden"}"#,
+            ),
+            ("WISHPOOL_CMA_BASE_URL", "https://user:secret@example.org"),
+            ("WISHPOOL_CMA_BASE_URL", "http://example.org"),
+            ("WISHPOOL_AUDIT_TIMEOUT_SECS", "3601"),
+            ("WISHPOOL_CMA_TOKEN_ACCOUNT", "unconfigured-delegation"),
+        ] {
+            assert!(
+                local(&[
+                    ("WISHPOOL_CMA_WORKSPACE", "wks_example"),
+                    ("WISHPOOL_CMA_TOKEN_FILE", "/mounted/user-token"),
+                    extra
+                ])
+                .is_err(),
+                "{extra:?}"
+            );
+        }
+        assert!(local(&[("WISHPOOL_AGENT_BACKEND", "cma")]).is_err());
+        assert!(local(&[("WISHPOOL_AGENT_BACKEND", "unknown")]).is_err());
+        assert!(local(&[("WISHPOOL_CMA_WORKSPACE", "wks_example")]).is_err());
+        assert!(matches!(
+            local(&[("WISHPOOL_AGENT_BACKEND", "codex-local")])
+                .unwrap()
+                .advisor,
+            Some(AdvisorConfig::Codex { .. })
+        ));
+        assert!(
+            local(&[
+                ("WISHPOOL_BIND", "0.0.0.0:8080"),
+                ("WISHPOOL_STORAGE", "mongo"),
+                ("WISHPOOL_MONGODB_URI", "mongodb://127.0.0.1:1"),
+                ("WISHPOOL_AUTH_MODE", "nyxid"),
+                ("CHRONO_NYXID_CLIENT_ID", "id"),
+                ("CHRONO_NYXID_CLIENT_SECRET", "secret"),
+                ("WISHPOOL_AGENT_BACKEND", "codex-local")
+            ])
+            .is_err()
+        );
+    }
+
     use std::collections::HashMap;
 
     fn local(extra: &[(&str, &str)]) -> anyhow::Result<Config> {

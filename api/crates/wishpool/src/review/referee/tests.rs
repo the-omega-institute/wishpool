@@ -249,7 +249,9 @@ impl Advisor for FakeAdvisor {
                     } else {
                         vec![]
                     },
-                    known: (self.known && c.proved).then(|| "A reported source".into()),
+                    known: (self.known && c.proved).then(|| {
+                        "A reported source [opened: https://example.test/reported-work]".into()
+                    }),
                     ..Default::default()
                 })
                 .collect(),
@@ -426,9 +428,6 @@ impl World {
                 timeout: Duration::from_secs(1),
             },
             model: None,
-            openalex: Arc::new(
-                wishpool_review::openalex::OpenAlex::new("http://127.0.0.1:1", None).unwrap(),
-            ),
             reviewer,
             auditor_account,
             referee_account,
@@ -507,7 +506,7 @@ impl World {
 
 fn completed(recommendation: &str) -> ReviewResult<OracleStatus> {
     Ok(OracleStatus::Completed { model: None, text: serde_json::json!({"recommendation":recommendation,"summary":"A review",
-        "claims":[{"claim":"C1","shape":"content","witnesses":["A compactness lemma"],"known":"A reported source","note":"The intermediate argument"},
+        "claims":[{"claim":"C1","shape":"content","witnesses":["A compactness lemma"],"known":"A reported source [opened: https://example.test/reported-work]","note":"The intermediate argument"},
             {"claim":"C2","shape":"bind_only"}], "limits":["Computation was not reproduced"]}).to_string() })
 }
 
@@ -551,7 +550,11 @@ async fn polling_survives_transport_errors_without_resubmitting_or_burning_attem
     assert!(
         matches!(&judgements[0].reviewer, ReviewerIdentity::Machine { account, engine, model } if account.as_str() == "wishpool:referee" && engine == "nyxid-oracle" && model.as_deref() == Some("chatgpt-pro"))
     );
-    assert!(judgements[0].rationale.contains("A reported source"));
+    assert!(
+        judgements[0]
+            .rationale
+            .contains("A reported source [opened: https://example.test/reported-work]")
+    );
     assert!(
         w.worker
             .app
@@ -1127,7 +1130,11 @@ async fn known_main_result_gets_advice_and_auto_letter_but_no_formal_probe() {
             .body
             .starts_with("Your paper is not accepted.")
     );
-    assert!(file.letters[0].body.contains("A reported source"));
+    assert!(
+        file.letters[0]
+            .body
+            .contains("A reported source [opened: https://example.test/reported-work]")
+    );
     assert!(matches!(
         file.current().unwrap().formal.state,
         StepState::Skipped { .. }
@@ -1544,4 +1551,159 @@ async fn accepted_paper_problem_runs_independent_referee_audit_and_author_target
     let job = w.jobs.claim().await.unwrap().unwrap();
     assert!(!w.worker.open_problems_job(&job).await.unwrap());
     assert_eq!(w.oracle.submitted.load(Ordering::SeqCst), before);
+}
+
+struct ManagedTransport {
+    created: AtomicUsize,
+    calls: Mutex<Vec<(String, String)>>,
+    answers: Mutex<std::collections::BTreeMap<String, String>>,
+}
+#[async_trait]
+impl wishpool_review::cma::Transport for ManagedTransport {
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+        _key: Option<&str>,
+    ) -> ReviewResult<wishpool_review::cma::TransportReply> {
+        use serde_json::json;
+        self.calls.lock().await.push((method.into(), path.into()));
+        let mut response_id = None;
+        let value = if path.ends_with("/agents") {
+            let n = self.created.fetch_add(1, Ordering::SeqCst) + 1;
+            json!({"id":format!("agt_{n}")})
+        } else if method == "POST" && path.ends_with("/responses") {
+            let body = body.unwrap();
+            assert_eq!(body["stream"], true);
+            let text = body["input"].as_str().unwrap();
+            assert!(text.contains("Every gap is finite"));
+            assert!(!text.contains("Network access is disabled"));
+            let answer = if text.contains("Audit the GPT Pro referee report") {
+                json!({"verdict":"accept","summary":"The compactness argument supplies new content.","claims":[{"claim":"C1","correctness":"correct","comment":"A compactness lemma supplies the proof.","shape":"content","witnesses":["A compactness lemma"],"referee_agreed":true},{"claim":"C2","correctness":"not_checked","comment":"An open question."}]})
+            } else if text.contains("You are advising") {
+                json!({"summary":"Clarify the notation.","improvements":[],"formalization":[]})
+            } else {
+                json!({"subject":"Decision","body":"Dear A. Author,\n\nThe compactness argument is useful.","note":""})
+            };
+            let id = format!("resp_{}", self.created.load(Ordering::SeqCst));
+            self.answers
+                .lock()
+                .await
+                .insert(id.clone(), answer.to_string());
+            response_id = Some(id);
+            json!(null)
+        } else if method == "GET" && path.starts_with("api/v2/responses/") {
+            let id = path.rsplit('/').next().unwrap();
+            let answer = self.answers.lock().await.get(id).unwrap().clone();
+            json!({"status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":answer}]}]})
+        } else if path.ends_with("/controls") {
+            json!({"target_active":false,"target":{}})
+        } else {
+            json!(null)
+        };
+        Ok(wishpool_review::cma::TransportReply {
+            status: 200,
+            body: if value.is_null() {
+                String::new()
+            } else {
+                value.to_string()
+            },
+            response_id,
+        })
+    }
+}
+#[tokio::test]
+async fn pipeline_uses_durable_cma_for_audit_advice_letter_and_hides_provider_state() {
+    let mut w = World::new(vec![completed("accept")], true).await;
+    let transport = Arc::new(ManagedTransport {
+        created: AtomicUsize::new(0),
+        calls: Mutex::new(vec![]),
+        answers: Mutex::new(Default::default()),
+    });
+    w.worker.advisor = Some(Arc::new(wishpool_review::cma::CmaAdvisor {
+        client: Arc::new(wishpool_review::cma::Client {
+            transport: transport.clone(),
+            workspace: "wks_test".into(),
+            profile: None,
+            poll: Duration::from_millis(1),
+        }),
+        timeout: Duration::from_secs(60),
+        audit_timeout: Duration::from_secs(60),
+    }));
+    w.run_round().await;
+    let file = w.file().await;
+    assert_eq!(file.agent_steps.len(), 3);
+    assert_eq!(
+        file.current().unwrap().audit.engine.as_deref(),
+        Some("nyxid-cma")
+    );
+    assert_eq!(file.letters.len(), 1);
+    for step in file.agent_steps.values() {
+        assert_eq!(step.progress["stopped"], true);
+        assert_eq!(step.progress["deleted"], true);
+        assert!(
+            step.progress["agent_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("agt_")
+        );
+        assert!(
+            step.progress["response_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("resp_")
+        );
+    }
+    let view = serde_json::to_string(&w.worker.app.referee(&w.author, &w.paper.id).await.unwrap())
+        .unwrap();
+    assert!(!view.contains("agent_steps") && !view.contains("agt_") && !view.contains("resp_"));
+    assert_eq!(transport.created.load(Ordering::SeqCst), 3);
+}
+#[tokio::test]
+async fn withdrawn_paper_cleans_up_its_saved_cma_turn_after_a_worker_restart() {
+    use wishpool_review::cma::{RunState, RunStore};
+    let mut w = World::new(vec![], true).await;
+    let transport = Arc::new(ManagedTransport {
+        created: AtomicUsize::new(0),
+        calls: Mutex::new(vec![]),
+        answers: Mutex::new(Default::default()),
+    });
+    w.worker.advisor = Some(Arc::new(wishpool_review::cma::CmaAdvisor {
+        client: Arc::new(wishpool_review::cma::Client {
+            transport: transport.clone(),
+            workspace: "wks_test".into(),
+            profile: None,
+            poll: Duration::from_millis(1),
+        }),
+        timeout: Duration::from_secs(60),
+        audit_timeout: Duration::from_secs(60),
+    }));
+    let job = w.job().await;
+    let store = w.worker.agent_store(&job, &w.paper, "r1:audit:a0");
+    store
+        .save(
+            serde_json::to_value(RunState {
+                agent_id: Some("agt_previous_worker".into()),
+                response_id: Some("resp_previous_worker".into()),
+                deadline: u64::MAX,
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    w.worker.app.withdraw(&w.author, &w.paper.id).await.unwrap();
+    w.worker.cleanup_agents(&job).await.unwrap();
+    let state = store.load().await.unwrap().unwrap();
+    assert_eq!(state["deleted"], true);
+    assert!(
+        transport
+            .calls
+            .lock()
+            .await
+            .iter()
+            .any(|(method, path)| method == "DELETE" && path.ends_with("agt_previous_worker"))
+    );
+    assert_eq!(transport.created.load(Ordering::SeqCst), 0);
 }

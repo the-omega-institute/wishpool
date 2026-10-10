@@ -625,9 +625,6 @@ async fn donated_quota_runs_a_hosted_judgement() {
         app: h.app.clone(),
         nyxid: h.client.clone(),
         donations: h.donations.clone(),
-        openalex: Arc::new(
-            wishpool_review::openalex::OpenAlex::new("http://127.0.0.1:9", None).unwrap(),
-        ),
         interval: std::time::Duration::from_secs(1),
     };
     assert_eq!(worker.round_for_test().await.unwrap(), 1);
@@ -680,8 +677,8 @@ async fn donated_quota_runs_a_hosted_judgement() {
             .unwrap(),
         "refresh-2"
     );
-    // The donor already judged the theorem; the literature task needs
-    // OpenAlex, which is unreachable here, so the lease is released.
+    // The donor already judged the theorem; literature is handled by the
+    // networked referee/CMA pipeline, so hosted chat leaves that task open.
     assert_eq!(worker.round_for_test().await.unwrap(), 0);
     let literature = h
         .app

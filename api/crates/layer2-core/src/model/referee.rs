@@ -380,9 +380,20 @@ pub struct FeedbackLetter {
     pub sent_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStep {
+    pub version: u32,
+    pub claims_revision: u64,
+    /// Provider-specific progress; never part of an author/public projection.
+    pub progress: serde_json::Value,
+}
+
 /// Every round and letter of one paper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefereeFile {
+    /// Private durable external-agent steps, including auxiliary problem/target work.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub agent_steps: std::collections::BTreeMap<String, AgentStep>,
     /// The paper's id.
     pub id: SubmissionId,
     #[serde(default)]
@@ -397,6 +408,7 @@ impl RefereeFile {
     pub fn new(id: SubmissionId) -> Self {
         Self {
             id,
+            agent_steps: Default::default(),
             rounds: vec![],
             letters: vec![],
             revision: 0,

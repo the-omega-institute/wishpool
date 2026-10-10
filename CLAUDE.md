@@ -94,7 +94,7 @@ api/crates/
   layer2-core/     Layer 2: domain, threshold policy, judgements and analysis,
                    formalization, contribution network, ports, services. No I/O.
   layer3-latex/    Layer 3: unpack, read and compile LaTeX sources.
-  layer3-review/   Layer 3: models via the NyxID gateway, OpenAlex.
+  layer3-review/   Layer 3: models via NyxID: Oracle broker and CMA.
   verifier/        stateless, credential-free Lean checker and binary.
   wishpool/        binary: composition, MongoDB (GridFS for files), NyxID
                    sign-in and delegated tokens, workers.
@@ -179,7 +179,10 @@ sdk/contribute/    the contributors' CLI and MCP server.
 - Model output is untrusted. It is sanitised in the binary's review mapping;
   anything that cannot be represented faithfully is dropped and named in the
   report summary. Never invent a witness, a citation or an identifier;
-  literature leads name only works a search engine returned.
+  named prior works include the DOI, arXiv id or URL the model states it opened.
+  Those sources are reported, never venue-verified. External facts the model
+  could not open remain `not_checkable`. Never send secrets, credentials, token
+  files or deployment configuration to CMA; only bounded paper/review data.
 
 ## 8. infra never diverges from the code
 
@@ -218,14 +221,15 @@ from `develop`. No force pushes to either.
   reviews while the paper is in review, or send additional letters.
 - For conjectures, the referee supplies well-posedness reasons, open/known/unclear
   status, reported work names, content/bind-only escape reasons and sharpening
-  suggestions. Codex checks missing symbols/quantifiers and small cases offline;
-  known-result matches need offline evidence in available source/report material.
-  External knowledge is not checkable and becomes unclear, never verified.
+  suggestions. CMA Codex checks missing symbols/quantifiers and small cases, and
+  may search literature and open sources. Known-result matches require a
+  matching argument and the reported opened source, or reproducible local
+  mathematical evidence. Unopened external knowledge becomes unclear.
 - The audit checks source, report JSON and full text, computing where useful.
   It covers every confirmed statement with correctness, a one-sentence comment,
   proof shape/witnesses where applicable, and agreement with the referee.
-  External facts unavailable offline are `not_checkable`, never confirmed.
-  `known` names only works named in the paper or report; never invent citations.
+  External facts the agent could not open are `not_checkable`. Every named
+  prior work includes its reported opened source; never invent citations.
 - Layer 2 appends audit-derived S2 (known prior works) and S3 (main-result escape
   assessments) under the statement revision fence. Gap/error/not-checked main
   results have no escape witnesses and cannot ground acceptance. Publication is
@@ -251,7 +255,7 @@ from `develop`. No force pushes to either.
   Anyone else receives `not_found`, including readers of an accepted paper.
 - Referee readings remain machine judgements under `wishpool:referee` by default
   (engine `nyxid-oracle`). Audit reports and automatic letters use the separate
-  `wishpool:auditor` account by default (engine `codex-cli`). All model output is
+  `wishpool:auditor` account by default (engine `nyxid-cma`; `codex-cli` only for explicit development fallback). All model output is
   untrusted and sanitised in the binary; never invent witnesses or citations.
 - A referee request goes to every configured Oracle pool; the first completed
   answer is the report. The default pool is `chrono-chatgpt-pro-pool` on the
@@ -262,10 +266,29 @@ from `develop`. No force pushes to either.
   30-minute lease about every five minutes. A lost lease fences the pending
   result. Transport completion is not mathematical verification. Model output
   is sanitised in the binary.
-- Oracle CLI and Codex CLI backends are local-only and refused on non-loopback
-  binds. Their children inherit only `PATH` and operator `HOME`, never deployment
-  secrets. Codex operates on a fresh source copy with a separate scratch area,
-  sandbox network disabled and a deadline; source edits are forbidden.
+- All Codex agent steps use CMA through NyxID: audit, advice, letter,
+  accepted-paper Lean probe, conjecture target generation and paper-problem
+  audits. CMA network access is on. Paper TeX and needed inputs travel inline,
+  split into turns above 200 KiB. Final messages are JSON; Lean entries carry
+  every file's complete text. Answers are capped at 2,000,000 bytes.
+- CMA agent/response ids, chunk progress, deadlines and terminal answers are
+  durable private steps in the referee aggregate. Stable keys bind submission,
+  version, statement revision, round, step and attempt. Worker restarts resume
+  polling with those ids; uncertain mutations reuse the original key and body.
+  Agent steps have at most 3,600 seconds. The lease heartbeat stays active.
+- CMA output is untrusted: the binary writes returned Lean text into fresh
+  scratch and checks it locally; the credential-free solution verifier is
+  unchanged. Always stop and delete the CMA Agent after the final answer or on
+  cancellation/failure, best effort with logged failures. Credentials stay in
+  the transport, never in a model prompt.
+- `WISHPOOL_AGENT_BACKEND=cma|codex-local` selects the carrier; configuring a
+  CMA workspace defaults to CMA. `codex-local` is an explicit development
+  fallback, refused on non-loopback binds. Oracle CLI and CMA CLI are also
+  loopback-only. CLI children inherit only operator `PATH` and `HOME`.
+  The local fallback uses fresh source/scratch copies and disables its sandbox
+  network. Production CMA HTTP uses a NyxID user access token from the existing
+  sealed delegated-token refresh path or a mounted token file; agent keys are
+  rejected. Every new configuration key must be declared in infra (§8).
 
 ## 12. Solving and the leaderboard
 

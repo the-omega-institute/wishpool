@@ -29,7 +29,7 @@ contributor using a different model family agrees, or an editor decides.";
 pub const LITERATURE_CHECK: &str = "\
 Find prior work that states the statement (relation \"same\"), directly implies it (\"implies\"), or is \
 closely related (\"related\"). Cite only works you have actually opened: give an arXiv id, a DOI or a stable URL \
-for each. Search zbMATH Open (https://api.zbmath.org/v1/), OpenAlex (https://api.openalex.org) and arXiv; \
+for each. Search zbMATH Open (https://api.zbmath.org/v1/) and arXiv; \
 respect their rate limits. Submit: {\"output\":\"literature\",\"prior\":[{\"claim\":\"<the statement id, e.g. C2>\",\
 \"source\":{\"kind\":\"arxiv\"|\"doi\"|\"url\",\"locator\":\"…\"},\"relation\":\"same\"|\"implies\"|\"related\",\
 \"note\":\"…\"}],\"searched\":[\"what you searched\"],\"summary\":\"…\"}. An editor reviews it.";

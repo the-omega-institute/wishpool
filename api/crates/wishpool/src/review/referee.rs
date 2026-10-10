@@ -405,7 +405,11 @@ impl Worker {
                         audit.model = Some(advisor.model().into());
                         audit.input_digest =
                             Some(input_digest(&referee_prompts::audit(&input), &source));
-                        audit.attempts += 1;
+                        if matches!(audit.state, StepState::Pending)
+                            || advisor.managed_client().is_none()
+                        {
+                            audit.attempts += 1;
+                        }
                         audit.state = StepState::Running {
                             task: None,
                             queue_position: None,
@@ -420,29 +424,32 @@ impl Worker {
                                 RoundUpdate::Audit(audit.clone()),
                             )
                             .await?;
-                        audit.state =
-                            match tokio::time::timeout(self.audit_budget, advisor.audit(&input))
-                                .await
-                            {
-                                Ok(Ok(raw)) => {
-                                    match mapping::audit(raw, &input, &submission.claims) {
-                                        Ok(result) => StepState::Done {
-                                            result,
-                                            at: chrono::Utc::now(),
-                                        },
-                                        Err(error) => self.failed(error.to_string(), None, false),
-                                    }
-                                }
-                                Ok(Err(error)) if transient(&error) => {
-                                    return Err(Failure::Transient(error.to_string()));
-                                }
-                                Ok(Err(error)) => self.failed(error.to_string(), None, false),
-                                Err(_) => {
-                                    return Err(Failure::Transient(
-                                        "the audit exceeded its time budget".into(),
-                                    ));
-                                }
-                            };
+                        audit.state = match tokio::time::timeout(
+                            self.audit_budget,
+                            advisor.audit_with_store(
+                                &input,
+                                &self.agent_store(job, submission, &format!("r{number}:audit:a0")),
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(Ok(raw)) => match mapping::audit(raw, &input, &submission.claims) {
+                                Ok(result) => StepState::Done {
+                                    result,
+                                    at: chrono::Utc::now(),
+                                },
+                                Err(error) => self.failed(error.to_string(), None, false),
+                            },
+                            Ok(Err(error)) if transient(&error) => {
+                                return Err(Failure::Transient(error.to_string()));
+                            }
+                            Ok(Err(error)) => self.failed(error.to_string(), None, false),
+                            Err(_) => {
+                                return Err(Failure::Transient(
+                                    "the audit exceeded its time budget".into(),
+                                ));
+                            }
+                        };
                     }
                     Err(error) => audit.state = self.failed(error, None, false),
                 }
@@ -500,7 +507,11 @@ impl Worker {
                         advice.model = Some(advisor.model().into());
                         advice.input_digest =
                             Some(input_digest(&referee_prompts::advice(&input), &source));
-                        advice.attempts += 1;
+                        if matches!(advice.state, StepState::Pending)
+                            || advisor.managed_client().is_none()
+                        {
+                            advice.attempts += 1;
+                        }
                         advice.state = StepState::Running {
                             task: None,
                             queue_position: None,
@@ -515,7 +526,13 @@ impl Worker {
                                 RoundUpdate::Advice(advice.clone()),
                             )
                             .await?;
-                        advice.state = match advisor.advise(&input).await {
+                        advice.state = match advisor
+                            .advise_with_store(
+                                &input,
+                                &self.agent_store(job, submission, &format!("r{number}:advice:a0")),
+                            )
+                            .await
+                        {
                             Ok(raw) => StepState::Done {
                                 result: mapping::advice(raw, &submission.claims),
                                 at: chrono::Utc::now(),
@@ -559,7 +576,11 @@ impl Worker {
                                 &referee_prompts::letter(&input, advice.as_ref()),
                                 &source,
                             ));
-                            letter.attempts += 1;
+                            if matches!(letter.state, StepState::Pending)
+                                || advisor.managed_client().is_none()
+                            {
+                                letter.attempts += 1;
+                            }
                             letter.state = StepState::Running {
                                 task: None,
                                 queue_position: None,
@@ -575,7 +596,15 @@ impl Worker {
                                 )
                                 .await?;
                             letter.state = match advisor
-                                .draft_letter(&input, advice.as_ref())
+                                .letter_with_store(
+                                    &input,
+                                    advice.as_ref(),
+                                    &self.agent_store(
+                                        job,
+                                        submission,
+                                        &format!("r{number}:letter:a0"),
+                                    ),
+                                )
                                 .await
                                 .and_then(mapping::letter)
                             {
@@ -694,7 +723,14 @@ impl Worker {
                                 &serde_json::to_string(&input).unwrap_or_default(),
                                 &source,
                             ));
-                            formal.attempts += 1;
+                            if matches!(formal.state, StepState::Pending)
+                                || self
+                                    .advisor
+                                    .as_ref()
+                                    .is_none_or(|a| a.managed_client().is_none())
+                            {
+                                formal.attempts += 1;
+                            }
                             formal.state = StepState::Running {
                                 task: None,
                                 queue_position: None,
@@ -712,7 +748,15 @@ impl Worker {
                             let probe_dir = work.path().join("probe");
                             formal.state = match tokio::time::timeout(
                                 self.formal_budget,
-                                formalizer.formalize(&input, &probe_dir),
+                                formalizer.formalize_with_store(
+                                    &input,
+                                    &probe_dir,
+                                    &self.agent_store(
+                                        job,
+                                        submission,
+                                        &format!("r{number}:formal:a0"),
+                                    ),
+                                ),
                             )
                             .await
                             {
@@ -863,7 +907,23 @@ impl Worker {
             };
             let out = tokio::time::timeout(
                 self.formal_budget,
-                formalizer.formalize(&input, &work.path().join("target")),
+                formalizer.formalize_with_store(
+                    &input,
+                    &work.path().join("target"),
+                    &self.agent_store(
+                        job,
+                        &submission,
+                        &format!(
+                            "target:{}:a{}",
+                            claim.id,
+                            latest.map_or(0, |_| submission
+                                .lean_statements
+                                .iter()
+                                .filter(|a| a.claim == claim.id)
+                                .count())
+                        ),
+                    ),
+                ),
             )
             .await
             .map_err(|_| Failure::Transient("Lean statement elaboration timed out".into()))?
@@ -964,7 +1024,7 @@ impl Worker {
             referee: mapping::referee_out(report),
             audit: None,
             decision: None,
-            text: crate::latex::source_text(&file.bytes, &version.filename).ok(),
+            text: Some(crate::latex::source_text(&file.bytes, &version.filename)?),
             source_dir: Some(source_dir),
             main_file: Some(main),
         };

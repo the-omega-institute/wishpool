@@ -76,36 +76,6 @@ pub fn source_text(bytes: &[u8], filename: &str) -> Result<String, String> {
     )))
 }
 
-/// A search query from a statement: its words without math or commands,
-/// or `fallback` when too few remain.
-pub fn search_query(statement: &str, fallback: &str) -> String {
-    let text = parse::plain(statement);
-    let mut words = Vec::new();
-    let mut in_math = false;
-    for token in text.split_whitespace() {
-        let dollars = token.matches('$').count();
-        let was_math = in_math;
-        if dollars % 2 == 1 {
-            in_math = !in_math;
-        }
-        if was_math || dollars > 0 || token.starts_with('\\') {
-            continue;
-        }
-        let word: String = token
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-')
-            .collect();
-        if word.len() > 2 {
-            words.push(word);
-        }
-    }
-    if words.len() < 4 {
-        return fallback.to_owned();
-    }
-    words.truncate(20);
-    words.join(" ")
-}
-
 pub struct Compile {
     /// The TeX Live bin directory.
     pub tex_bin: PathBuf,
@@ -143,17 +113,6 @@ impl Compile {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn queries_drop_math_and_commands() {
-        let q = search_query(
-            "For every prime $p > 3$ the gap \\emph{between} consecutive zero runs is bounded by a constant",
-            "Title",
-        );
-        assert!(!q.contains('$') && !q.contains('>'), "{q}");
-        assert!(q.starts_with("For every prime the gap"), "{q}");
-        assert_eq!(search_query("$x$", "Title"), "Title");
-    }
 
     #[test]
     fn reads_a_single_file_paper() {

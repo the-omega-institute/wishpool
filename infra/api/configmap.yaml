@@ -37,7 +37,6 @@ data:
   WISHPOOL_DONATION_SERVICE_IDS: ""
   WISHPOOL_DONATION_MODEL: "claude-opus-5-5"
   WISHPOOL_HOSTED_INTERVAL_SECS: "30"
-  WISHPOOL_OPENALEX_URL: "https://api.openalex.org"
   RUST_LOG: "info"
   # Referee rounds are opt-in. CLI modes are refused on this production bind.
   WISHPOOL_ORACLE: ""
@@ -48,6 +47,18 @@ data:
   WISHPOOL_ORACLE_POLL_SECS: "60"
   WISHPOOL_REFEREE_ACCOUNT: "wishpool:referee"
   WISHPOOL_AUDITOR_ACCOUNT: "wishpool:auditor"
+  # CMA is the default when an existing workspace is configured. HTTP accepts
+  # NyxID user access tokens only; provision the mounted token file out of band.
+  WISHPOOL_AGENT_BACKEND: ""
+  WISHPOOL_CMA_WORKSPACE: ""
+  WISHPOOL_CMA_AGENT_PROFILE: ""
+  WISHPOOL_CMA_TRANSPORT: "http"
+  WISHPOOL_CMA_BASE_URL: "https://nyx-api.chrono-ai.fun/api/v1/proxy/s/cma"
+  WISHPOOL_CMA_TOKEN_FILE: ""
+  WISHPOOL_CMA_TOKEN_ACCOUNT: ""
+  WISHPOOL_CMA_CLI: "nyxid"
+  WISHPOOL_CMA_POLL_SECS: "5"
+  # Explicit legacy development/chat configuration; CMA workspace takes priority.
   WISHPOOL_ADVISOR: ""
   WISHPOOL_CODEX_BIN: "codex"
   WISHPOOL_CODEX_MODEL: ""

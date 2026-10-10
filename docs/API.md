@@ -329,7 +329,7 @@ Editors may restart settled reviews while the paper is in review; the internal
 worker services begin idempotently, fence revisions, and resume durable work.
 The audit recommendation is feedback, never a publication decision.
 
-Codex checks the source and the referee's JSON and full text offline. Layer 2
+Codex on CMA checks inline source and the referee's JSON/full text, with network access. Layer 2
 appends audit-derived S2 prior works and S3 main-result assessments together under
 the submission fence, then applies the same `Policy::decide` path as editors.
 Named prior works use source kind `named_work`, retaining the reported name
@@ -407,7 +407,7 @@ type RefereeRound = {
   letter?: Step<LetterDraft>;       // staff only
 };
 type Step<T> = {
-  engine?: string | null;           // e.g. nyxid-oracle, codex-cli, openai-compatible
+  engine?: string | null;           // e.g. nyxid-oracle, nyxid-cma, codex-cli (explicit local fallback)
   model?: string | null;            // recorded model label, not UI attestation
   attempts: number;                 // external work starts; polls do not increment it
   client_ref?: string | null;       // durable Oracle idempotency identity
@@ -559,15 +559,30 @@ text as a report without a recommendation, and the parse limitation is visible
 to staff.
 
 Audit sanitisation preserves source identity: unsupported/unknown/duplicate
-readings and invented prior works are dropped and named in the summary. Missing
-statements get an explicit `not_checked` reading; no witness is invented. Offline
-confirmation/refutation requires reported evidence; external attributions such
-as OEIS are `not_checkable`. The Codex prompt is capped at 500,000 characters,
-answers at 2,000,000 bytes, and its deadline at the configured audit timeout
-(default 3,600 seconds, maximum 7,200 seconds). Advice and letter calls use
-the advisor timeout (default 1,200, maximum 3,600); the worker renews the
-30-minute lease while any step runs. Audit transport timeouts retry the same
-job under the existing attempt limit while all dependent steps remain pending.
+readings and unusable prior works are dropped and named in the summary. Missing
+statements get `not_checked`; no witness or identifier is invented. Every named
+work includes the source the model states it opened, as
+`Title [opened: DOI:10.../...]`, `Title [opened: arXiv:NNNN.NNNNN]` or
+`Title [opened: https://...]`. These are reported sources, not venue verification.
+Mathematical confirmation/refutation needs reproducible evidence (`basis:
+"offline"`); an opened external source needs `basis: "opened_source"` and its
+full named-work string on a separate evidence line, with a matching argument.
+Unopened external facts stay `not_checkable`.
+
+All managed Codex steps use CMA and retain private agent/response identifiers,
+chunk progress, input digest, original deadline and terminal answers in
+`RefereeFile.agent_steps`. Restart/begin round results for authorized staff may
+include this map, whose entries are `{version, claims_revision, progress}`;
+`progress` is private provider metadata. It is absent from referee author/public
+projections. Existing step/result and public API routes are unchanged.
+CMA inputs split above 200 KiB and final JSON is capped at 2,000,000 bytes.
+CMA deadlines are at most 3,600 seconds (audit default 3,600; advice/letter/Lean
+default 1,200). The worker retains its lease heartbeat and resumes existing
+responses after restart. Agents are stopped/deleted after output or failure.
+Returned Lean text is independently checked locally; solution-verifier
+receipts keep their existing credential-free meaning. The explicit loopback
+`codex-local` fallback retains a 500,000-character prompt cap and a 7,200-second
+audit maximum.
 
 Example author outcome after automatic delivery (other report/audit fields omitted
 here for brevity):
@@ -601,8 +616,9 @@ environments and suggest main roles; the author confirms those too.
 
 Conjecture referee/audit claim objects carry `conjecture: ConjectureReading`.
 Audit input additionally uses `status_basis` and `status_evidence`: claimed known
-statuses require offline evidence; unavailable external knowledge becomes unclear.
-Named works must occur in the source/report material. Missing, invented,
+statuses require reproducible mathematical evidence or an opened source and
+matching argument; unopened external knowledge becomes unclear. Named works
+carry the reported source the model states it opened. Missing, invented,
 unsupported or duplicate audit readings become explicit unchecked readings and
 cannot qualify for admission. Reasons, lists and names are bounded, and no
 bibliographic identifier or witness is invented.

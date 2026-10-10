@@ -14,8 +14,8 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::json;
 
 use crate::{
-    CandidateRelation, Document, EscapeProposal, JudgementDraft, ReviewError, ReviewModel,
-    ReviewResult, Statement, Usage, openalex::Work,
+    Document, EscapeProposal, JudgementDraft, ReviewError, ReviewModel, ReviewResult, Statement,
+    Usage,
 };
 
 /// Characters of document text included in one prompt.
@@ -103,21 +103,6 @@ struct UsageEnvelope {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
-}
-
-#[derive(Deserialize)]
-struct QueriesReply {
-    #[serde(default)]
-    queries: Vec<String>,
-}
-
-/// Queries per statement.
-pub const MAX_QUERIES: usize = 3;
-
-#[derive(Deserialize)]
-struct CandidateReply {
-    #[serde(default)]
-    relations: Vec<CandidateRelation>,
 }
 
 #[derive(Deserialize)]
@@ -212,68 +197,6 @@ impl ReviewModel for ChatModel {
             context.chars().take(20_000).collect::<String>()
         );
         self.complete_metered(prompts::STATEMENT, user).await
-    }
-
-    async fn search_queries(
-        &self,
-        title: &str,
-        abstract_text: &str,
-        statement: &str,
-    ) -> ReviewResult<(Vec<String>, Usage)> {
-        let user = format!(
-            "PAPER: {}\n\nABSTRACT:\n{}\n\nSTATEMENT:\n{}",
-            title,
-            abstract_text.chars().take(4_000).collect::<String>(),
-            statement.chars().take(10_000).collect::<String>()
-        );
-        let (reply, usage): (QueriesReply, Usage) =
-            self.complete_metered(prompts::QUERIES, user).await?;
-        let mut queries: Vec<String> = Vec::new();
-        for query in reply.queries {
-            let query: String = query
-                .chars()
-                .filter(|c| !matches!(c, '$' | '\\' | '{' | '}' | '"'))
-                .take(120)
-                .collect();
-            let query = query.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !query.is_empty() && !queries.contains(&query) {
-                queries.push(query);
-            }
-        }
-        queries.truncate(MAX_QUERIES);
-        Ok((queries, usage))
-    }
-
-    async fn relate_candidates(
-        &self,
-        statement: &str,
-        candidates: &[Work],
-    ) -> ReviewResult<(Vec<CandidateRelation>, Usage)> {
-        let listing: Vec<String> = candidates
-            .iter()
-            .enumerate()
-            .map(|(i, w)| {
-                format!(
-                    "[{i}] {} ({}) {}",
-                    w.title,
-                    w.year.map(|y| y.to_string()).unwrap_or_default(),
-                    w.abstract_text.chars().take(1_200).collect::<String>()
-                )
-            })
-            .collect();
-        let user = format!(
-            "STATEMENT:\n{}\n\nCANDIDATES:\n{}",
-            statement.chars().take(10_000).collect::<String>(),
-            listing.join("\n\n")
-        );
-        let (reply, usage): (CandidateReply, Usage) =
-            self.complete_metered(prompts::CANDIDATES, user).await?;
-        let relations = reply
-            .relations
-            .into_iter()
-            .filter(|r| r.index < candidates.len())
-            .collect();
-        Ok((relations, usage))
     }
 }
 

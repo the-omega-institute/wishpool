@@ -8,102 +8,17 @@
 //! files every result through Layer 2 as the reviewer service account, under
 //! the same rules as any other reviewer.
 
+mod agent_store;
 pub(crate) mod mapping;
 mod open_problems;
 mod referee;
+mod sources;
 mod worker;
 
 use async_trait::async_trait;
-use wishpool_core::{
-    CoreResult,
-    ids::SubmissionId,
-    model::{Stage, normalise_doi},
-    ports::JobKind,
-};
+use wishpool_core::{CoreResult, ids::SubmissionId, model::Stage, ports::JobKind};
 
 pub use worker::{Worker, run_reconciler};
-
-/// Candidates kept per statement across its queries.
-pub const CANDIDATES_PER_STATEMENT: usize = 10;
-const CANDIDATES_PER_QUERY: usize = 6;
-
-/// The paper a literature search runs for; its own entries are excluded.
-pub struct SearchedPaper<'a> {
-    pub title: &'a str,
-    pub abstract_text: &'a str,
-    pub doi: Option<&'a str>,
-}
-
-/// Search OpenAlex for one statement and relate what it returns: the model
-/// writes the queries, the search supplies the works, the model relates
-/// only those works. Returns the leads and the summed usage.
-pub(crate) async fn search_statement(
-    model: &dyn wishpool_review::ReviewModel,
-    openalex: &wishpool_review::openalex::OpenAlex,
-    paper: &SearchedPaper<'_>,
-    claim: &wishpool_core::ids::ClaimId,
-    statement: &str,
-) -> wishpool_review::ReviewResult<(mapping::Found, wishpool_review::Usage)> {
-    let (mut queries, mut usage) = model
-        .search_queries(paper.title, paper.abstract_text, statement)
-        .await?;
-    if queries.is_empty() {
-        queries.push(crate::latex::search_query(statement, paper.title));
-    }
-    let mut candidates: Vec<wishpool_review::openalex::Work> = Vec::new();
-    for query in &queries {
-        for work in openalex.search(query, CANDIDATES_PER_QUERY).await? {
-            if candidates.len() < CANDIDATES_PER_STATEMENT
-                && !is_same_paper(&work, paper)
-                && !candidates.iter().any(|c| c.id == work.id)
-            {
-                candidates.push(work);
-            }
-        }
-    }
-    let relations = if candidates.is_empty() {
-        vec![]
-    } else {
-        let (relations, more) = model.relate_candidates(statement, &candidates).await?;
-        usage.input += more.input;
-        usage.output += more.output;
-        relations
-    };
-    Ok((
-        mapping::Found {
-            claim: claim.clone(),
-            queries,
-            candidates,
-            relations,
-        },
-        usage,
-    ))
-}
-
-fn normalized(title: &str) -> String {
-    title
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-/// Whether a search result is the submitted paper itself (or a companion
-/// entry with its title, such as a reproducibility package).
-fn is_same_paper(work: &wishpool_review::openalex::Work, paper: &SearchedPaper<'_>) -> bool {
-    let title = normalized(paper.title);
-    if !title.is_empty() && normalized(&work.title).starts_with(&title) {
-        return true;
-    }
-    match (paper.doi, &work.doi) {
-        (Some(paper_doi), Some(work_doi)) => {
-            let paper_doi = normalise_doi(paper_doi);
-            !paper_doi.is_empty()
-                && paper_doi.to_lowercase() == normalise_doi(work_doi).to_lowercase()
-        }
-        _ => false,
-    }
-}
 
 pub const MAX_ATTEMPTS: u32 = 3;
 
@@ -324,95 +239,6 @@ mod tests {
             "stage:literature"
         );
         assert_eq!(parse_kind_key("stage:nonsense"), None);
-    }
-}
-
-#[cfg(test)]
-mod search_tests {
-    use wishpool_review::openalex::Work;
-
-    use super::{SearchedPaper, is_same_paper};
-
-    fn work(title: &str, doi: Option<&str>) -> Work {
-        Work {
-            id: "W1".into(),
-            title: title.into(),
-            doi: doi.map(str::to_owned),
-            year: Some(2026),
-            abstract_text: String::new(),
-        }
-    }
-
-    #[test]
-    fn excludes_the_paper_and_its_companions() {
-        let paper = SearchedPaper {
-            title: "A Padovan-automatic description of a nested recurrence",
-            abstract_text: "",
-            doi: Some("10.48550/arXiv.2609.33421"),
-        };
-        assert!(is_same_paper(
-            &work(
-                "A Padovan-Automatic Description of a Nested Recurrence",
-                None
-            ),
-            &paper
-        ));
-        assert!(is_same_paper(
-            &work(
-                "A Padovan-automatic description of a nested recurrence: reproducibility package",
-                None
-            ),
-            &paper
-        ));
-        assert!(is_same_paper(
-            &work(
-                "Preprint",
-                Some("https://doi.org/10.48550/arXiv.2609.33421")
-            ),
-            &paper
-        ));
-        assert!(!is_same_paper(
-            &work("An exploration of nested recurrences", None),
-            &paper
-        ));
-    }
-
-    #[test]
-    fn matches_normalised_dois_exactly_ignoring_case() {
-        let paper = SearchedPaper {
-            title: "",
-            abstract_text: "",
-            doi: Some("  DOI: 10.1000/AbC  "),
-        };
-        for doi in [
-            "10.1000/abc",
-            " https://doi.org/10.1000/ABC ",
-            "http://dx.doi.org/10.1000/abc",
-        ] {
-            assert!(is_same_paper(&work("Other title", Some(doi)), &paper));
-        }
-        for doi in ["10.1000/abc2", "10.9999/10.1000/abc", "10.1000/ab", ""] {
-            assert!(!is_same_paper(&work("Other title", Some(doi)), &paper));
-        }
-        assert!(!is_same_paper(&work("Other title", None), &paper));
-        let paper = SearchedPaper {
-            doi: Some(" doi: "),
-            ..paper
-        };
-        assert!(!is_same_paper(&work("Other title", Some("")), &paper));
-        let paper = SearchedPaper { doi: None, ..paper };
-        assert!(!is_same_paper(
-            &work("Other title", Some("10.1000/abc")),
-            &paper
-        ));
-        let paper = SearchedPaper {
-            doi: Some("10.1000/Ä"),
-            ..paper
-        };
-        assert!(is_same_paper(
-            &work("Other title", Some("10.1000/ä")),
-            &paper
-        ));
     }
 }
 

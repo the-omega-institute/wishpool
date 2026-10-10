@@ -83,6 +83,8 @@ struct ProverFile {
     claim: String,
     theorem: String,
     note: String,
+    path: String,
+    text: String,
 }
 
 #[async_trait]
@@ -90,6 +92,14 @@ pub trait Formalizer: Send + Sync {
     fn engine(&self) -> &str;
     fn model(&self) -> &str;
     async fn formalize(&self, input: &FormalInput, work: &Path) -> ReviewResult<FormalOut>;
+    async fn formalize_with_store(
+        &self,
+        input: &FormalInput,
+        work: &Path,
+        _store: &dyn crate::cma::RunStore,
+    ) -> ReviewResult<FormalOut> {
+        self.formalize(input, work).await
+    }
     async fn elaborate_target(
         &self,
         _claim: &str,
@@ -139,6 +149,96 @@ async fn capture(program: &Path, args: &[&str], dir: &Path) -> ReviewResult<Stri
 }
 
 impl CodexLean {
+    /// CMA's claims of successful compilation are ignored. Check exact returned bytes.
+    pub(crate) async fn recheck_json(
+        &self,
+        input: &FormalInput,
+        work: &Path,
+        answer: &str,
+    ) -> ReviewResult<FormalOut> {
+        let env = self.env().await?;
+        self.recheck_with_env(input, work, answer, &env).await
+    }
+    async fn recheck_with_env(
+        &self,
+        input: &FormalInput,
+        work: &Path,
+        answer: &str,
+        env: &LeanEnv,
+    ) -> ReviewResult<FormalOut> {
+        if answer.len() > crate::cma::MAX_JSON {
+            return Err(ReviewError::Output(
+                "Lean JSON exceeds 2000000 bytes".into(),
+            ));
+        }
+        let said: ProverAnswer = serde_json::from_str(answer)
+            .map_err(|_| ReviewError::Output("invalid Lean JSON".into()))?;
+        let mut seen = std::collections::BTreeSet::new();
+        for file in &said.files {
+            if !seen.insert(&file.claim)
+                || !input.targets.iter().any(|t| t.claim == file.claim)
+                || file.path != format!("lean/{}.lean", file.claim)
+                || !file
+                    .claim
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                || file.text.chars().count() > MAX_LEAN_CHARS
+            {
+                return Err(ReviewError::Output(
+                    "unusable, duplicate or unexpected Lean file".into(),
+                ));
+            }
+        }
+        let lean_dir = work.join("lean");
+        let check_dir = work.join("check");
+        std::fs::create_dir_all(&lean_dir).map_err(io_error)?;
+        std::fs::create_dir_all(&check_dir).map_err(io_error)?;
+        let mut files = Vec::new();
+        for target in &input.targets {
+            let Some(reported) = said
+                .files
+                .iter()
+                .find(|f| f.claim == target.claim && !f.text.is_empty())
+            else {
+                files.push(missing(target, "no Lean file was returned"));
+                continue;
+            };
+            // The remote path is validated but never used to select a local destination.
+            std::fs::write(
+                lean_dir.join(format!("{}.lean", target.claim)),
+                &reported.text,
+            )
+            .map_err(io_error)?;
+            let lean = if input.conjecture {
+                wishpool_verifier::convert_target(&reported.text)
+                    .unwrap_or_else(|_| reported.text.clone())
+            } else {
+                reported.text.clone()
+            };
+            let theorem = if input.conjecture {
+                "wishpool_target_prop"
+            } else {
+                reported.theorem.trim()
+            };
+            let mut checked = self
+                .check(
+                    env,
+                    &check_dir,
+                    &target.claim,
+                    Some(theorem),
+                    &lean,
+                    input.conjecture,
+                )
+                .await;
+            checked.note = reported.note.clone();
+            files.push(checked);
+        }
+        Ok(FormalOut {
+            toolchain: env.toolchain.clone(),
+            files,
+            summary: said.summary,
+        })
+    }
     async fn env(&self) -> ReviewResult<LeanEnv> {
         let lake = Path::new("lake");
         let lean_path = capture(lake, &["env", "printenv", "LEAN_PATH"], &self.workspace).await?;
@@ -205,7 +305,15 @@ impl CodexLean {
             return file;
         }
         let mut command = local_command(&env.lean);
+        let checker_home = match tempfile::tempdir_in(dir) {
+            Ok(home) => home,
+            Err(_) => {
+                file.log = "checker home unavailable".into();
+                return file;
+            }
+        };
         command
+            .env("HOME", checker_home.path())
             .env("LEAN_PATH", &env.lean_path)
             .current_dir(dir)
             .args(["-j", "2"])
@@ -424,6 +532,22 @@ fn missing(target: &FormalTarget, reason: &str) -> CheckedFile {
 
 /// Constructs that would let a file compile without proving its theorem.
 fn forbidden(lean: &str) -> Option<String> {
+    // Reuse the verifier scan while preserving namespaces permitted for probes.
+    let scan = lean
+        .split_whitespace()
+        .filter(|w| !matches!(*w, "namespace" | "section" | "end"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some(reason) = wishpool_verifier::forbidden(&scan) {
+        return Some(reason);
+    }
+    if lean
+        .lines()
+        .filter(|l| l.trim_start().starts_with("import "))
+        .any(|l| l.trim() != "import Mathlib")
+    {
+        return Some("only Mathlib may be imported".into());
+    }
     for word in [
         "sorry",
         "admit",
@@ -596,6 +720,95 @@ fn tail(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cma_json_text_is_written_and_independently_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("fake-local-check");
+        let checker = CodexLean {
+            program: "unused".into(),
+            model: None,
+            workspace: dir.path().into(),
+            timeout: Duration::from_secs(2),
+            check_timeout: Duration::from_secs(15),
+        };
+        let env = LeanEnv {
+            lean: program.clone(),
+            lean_path: "fake".into(),
+            toolchain: "pinned-test-revision".into(),
+        };
+        let input = FormalInput {
+            conjecture: false,
+            correction: None,
+            title: "Paper".into(),
+            abstract_text: String::new(),
+            statements: vec![],
+            targets: vec![FormalTarget {
+                claim: "C1".into(),
+                label: "Theorem 1".into(),
+                statement: "True".into(),
+                lean_sketch: String::new(),
+                plan: String::new(),
+                mathlib: vec![],
+            }],
+            source_dir: None,
+            main_file: None,
+        };
+        let text = "import Mathlib\nnamespace Wishpool.C1\ntheorem main : True := by trivial\nend Wishpool.C1\n";
+        let mut remote = serde_json::json!({"summary":"CMA claims success","files":[{"claim":"C1","path":"lean/C1.lean","text":text,"theorem":"Wishpool.C1.main","note":"Exact statement","compiled":true,"axioms":[]}]});
+        for (receipt, expected) in [
+            ("'Wishpool.C1.main' does not depend on any axioms", true),
+            ("error: type mismatch", false),
+            ("'Wishpool.C1.main' depends on axioms: [remoteAxiom]", false),
+        ] {
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\ncat <<'RECEIPT'\n{receipt}\nRECEIPT\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let out = checker
+                .recheck_with_env(&input, dir.path(), &remote.to_string(), &env)
+                .await
+                .unwrap();
+            assert_eq!(out.files[0].compiled, expected, "{}", out.files[0].log);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("lean/C1.lean")).unwrap(),
+                text
+            );
+            assert!(out.toolchain.contains("pinned-test-revision"));
+        }
+        remote["files"][0]["path"] = serde_json::json!("../../escape.lean");
+        assert!(
+            checker
+                .recheck_with_env(&input, dir.path(), &remote.to_string(), &env)
+                .await
+                .is_err()
+        );
+        remote["files"][0]["path"] = serde_json::json!("lean/C1.lean");
+        remote["files"][0]["text"] =
+            serde_json::json!("import Mathlib\ntheorem main : True := by sorry");
+        assert!(
+            !checker
+                .recheck_with_env(&input, dir.path(), &remote.to_string(), &env)
+                .await
+                .unwrap()
+                .files[0]
+                .compiled
+        );
+        remote["files"][0]["text"] = serde_json::json!(
+            "import Mathlib\n#eval IO.println \"fake receipt\"\ntheorem main : True := by trivial"
+        );
+        assert!(
+            !checker
+                .recheck_with_env(&input, dir.path(), &remote.to_string(), &env)
+                .await
+                .unwrap()
+                .files[0]
+                .compiled
+        );
+    }
 
     #[test]
     fn reads_axioms_and_refuses_escape_hatches() {
@@ -655,7 +868,7 @@ mod tests {
             model: None,
             workspace: dir.path().into(),
             timeout: Duration::from_secs(2),
-            check_timeout: Duration::from_secs(2),
+            check_timeout: Duration::from_secs(15),
         };
         let env = LeanEnv {
             lean: program.clone(),

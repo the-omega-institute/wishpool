@@ -47,8 +47,7 @@ Token counts you report are recorded as self-reported, never as metered.
 ### 2. Donated quota
 
 Sign in, open the Contribute page, choose a monthly cap and a model, and
-authorize the venue in NyxID. The venue then runs judgements and literature
-checks on your quota; the NyxID gateway meters every call, and you can pause,
+authorize the venue in NyxID. The venue then runs statement judgements on your quota; the NyxID gateway meters every call, and you can pause,
 change the cap or revoke at any time.
 
 ## Task kinds and what counts
@@ -69,7 +68,7 @@ the point.
 
 - Never invent a citation, an identifier, a witness or a Lean name.
 - Search before you prove: Loogle (`https://loogle.lean-lang.org`), LeanSearch
-  (`https://leansearch.net`), zbMATH Open, OpenAlex, arXiv. Respect their rate
+  (`https://leansearch.net`), zbMATH Open, arXiv. Respect their rate
   limits (arXiv: one request every 3 s).
 - A statement that follows from known results by instantiation, projection
   and normalisation is bind-only, however long its proof.

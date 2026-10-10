@@ -8,23 +8,20 @@ use wishpool_core::{
     model::{Caller, ReviewerIdentity, Stage, Submission, SubmissionStatus},
     ports::JobKind,
 };
-use wishpool_review::{Document, ReviewModel, openalex::OpenAlex};
+use wishpool_review::{Document, ReviewModel};
 
-use super::{JobLease, LeasedJob, SearchedPaper, kind_key, mapping, search_statement};
+use super::{JobLease, LeasedJob, kind_key, mapping};
 use crate::latex::{self, Compile};
 
 const IDLE_POLL: Duration = Duration::from_secs(3);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(5 * 60);
-/// Main results searched per paper.
-const MAX_SEARCHED: usize = 6;
 
 pub struct Worker {
     pub app: Arc<App>,
     pub jobs: Arc<dyn JobLease>,
     pub compile: Compile,
     pub model: Option<Arc<dyn ReviewModel>>,
-    pub openalex: Arc<OpenAlex>,
     pub reviewer: Caller,
     pub referee_account: Caller,
     pub auditor_account: Caller,
@@ -150,6 +147,7 @@ impl Worker {
                 .await?;
             return Ok(false);
         }
+        self.cleanup_agents(job).await?;
         if job.kind == JobKind::OpenProblems {
             return self.open_problems_job(job).await;
         }
@@ -170,7 +168,8 @@ impl Worker {
             | JobKind::LeanStatement
             | JobKind::Referee => unreachable!("referee handled above"),
             JobKind::Compile => self.compile(job, &submission).await,
-            JobKind::Stage(Stage::Literature) => self.literature(job, &submission).await,
+            // Literature is supplied by the networked referee and durable CMA audit.
+            JobKind::Stage(Stage::Literature) => Ok(()),
             JobKind::Stage(Stage::Escape) => self.escape(job, &submission).await,
             // The compile job files S0; the author confirms S1.
             JobKind::Stage(Stage::Hygiene | Stage::Claims) => Ok(()),
@@ -223,50 +222,6 @@ impl Worker {
         self.ensure_lease(job).await?;
         self.app
             .record_compilation(&self.reviewer, &submission.id, number, outcome)
-            .await?;
-        Ok(())
-    }
-
-    async fn literature(&self, job: &LeasedJob, submission: &Submission) -> Result<(), Failure> {
-        let Some(model) = &self.model else {
-            return Ok(());
-        };
-        if !submission.is_open() || submission.latest_report(Stage::Literature).is_some() {
-            return Ok(());
-        }
-        let paper = SearchedPaper {
-            title: &submission.title,
-            abstract_text: &submission.abstract_text,
-            doi: submission.doi.as_deref(),
-        };
-        let mut found = Vec::new();
-        for claim in submission
-            .claims
-            .iter()
-            .filter(|c| c.is_main_result())
-            .take(MAX_SEARCHED)
-        {
-            let (leads, _) = search_statement(
-                model.as_ref(),
-                &self.openalex,
-                &paper,
-                &claim.id,
-                &claim.statement,
-            )
-            .await
-            .map_err(model_failure)?;
-            found.push(leads);
-        }
-        let draft = mapping::literature(&found, model.model());
-        self.ensure_lease(job).await?;
-        self.app
-            .file_report(
-                &self.reviewer,
-                &submission.id,
-                Stage::Literature,
-                draft,
-                Some(self.filed_by(model.as_ref())),
-            )
             .await?;
         Ok(())
     }

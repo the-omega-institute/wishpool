@@ -143,7 +143,7 @@ export const reports: StageReport[] = [
     stage: 'literature',
     outcome: { outcome: 'pass' },
     summary: 'Old leads.',
-    payload: { stage: 'literature', prior: [], searched: ['OpenAlex'] },
+    payload: { stage: 'literature', prior: [], searched: ['Reported sources'] },
     evidence: [],
     reviewer: human,
     claims_revision: 0,
@@ -172,7 +172,7 @@ export const reports: StageReport[] = [
   {
     stage: 'literature',
     outcome: { outcome: 'pass' },
-    summary: 'Machine leads from OpenAlex.',
+    summary: 'Machine leads from Reported sources.',
     payload: {
       stage: 'literature',
       prior: [
@@ -183,7 +183,7 @@ export const reports: StageReport[] = [
           note: 'A weaker bound.',
         },
       ],
-      searched: ['OpenAlex'],
+      searched: ['Reported sources'],
     },
     evidence: [],
     reviewer: machine,

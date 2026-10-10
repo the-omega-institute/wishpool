@@ -14,7 +14,7 @@ use wishpool_core::{
     policy::Policy,
     ports::{Ports, SystemClock},
 };
-use wishpool_review::{ReviewModel, openai_compat::ChatModel, openalex::OpenAlex};
+use wishpool_review::{ReviewModel, openai_compat::ChatModel};
 
 use crate::{
     auth::{self, AuthState, AuthStore, MemoryAuthStore, Provider, nyxid::NyxIdClient},
@@ -146,17 +146,12 @@ impl Composition {
             }
             None => None,
         };
-        let openalex = Arc::new(OpenAlex::new(
-            &config.openalex_url,
-            config.openalex_api_key.clone(),
-        )?);
         let hosted = match (&provider, &donations, &config.hosted) {
             (Provider::NyxId(client), Some(donations), Some(hosted)) => {
                 Some(Arc::new(HostedWorker {
                     app: app.clone(),
                     nyxid: client.clone(),
                     donations: donations.clone(),
-                    openalex: openalex.clone(),
                     interval: Duration::from_secs(hosted.interval_secs),
                 }))
             }
@@ -223,23 +218,42 @@ impl Composition {
             }
             None => "chatgpt-pro".into(),
         };
-        let formalizer: Option<Arc<dyn wishpool_review::lean::Formalizer>> =
-            match (&config.lean_workspace, &config.advisor) {
-                (Some(workspace), Some(AdvisorConfig::Codex { program, model })) => {
-                    Some(Arc::new(wishpool_review::lean::CodexLean {
-                        program: program.into(),
-                        model: model.clone(),
-                        workspace: workspace.into(),
-                        timeout: Duration::from_secs(config.formal_timeout_secs),
-                        check_timeout: Duration::from_secs(120),
-                    }))
-                }
-                _ => None,
-            };
         let auditor_account = app
             .ensure_service_account(&config.auditor_account, "Wishpool auditor", Role::Reviewer)
             .await?;
+        let cma = match &config.advisor {
+            Some(AdvisorConfig::Cma(settings)) => {
+                use wishpool_review::cma::{CliTransport, Client, HttpTransport, Transport};
+                let transport: Arc<dyn Transport> = if settings.transport == "cli" {
+                    Arc::new(CliTransport {
+                        program: settings.program.clone().into(),
+                        work_dir: std::path::PathBuf::from(&config.advisor_work_dir).join("cma"),
+                    })
+                } else {
+                    Arc::new(HttpTransport {
+                        base_url: settings.base_url.clone(),
+                        tokens: Arc::new(crate::cma_tokens::CmaTokens {
+                            hosted: hosted.clone(),
+                            account: settings.token_account.clone(),
+                            file: settings.token_file.clone().map(Into::into),
+                        }),
+                    })
+                };
+                Some(Arc::new(Client {
+                    transport,
+                    workspace: settings.workspace.clone(),
+                    profile: settings.profile.clone(),
+                    poll: Duration::from_secs(settings.poll_secs),
+                }))
+            }
+            _ => None,
+        };
         let advisor: Option<Arc<dyn wishpool_review::advisor::Advisor>> = match &config.advisor {
+            Some(AdvisorConfig::Cma(_)) => Some(Arc::new(wishpool_review::cma::CmaAdvisor {
+                client: cma.as_ref().unwrap().clone(),
+                timeout: Duration::from_secs(config.advisor_timeout_secs),
+                audit_timeout: Duration::from_secs(config.audit_timeout_secs),
+            })),
             Some(AdvisorConfig::Codex { program, model }) => {
                 Some(Arc::new(wishpool_review::advisor::CodexCli {
                     program: program.into(),
@@ -261,6 +275,31 @@ impl Composition {
             }
             None => None,
         };
+        let formalizer: Option<Arc<dyn wishpool_review::lean::Formalizer>> =
+            match (&config.lean_workspace, &config.advisor) {
+                (Some(workspace), Some(AdvisorConfig::Codex { program, model })) => {
+                    Some(Arc::new(wishpool_review::lean::CodexLean {
+                        program: program.into(),
+                        model: model.clone(),
+                        workspace: workspace.into(),
+                        timeout: Duration::from_secs(config.formal_timeout_secs),
+                        check_timeout: Duration::from_secs(120),
+                    }))
+                }
+                (Some(workspace), Some(AdvisorConfig::Cma(_))) => {
+                    Some(Arc::new(wishpool_review::cma::CmaLean {
+                        client: cma.as_ref().unwrap().clone(),
+                        checker: wishpool_review::lean::CodexLean {
+                            program: "unused".into(),
+                            model: None,
+                            workspace: workspace.into(),
+                            timeout: Duration::from_secs(config.formal_timeout_secs),
+                            check_timeout: Duration::from_secs(120),
+                        },
+                    }))
+                }
+                _ => None,
+            };
         let worker = Worker {
             app: app.clone(),
             jobs,
@@ -271,7 +310,6 @@ impl Composition {
                 timeout: Duration::from_secs(config.compile_timeout_secs),
             },
             model,
-            openalex,
             reviewer,
             referee_account,
             auditor_account,
@@ -281,10 +319,16 @@ impl Composition {
             formalizer,
             oracle_poll: Duration::from_secs(config.oracle_poll_secs),
             advisor_work_dir: config.advisor_work_dir.clone().into(),
-            audit_budget: Duration::from_secs(config.audit_timeout_secs + REVIEW_STEP_MARGIN_SECS),
-            formal_budget: Duration::from_secs(
-                config.formal_timeout_secs + REVIEW_STEP_MARGIN_SECS,
-            ),
+            audit_budget: Duration::from_secs(if cma.is_some() {
+                (config.audit_timeout_secs + REVIEW_STEP_MARGIN_SECS).min(3600)
+            } else {
+                config.audit_timeout_secs + REVIEW_STEP_MARGIN_SECS
+            }),
+            formal_budget: Duration::from_secs(if cma.is_some() {
+                (config.formal_timeout_secs + REVIEW_STEP_MARGIN_SECS).min(3600)
+            } else {
+                config.formal_timeout_secs + REVIEW_STEP_MARGIN_SECS
+            }),
         };
 
         let router = http_router(

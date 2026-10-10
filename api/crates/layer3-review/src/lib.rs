@@ -7,8 +7,6 @@
 //!
 //! - [`openai_compat`]: a chat-completions model, reached through the NyxID
 //!   LLM gateway or any OpenAI-compatible endpoint.
-//! - [`openalex`]: works that exist, from OpenAlex, to ground literature
-//!   checks.
 //! - [`oracle`]: long-running referee tasks through the NyxID Oracle.
 //! - [`advisor`]: advice and letter drafts from a local Codex workspace or a
 //!   chat model.
@@ -18,9 +16,9 @@
 //! The binary maps these results onto Layer 2 judgements and reports.
 
 pub mod advisor;
+pub mod cma;
 pub mod lean;
 pub mod openai_compat;
-pub mod openalex;
 pub mod oracle;
 pub mod referee_prompts;
 
@@ -84,16 +82,6 @@ pub struct JudgementDraft {
     pub rationale: String,
 }
 
-/// How a candidate work found by a search bears on a statement.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-pub struct CandidateRelation {
-    pub index: usize,
-    /// `same`, `implies` or `related`.
-    pub relation: String,
-    #[serde(default)]
-    pub note: String,
-}
-
 /// Token usage reported by the endpoint.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
@@ -120,19 +108,4 @@ pub trait ReviewModel: Send + Sync {
         statement: &str,
         context: &str,
     ) -> ReviewResult<(JudgementDraft, Usage)>;
-    /// Short keyword queries for a literature search on one statement,
-    /// in the field's standard terms rather than the paper's notation.
-    async fn search_queries(
-        &self,
-        title: &str,
-        abstract_text: &str,
-        statement: &str,
-    ) -> ReviewResult<(Vec<String>, Usage)>;
-    /// Relate a statement to candidate works found by a search. Only the
-    /// candidates may be named.
-    async fn relate_candidates(
-        &self,
-        statement: &str,
-        candidates: &[openalex::Work],
-    ) -> ReviewResult<(Vec<CandidateRelation>, Usage)>;
 }

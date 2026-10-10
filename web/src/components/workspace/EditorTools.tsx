@@ -148,7 +148,7 @@ function LiteratureReportForm({
   const targets = main.length > 0 ? main : submission.claims;
   const [outcome, setOutcome] = useState<LiteratureOutcome>('pass');
   const [summary, setSummary] = useState('');
-  const [searched, setSearched] = useState('OpenAlex\nzbMATH Open\narXiv');
+  const [searched, setSearched] = useState('Reported sources\nzbMATH Open\narXiv');
   const [prior, setPrior] = useState<PriorWork[]>([]);
   const [knownBy, setKnownBy] = useState(0);
   const [question, setQuestion] = useState('');
@@ -168,8 +168,8 @@ function LiteratureReportForm({
     <form className="tool-form" onSubmit={submit} aria-label="File a literature report">
       <h3>S2 Literature report</h3>
       <p className="small">
-        Machine leads from OpenAlex appear in the S2 history above as proposals. This report decides
-        the stage.
+        The networked referee and Codex audit report opened literature sources in the S2 history
+        above. This report decides the stage.
       </p>
       <PriorWorkEditor idPrefix="lit-prior" value={prior} claims={targets} onChange={setPrior} />
       <Field label="Searched (one per line)" htmlFor="lit-searched">
