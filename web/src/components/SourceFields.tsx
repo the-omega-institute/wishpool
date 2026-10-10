@@ -10,6 +10,7 @@ const PLACEHOLDERS: { [K in SourceKind]: string } = {
   doi: '10.1000/xyz123',
   oeis: 'A000045',
   url: 'https://…',
+  named_work: 'Work named in the paper or report',
   personal: 'Who, when',
 };
 

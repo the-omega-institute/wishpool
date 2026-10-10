@@ -90,6 +90,7 @@ describe('createApiClient', () => {
       subject: 'Edited subject',
       body: 'Edited body',
       note: 'Edited note',
+      assessment: 'major_revision',
     });
     const calls = fetchImpl.mock.calls as unknown as [string, RequestInit][];
     expect(calls.map(([url, init]) => `${init.method} ${url}`)).toEqual([
@@ -102,6 +103,7 @@ describe('createApiClient', () => {
       subject: 'Edited subject',
       body: 'Edited body',
       note: 'Edited note',
+      assessment: 'major_revision',
     });
     expect(calls.every(([, init]) => init.credentials === 'same-origin')).toBe(true);
     await api.sendFeedback('s/1', { subject: 'Subject', body: 'Body' });

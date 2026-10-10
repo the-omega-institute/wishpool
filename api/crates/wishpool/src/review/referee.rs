@@ -1,8 +1,6 @@
 //! Resume one persisted round, releasing the job lease between external polls
 //! and between advisor calls.
 
-use std::time::Duration;
-
 use sha2::{Digest, Sha256};
 use wishpool_core::{
     CoreError,
@@ -20,9 +18,6 @@ use super::{
     LeasedJob, mapping,
     worker::{Failure, Worker},
 };
-
-/// Leave five minutes of the 30-minute lease to persist and defer the job.
-const FORMAL_STEP_BUDGET: Duration = Duration::from_secs(25 * 60);
 
 fn transient(error: &ReviewError) -> bool {
     matches!(error, ReviewError::Transport(_))
@@ -96,6 +91,7 @@ impl Worker {
         ) {
             return Ok(false);
         }
+        self.ensure_lease(job).await?;
         let file = self
             .app
             .begin_referee_round(&self.referee_account, &submission.id)
@@ -117,6 +113,7 @@ impl Worker {
                 {
                     if version.compile_error.is_some() {
                         step.state = self.failed("the paper did not compile".into(), None, false);
+                        self.ensure_lease(job).await?;
                         self.app
                             .update_referee_round(
                                 &self.referee_account,
@@ -145,6 +142,7 @@ impl Worker {
                     Err(CoreError::NotFound { .. }) => {
                         step.state =
                             self.failed("the paper has no compiled PDF".into(), None, false);
+                        self.ensure_lease(job).await?;
                         self.app
                             .update_referee_round(
                                 &self.referee_account,
@@ -157,7 +155,13 @@ impl Worker {
                     }
                     Err(error) => return Err(error.into()),
                 };
-                let prompt = referee_prompts::referee(
+                let make_prompt =
+                    if submission.kind == wishpool_core::model::SubmissionKind::Conjecture {
+                        referee_prompts::conjecture_referee
+                    } else {
+                        referee_prompts::referee
+                    };
+                let prompt = make_prompt(
                     &Document {
                         title: submission.title.clone(),
                         abstract_text: submission.abstract_text.clone(),
@@ -181,6 +185,7 @@ impl Worker {
                         None,
                         false,
                     );
+                    self.ensure_lease(job).await?;
                     self.app
                         .update_referee_round(
                             &self.referee_account,
@@ -196,6 +201,7 @@ impl Worker {
                 step.model = Some(self.referee_model.clone());
                 step.client_ref = Some(client_ref.clone());
                 step.input_digest = Some(digest);
+                self.ensure_lease(job).await?;
                 self.app
                     .update_referee_round(
                         &self.referee_account,
@@ -228,6 +234,7 @@ impl Worker {
                         step.state = self.failed(error.to_string(), None, false);
                     }
                 }
+                self.ensure_lease(job).await?;
                 self.app
                     .update_referee_round(
                         &self.referee_account,
@@ -246,6 +253,7 @@ impl Worker {
                 let Some(task) = task else {
                     step.state =
                         self.failed("oracle running step has no task id".into(), None, false);
+                    self.ensure_lease(job).await?;
                     self.app
                         .update_referee_round(
                             &self.referee_account,
@@ -264,6 +272,7 @@ impl Worker {
                     }
                     Err(error) => {
                         step.state = self.failed(error.to_string(), None, false);
+                        self.ensure_lease(job).await?;
                         self.app
                             .update_referee_round(
                                 &self.referee_account,
@@ -283,6 +292,7 @@ impl Worker {
                                 queue_position: position,
                                 since: *since,
                             };
+                            self.ensure_lease(job).await?;
                             self.app
                                 .update_referee_round(
                                     &self.referee_account,
@@ -301,6 +311,7 @@ impl Worker {
                                 queue_position: None,
                                 since: *since,
                             };
+                            self.ensure_lease(job).await?;
                             self.app
                                 .update_referee_round(
                                     &self.referee_account,
@@ -312,19 +323,23 @@ impl Worker {
                         }
                         return self.defer_referee(job).await;
                     }
-                    OracleStatus::Completed { text } => {
+                    OracleStatus::Completed { text, model } => {
+                        if let Some(model) = model {
+                            step.model = Some(model);
+                        }
                         let filed_model = step
                             .model
                             .clone()
                             .unwrap_or_else(|| self.referee_model.clone());
                         let report = match parse_answer::<RefereeOut>(&text) {
-                            Ok(raw) => mapping::referee(raw, text, &submission.claims),
+                            Ok(raw) => mapping::referee_for_kind(raw, text, &submission.claims, submission.kind == wishpool_core::model::SubmissionKind::Conjecture),
                             Err(error) => mapping::referee(RefereeOut { summary: "The referee answer could not be parsed as a structured report.".into(), limits: vec![error.to_string()], ..Default::default() }, text, &submission.claims),
                         };
                         step.state = StepState::Done {
                             result: report.clone(),
                             at: chrono::Utc::now(),
                         };
+                        self.ensure_lease(job).await?;
                         self.app
                             .update_referee_round(
                                 &self.referee_account,
@@ -335,6 +350,7 @@ impl Worker {
                             .await?;
                         for reading in &report.claims {
                             if let Some(output) = mapping::referee_judgement(reading) {
+                                self.ensure_lease(job).await?;
                                 match self
                                     .app
                                     .file_machine_judgement(
@@ -367,6 +383,7 @@ impl Worker {
                         step.state = self.failed("cancelled".into(), None, false);
                     }
                 }
+                self.ensure_lease(job).await?;
                 self.app
                     .update_referee_round(
                         &self.referee_account,
@@ -379,23 +396,106 @@ impl Worker {
             }
             _ => {}
         }
+        if !round.audit.is_settled() {
+            let mut audit = round.audit.clone();
+            if let (Some(report), Some(advisor)) = (round.referee.done(), &self.advisor) {
+                match self.advisor_input(submission, report).await {
+                    Ok((input, _work, source)) => {
+                        audit.engine = Some(advisor.engine().into());
+                        audit.model = Some(advisor.model().into());
+                        audit.input_digest =
+                            Some(input_digest(&referee_prompts::audit(&input), &source));
+                        audit.attempts += 1;
+                        audit.state = StepState::Running {
+                            task: None,
+                            queue_position: None,
+                            since: chrono::Utc::now(),
+                        };
+                        self.ensure_lease(job).await?;
+                        self.app
+                            .update_referee_round(
+                                &self.auditor_account,
+                                &submission.id,
+                                number,
+                                RoundUpdate::Audit(audit.clone()),
+                            )
+                            .await?;
+                        audit.state =
+                            match tokio::time::timeout(self.audit_budget, advisor.audit(&input))
+                                .await
+                            {
+                                Ok(Ok(raw)) => {
+                                    match mapping::audit(raw, &input, &submission.claims) {
+                                        Ok(result) => StepState::Done {
+                                            result,
+                                            at: chrono::Utc::now(),
+                                        },
+                                        Err(error) => self.failed(error.to_string(), None, false),
+                                    }
+                                }
+                                Ok(Err(error)) if transient(&error) => {
+                                    return Err(Failure::Transient(error.to_string()));
+                                }
+                                Ok(Err(error)) => self.failed(error.to_string(), None, false),
+                                Err(_) => {
+                                    return Err(Failure::Transient(
+                                        "the audit exceeded its time budget".into(),
+                                    ));
+                                }
+                            };
+                    }
+                    Err(error) => audit.state = self.failed(error, None, false),
+                }
+            } else {
+                audit.state = if round.referee.done().is_some() {
+                    self.failed("no Codex auditor configured".into(), None, false)
+                } else {
+                    StepState::Skipped {
+                        reason: "no completed referee report".into(),
+                    }
+                };
+            }
+            self.ensure_lease(job).await?;
+            self.app
+                .update_referee_round(
+                    &self.auditor_account,
+                    &submission.id,
+                    number,
+                    RoundUpdate::Audit(audit),
+                )
+                .await?;
+            return self.defer_referee(job).await;
+        }
+        // Replaying this persisted audit is safe after either report or record writes.
+        let decided = if round.audit.done().is_some() {
+            self.ensure_lease(job).await?;
+            self.app
+                .apply_referee_audit(&self.auditor_account, &submission.id, number)
+                .await?
+        } else {
+            submission.clone()
+        };
+        let submission = &decided;
         if !round.advice.is_settled() {
-            let positive = round
-                .referee
-                .done()
-                .and_then(|r| r.recommendation)
-                .is_some_and(|r| r.is_positive());
             let mut advice = round.advice.clone();
-            if !positive {
+            if round.audit.done().is_none() {
                 advice.state = StepState::Skipped {
-                    reason: "the referee did not give a positive recommendation".into(),
+                    reason: "no completed audit".into(),
                 };
             } else if let Some(advisor) = &self.advisor {
                 let prepared = self
-                    .advisor_input(submission, round.referee.done().expect("positive report"))
+                    .advisor_input(
+                        submission,
+                        round.referee.done().expect("audit follows report"),
+                    )
                     .await;
                 match prepared {
-                    Ok((input, _work, source)) => {
+                    Ok((mut input, _work, source)) => {
+                        input.audit = round
+                            .audit
+                            .done()
+                            .and_then(|a| serde_json::to_value(a).ok());
+                        input.decision = serde_json::to_value(&submission.status).ok();
                         advice.engine = Some(advisor.engine().into());
                         advice.model = Some(advisor.model().into());
                         advice.input_digest =
@@ -406,6 +506,7 @@ impl Worker {
                             queue_position: None,
                             since: chrono::Utc::now(),
                         };
+                        self.ensure_lease(job).await?;
                         self.app
                             .update_referee_round(
                                 &self.referee_account,
@@ -429,6 +530,7 @@ impl Worker {
             } else {
                 advice.state = self.failed("no advisor configured".into(), None, false);
             }
+            self.ensure_lease(job).await?;
             self.app
                 .update_referee_round(
                     &self.referee_account,
@@ -437,10 +539,102 @@ impl Worker {
                     RoundUpdate::Advice(advice),
                 )
                 .await?;
-            // Each potentially twenty-minute advisor call gets a fresh lease.
+            // Release between calls so other papers can progress.
+            return self.defer_referee(job).await;
+        }
+        if !round.letter.is_settled() {
+            let mut letter = round.letter.clone();
+            if let (Some(report), Some(audit)) = (round.referee.done(), round.audit.done()) {
+                if let Some(advisor) = &self.advisor {
+                    match self.advisor_input(submission, report).await {
+                        Ok((mut input, _work, source)) => {
+                            input.audit = serde_json::to_value(audit).ok();
+                            input.decision = Some(
+                                serde_json::json!({ "status": submission.status, "decision": submission.decision }),
+                            );
+                            let advice = round.advice.done().map(mapping::advice_out);
+                            letter.engine = Some(advisor.engine().into());
+                            letter.model = Some(advisor.model().into());
+                            letter.input_digest = Some(input_digest(
+                                &referee_prompts::letter(&input, advice.as_ref()),
+                                &source,
+                            ));
+                            letter.attempts += 1;
+                            letter.state = StepState::Running {
+                                task: None,
+                                queue_position: None,
+                                since: chrono::Utc::now(),
+                            };
+                            self.ensure_lease(job).await?;
+                            self.app
+                                .update_referee_round(
+                                    &self.referee_account,
+                                    &submission.id,
+                                    number,
+                                    RoundUpdate::Letter(letter.clone()),
+                                )
+                                .await?;
+                            letter.state = match advisor
+                                .draft_letter(&input, advice.as_ref())
+                                .await
+                                .and_then(mapping::letter)
+                            {
+                                Ok(result) => StepState::Done {
+                                    result,
+                                    at: chrono::Utc::now(),
+                                },
+                                Err(error) => {
+                                    self.failed(error.to_string(), None, transient(&error))
+                                }
+                            };
+                        }
+                        Err(error) => {
+                            letter.state = self.failed(error, None, false);
+                        }
+                    }
+                } else {
+                    letter.state = self.failed("no advisor configured".into(), None, false);
+                }
+            } else {
+                letter.state = StepState::Skipped {
+                    reason: "no completed audit".into(),
+                };
+            }
+            self.ensure_lease(job).await?;
+            self.app
+                .update_referee_round(
+                    &self.auditor_account,
+                    &submission.id,
+                    number,
+                    RoundUpdate::Letter(letter),
+                )
+                .await?;
             return self.defer_referee(job).await;
         }
         if !round.formal.is_settled() {
+            if submission.kind == wishpool_core::model::SubmissionKind::Conjecture {
+                if matches!(submission.status, SubmissionStatus::Accepted { .. })
+                    && round.letter.done().is_some()
+                {
+                    self.app
+                        .queue_lean_statements(&self.referee_account, &submission.id)
+                        .await?;
+                }
+                let mut formal = round.formal.clone();
+                formal.state = StepState::Skipped {
+                    reason: "Conjecture statements use author confirmation, not a proof probe."
+                        .into(),
+                };
+                self.app
+                    .update_referee_round(
+                        &self.referee_account,
+                        &submission.id,
+                        number,
+                        RoundUpdate::Formal(formal),
+                    )
+                    .await?;
+                return self.defer_referee(job).await;
+            }
             let mut formal = round.formal.clone();
             let targets = round
                 .advice
@@ -448,6 +642,16 @@ impl Worker {
                 .map(|advice| mapping::formal_targets(advice, &submission.claims))
                 .unwrap_or_default();
             match (&self.formalizer, round.advice.done()) {
+                _ if !matches!(submission.status, SubmissionStatus::Accepted { .. }) => {
+                    formal.state = StepState::Skipped {
+                        reason: "the paper was not accepted".into(),
+                    };
+                }
+                _ if round.letter.done().is_none() => {
+                    formal.state = StepState::Skipped {
+                        reason: "no delivered letter".into(),
+                    };
+                }
                 (None, _) => {
                     formal.state = StepState::Skipped {
                         reason: "no Lean workspace is configured".into(),
@@ -468,6 +672,8 @@ impl Worker {
                     match self.advisor_input(submission, report).await {
                         Ok((advisor_input, work, source)) => {
                             let input = wishpool_review::lean::FormalInput {
+                                conjecture: false,
+                                correction: None,
                                 title: advisor_input.title,
                                 abstract_text: advisor_input.abstract_text,
                                 statements: advisor_input.statements,
@@ -487,6 +693,7 @@ impl Worker {
                                 queue_position: None,
                                 since: chrono::Utc::now(),
                             };
+                            self.ensure_lease(job).await?;
                             self.app
                                 .update_referee_round(
                                     &self.referee_account,
@@ -497,7 +704,7 @@ impl Worker {
                                 .await?;
                             let probe_dir = work.path().join("probe");
                             formal.state = match tokio::time::timeout(
-                                FORMAL_STEP_BUDGET,
+                                self.formal_budget,
                                 formalizer.formalize(&input, &probe_dir),
                             )
                             .await
@@ -520,6 +727,7 @@ impl Worker {
                     }
                 }
             }
+            self.ensure_lease(job).await?;
             self.app
                 .update_referee_round(
                     &self.referee_account,
@@ -530,69 +738,106 @@ impl Worker {
                 .await?;
             return self.defer_referee(job).await;
         }
-        if !round.letter.is_settled() {
-            let mut letter = round.letter.clone();
-            if let Some(report) = round.referee.done() {
-                if let Some(advisor) = &self.advisor {
-                    match self.advisor_input(submission, report).await {
-                        Ok((input, _work, source)) => {
-                            let advice = round.advice.done().map(mapping::advice_out);
-                            let formal = round
-                                .formal
-                                .done()
-                                .and_then(|probe| serde_json::to_value(probe).ok());
-                            letter.engine = Some(advisor.engine().into());
-                            letter.model = Some(advisor.model().into());
-                            letter.input_digest = Some(input_digest(
-                                &referee_prompts::letter(&input, advice.as_ref(), formal.as_ref()),
-                                &source,
-                            ));
-                            letter.attempts += 1;
-                            letter.state = StepState::Running {
-                                task: None,
-                                queue_position: None,
-                                since: chrono::Utc::now(),
-                            };
-                            self.app
-                                .update_referee_round(
-                                    &self.referee_account,
-                                    &submission.id,
-                                    number,
-                                    RoundUpdate::Letter(letter.clone()),
-                                )
-                                .await?;
-                            letter.state = match advisor
-                                .draft_letter(&input, advice.as_ref(), formal.as_ref())
-                                .await
-                                .and_then(mapping::letter)
-                            {
-                                Ok(result) => StepState::Done {
-                                    result,
-                                    at: chrono::Utc::now(),
-                                },
-                                Err(error) => {
-                                    self.failed(error.to_string(), None, transient(&error))
-                                }
-                            };
-                        }
-                        Err(error) => {
-                            letter.state = self.failed(error, None, false);
-                        }
-                    }
-                } else {
-                    letter.state = self.failed("no advisor configured".into(), None, false);
-                }
-            } else {
-                letter.state = StepState::Skipped {
-                    reason: "no completed referee report".into(),
-                };
-            }
+        Ok(false)
+    }
+
+    pub(super) async fn lean_statement_job(&self, job: &LeasedJob) -> Result<bool, Failure> {
+        use wishpool_core::model::{ClaimRole, LeanStatementResponse, SubmissionKind};
+        let submission = self
+            .app
+            .submission(&self.referee_account, &job.submission)
+            .await?;
+        if submission.kind != SubmissionKind::Conjecture
+            || !matches!(submission.status, SubmissionStatus::Accepted { .. })
+        {
+            return Ok(false);
+        }
+        let Some(formalizer) = &self.formalizer else {
+            return Ok(false);
+        };
+        let file = self
+            .app
+            .referee(&self.referee_account, &submission.id)
+            .await?;
+        let Some(round) = file.rounds.last().filter(|r| {
+            r.version == submission.current_version().unwrap().number
+                && r.claims_revision == submission.claims_revision
+        }) else {
+            return Ok(false);
+        };
+        let Some(report) = round.referee.done() else {
+            return Ok(false);
+        };
+        if round.letter.as_ref().and_then(|s| s.done()).is_none() {
+            return Ok(false);
+        }
+        let version = submission.current_version().unwrap().number;
+        for claim in submission
+            .claims
+            .iter()
+            .filter(|c| c.kind.is_open() && c.role == ClaimRole::Main)
+        {
+            let latest = submission
+                .lean_statements
+                .iter()
+                .rev()
+                .find(|a| a.claim == claim.id);
+            let correction = match latest.map(|a| &a.response) {
+                Some(LeanStatementResponse::Rejected { comment, .. }) => Some(comment.clone()),
+                Some(_) => continue,
+                None => None,
+            };
+            let (prepared, work, _) = self
+                .advisor_input(&submission, report)
+                .await
+                .map_err(Failure::Permanent)?;
+            let input = wishpool_review::lean::FormalInput {
+                conjecture: true,
+                correction,
+                title: prepared.title,
+                abstract_text: prepared.abstract_text,
+                statements: prepared.statements,
+                targets: vec![wishpool_review::lean::FormalTarget {
+                    claim: claim.id.to_string(),
+                    label: claim.label.clone(),
+                    statement: claim.statement.clone(),
+                    lean_sketch: latest.map(|a| a.lean.clone()).unwrap_or_default(),
+                    plan: "Translate the exact conjecture and explain it to the author.".into(),
+                    mathlib: vec![],
+                }],
+                source_dir: prepared.source_dir,
+                main_file: prepared.main_file,
+            };
+            let out = tokio::time::timeout(
+                self.formal_budget,
+                formalizer.formalize(&input, &work.path().join("target")),
+            )
+            .await
+            .map_err(|_| Failure::Transient("Lean statement elaboration timed out".into()))?
+            .map_err(|e| Failure::Transient(e.to_string()))?;
+            let checked = out
+                .files
+                .iter()
+                .find(|f| {
+                    f.claim == claim.id.as_str()
+                        && f.compiled
+                        && f.theorem.as_deref() == Some("wishpool_target")
+                })
+                .ok_or_else(|| {
+                    Failure::Transient("no faithful elaborated Lean statement was returned".into())
+                })?;
+            self.ensure_lease(job).await?;
             self.app
-                .update_referee_round(
+                .record_lean_statement(
                     &self.referee_account,
                     &submission.id,
-                    number,
-                    RoundUpdate::Letter(letter),
+                    version,
+                    submission.claims_revision,
+                    &claim.id,
+                    checked.lean.clone(),
+                    out.toolchain,
+                    checked.note.clone(),
+                    latest.map(|a| a.digest.clone()),
                 )
                 .await?;
         }
@@ -654,11 +899,18 @@ impl Worker {
             std::fs::write(path, bytes).map_err(|e| e.to_string())?;
         }
         let input = AdvisorInput {
+            kind: serde_json::to_value(paper.kind)
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .into(),
             title: paper.title.clone(),
             abstract_text: paper.abstract_text.clone(),
             authors: paper.authors.iter().map(|a| a.name.clone()).collect(),
             statements: mapping::confirmed_statements(&paper.claims),
             referee: mapping::referee_out(report),
+            audit: None,
+            decision: None,
             text: crate::latex::source_text(&file.bytes, &version.filename).ok(),
             source_dir: Some(source_dir),
             main_file: Some(main),

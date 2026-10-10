@@ -100,6 +100,9 @@ impl World {
         doi: Option<&str>,
     ) -> Submission {
         let new = NewPaper {
+            kind: crate::model::SubmissionKind::Paper,
+            make_public_after_acceptance: true,
+            typed_conjecture: None,
             ai_disclosure: AiDisclosure {
                 level: AiUse::Assisted,
                 statement: "A model checked Lemma 2.".into(),
@@ -279,12 +282,18 @@ async fn upload_confirm_review_accept_and_formalize() {
     assert_eq!(paper.conjectures.len(), 1);
     assert_eq!(paper.conjectures[0].state, ConjectureState::Screening);
 
-    // Readers see the paper; the analysis waits for the author's choice.
+    // Public mathematical inputs appear at acceptance; review stays private.
     let record = RecordId::format(year, 1);
     let public = w.app.paper(&record).await.unwrap();
     assert_eq!(public.summary.doi.as_deref(), Some("10.1000/xyz"));
     assert_eq!(public.claims.len(), 3);
-    assert!(public.analysis.is_none() && public.conjectures.is_empty());
+    assert!(public.new_content.is_empty());
+    assert!(
+        serde_json::to_value(&public)
+            .unwrap()
+            .get("analysis")
+            .is_none()
+    );
     assert_eq!(w.app.list_papers(None, None).await.unwrap().items.len(), 1);
     assert!(w.app.paper_file(None, &paper.id, None, true).await.is_ok());
     assert!(
@@ -304,7 +313,7 @@ async fn upload_confirm_review_accept_and_formalize() {
         .set_analysis_visibility(&author, &paper.id, Visibility::Public)
         .await
         .unwrap();
-    let analysis = w.app.paper(&record).await.unwrap().analysis.unwrap();
+    let analysis = w.app.analysis(&author, &paper.id).await.unwrap();
     assert_eq!(
         (
             analysis.main_results,
@@ -394,7 +403,12 @@ async fn upload_confirm_review_accept_and_formalize() {
         .await
         .unwrap();
     assert!(matches!(
-        w.app.paper(&record).await.unwrap().conjectures[0].state,
+        w.app
+            .submission(&author, &paper.id)
+            .await
+            .unwrap()
+            .conjectures[0]
+            .state,
         ConjectureState::NotPursued { .. }
     ));
     assert!(
@@ -555,6 +569,9 @@ async fn authority_and_limits() {
     w.submit(&author, "t", false).await;
     w.submit(&author, "t", false).await;
     let new = NewPaper {
+        kind: crate::model::SubmissionKind::Paper,
+        make_public_after_acceptance: true,
+        typed_conjecture: None,
         ai_disclosure: AiDisclosure {
             level: AiUse::None,
             statement: "None.".into(),
@@ -985,23 +1002,84 @@ async fn confirm_enqueues_referee_and_begin_is_idempotent() {
     );
 }
 
-#[tokio::test]
-async fn round_ordering_and_settled_immutability() {
-    let w = World::new().await;
-    let author = w.person("author", &[]).await;
-    let reviewer = w.person("referee", &[Role::Reviewer]).await;
-    let paper = w.submit(&author, "t", false).await;
-    let paper = w.review_paper(&author, &paper).await;
+fn audit_for(
+    paper: &Submission,
+    verdict: Recommendation,
+    correctness: Correctness,
+    shape: ProofShape,
+    known: Option<String>,
+) -> RefereeAudit {
+    RefereeAudit {
+        verdict,
+        agrees_with_referee: false,
+        summary: "The main argument was checked against the source.".into(),
+        claims: paper
+            .claims
+            .iter()
+            .map(|c| AuditedClaim {
+                conjecture: None,
+                claim: c.id.clone(),
+                correctness,
+                comment: "The proof uses a new intermediate estimate.".into(),
+                shape: Some(shape),
+                witnesses: if shape == ProofShape::Content {
+                    vec!["The gap estimate".into()]
+                } else {
+                    vec![]
+                },
+                known: known.clone(),
+                referee_agreed: false,
+            })
+            .collect(),
+        concerns: vec![],
+    }
+}
+
+async fn audited(
+    w: &World,
+    reviewer: &Caller,
+    paper: &Submission,
+    audit: RefereeAudit,
+) -> Submission {
     w.app
-        .begin_referee_round(&reviewer, &paper.id)
+        .update_referee_round(reviewer, &paper.id, 1, RoundUpdate::Audit(done_step(audit)))
         .await
         .unwrap();
-    let claim = paper.claims[0].id.clone();
+    w.app
+        .apply_referee_audit(reviewer, &paper.id, 1)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn audit_orders_and_fences_decision_advice_letter_then_formal() {
+    let w = World::new().await;
+    let author = w.person("author", &[]).await;
+    let auditor = w.person("wishpool:auditor", &[Role::Reviewer]).await;
+    let paper = w.submit(&author, "tl", false).await;
+    let paper = w.review_paper(&author, &paper).await;
+    w.app
+        .begin_referee_round(&auditor, &paper.id)
+        .await
+        .unwrap();
+    let audit = done_step(audit_for(
+        &paper,
+        Recommendation::MajorRevision,
+        Correctness::Correct,
+        ProofShape::Content,
+        None,
+    ));
+    assert!(
+        w.app
+            .update_referee_round(&auditor, &paper.id, 1, RoundUpdate::Audit(audit.clone()))
+            .await
+            .is_err()
+    );
     let advice = done_step(Advice {
         summary: "help".into(),
         improvements: vec![],
         formalization: vec![FormalizationCandidate {
-            claim: claim.clone(),
+            claim: paper.claims[0].id.clone(),
             feasibility: Feasibility::Ready,
             mathlib: vec![],
             missing: vec![],
@@ -1010,223 +1088,633 @@ async fn round_ordering_and_settled_immutability() {
             effort: Effort::Small,
         }],
     });
-    let attempt = |claim: ClaimId| FormalAttempt {
-        claim,
-        outcome: ProbeOutcome::Compiled,
-        theorem: Some("wishpool_c1".into()),
-        lean: "import Mathlib".into(),
-        axioms: vec!["propext".into()],
-        note: String::new(),
-        log: String::new(),
-    };
-    let probe = |claim: ClaimId| {
-        done_step(FormalProbe {
-            toolchain: "leanprover/lean4:v4.33.0".into(),
-            attempts: vec![attempt(claim)],
-            summary: String::new(),
-        })
-    };
-    let formal = probe(claim.clone());
     let letter = done_step(LetterDraft {
         subject: "Review".into(),
-        body: "Useful feedback.".into(),
+        body: "Accepted with its record. Useful feedback.".into(),
         note: "Argument".into(),
     });
+    let formal = done_step(FormalProbe {
+        toolchain: "lean".into(),
+        attempts: vec![FormalAttempt {
+            claim: paper.claims[0].id.clone(),
+            outcome: ProbeOutcome::Compiled,
+            theorem: Some("Wishpool.C1.main".into()),
+            lean: "private source".into(),
+            axioms: vec![],
+            note: "private note".into(),
+            log: "private log".into(),
+        }],
+        summary: "private summary".into(),
+    });
+    let report = done_step(referee_report(Some(Recommendation::Reject)));
+    w.app
+        .update_referee_round(&auditor, &paper.id, 1, RoundUpdate::Referee(report.clone()))
+        .await
+        .unwrap();
     for update in [
         RoundUpdate::Advice(advice.clone()),
-        RoundUpdate::Formal(formal.clone()),
         RoundUpdate::Letter(letter.clone()),
+        RoundUpdate::Formal(formal.clone()),
     ] {
-        assert!(matches!(
+        assert!(
             w.app
-                .update_referee_round(&reviewer, &paper.id, 1, update)
-                .await,
-            Err(CoreError::Conflict(_))
-        ));
+                .update_referee_round(&auditor, &paper.id, 1, update)
+                .await
+                .is_err()
+        );
     }
-    let report = done_step(referee_report(Some(Recommendation::Accept)));
     w.app
-        .update_referee_round(
-            &reviewer,
-            &paper.id,
-            1,
-            RoundUpdate::Referee(report.clone()),
-        )
+        .update_referee_round(&auditor, &paper.id, 1, RoundUpdate::Audit(audit.clone()))
         .await
         .unwrap();
     assert!(
         w.app
-            .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Letter(letter.clone()))
+            .update_referee_round(&auditor, &paper.id, 1, RoundUpdate::Advice(advice.clone()))
             .await
             .is_err()
     );
+    let decided = w
+        .app
+        .apply_referee_audit(&auditor, &paper.id, 1)
+        .await
+        .unwrap();
+    assert!(matches!(decided.status, SubmissionStatus::Accepted { .. }));
     w.app
-        .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Advice(advice.clone()))
+        .update_referee_round(&auditor, &paper.id, 1, RoundUpdate::Advice(advice.clone()))
         .await
         .unwrap();
     assert!(
         w.app
-            .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Letter(letter.clone()))
+            .update_referee_round(&auditor, &paper.id, 1, RoundUpdate::Formal(formal.clone()))
             .await
             .is_err()
     );
-    assert!(matches!(
-        w.app
-            .update_referee_round(
-                &reviewer,
-                &paper.id,
-                1,
-                RoundUpdate::Formal(probe("C99".into()))
-            )
-            .await,
-        Err(CoreError::Conflict(_))
-    ));
-    w.app
-        .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Formal(formal.clone()))
+    let file = w
+        .app
+        .update_referee_round(&auditor, &paper.id, 1, RoundUpdate::Letter(letter.clone()))
         .await
         .unwrap();
+    assert_eq!(file.letters.len(), 1);
+    assert_eq!(
+        file.letters[0].assessment,
+        Some(Recommendation::MajorRevision)
+    );
+    assert_eq!(file.letters[0].sent_by, auditor.person);
+    assert!(!file.letters[0].edited);
     w.app
-        .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Letter(letter.clone()))
+        .update_referee_round(&auditor, &paper.id, 1, RoundUpdate::Formal(formal.clone()))
         .await
         .unwrap();
     for update in [
         RoundUpdate::Referee(report),
+        RoundUpdate::Audit(audit),
         RoundUpdate::Advice(advice),
-        RoundUpdate::Formal(formal),
         RoundUpdate::Letter(letter),
+        RoundUpdate::Formal(formal),
     ] {
-        assert!(matches!(
+        assert!(
             w.app
-                .update_referee_round(&reviewer, &paper.id, 1, update)
-                .await,
-            Err(CoreError::Conflict(_))
-        ));
+                .update_referee_round(&auditor, &paper.id, 1, update)
+                .await
+                .is_err()
+        );
+    }
+    let coauthor = w.person("linked-coauthor", &[]).await;
+    let stranger = w.person("stranger", &[]).await;
+    let mut linked = w.app.submission(&author, &paper.id).await.unwrap();
+    linked.authors[0].person = Some(coauthor.person.clone());
+    w.app.save(&mut linked).await.unwrap();
+    assert_eq!(
+        w.app.referee(&author, &paper.id).await.unwrap(),
+        w.app.referee(&coauthor, &paper.id).await.unwrap()
+    );
+    assert!(matches!(
+        w.app.referee(&stranger, &paper.id).await,
+        Err(CoreError::NotFound { .. })
+    ));
+    let author_view =
+        serde_json::to_value(w.app.referee(&author, &paper.id).await.unwrap()).unwrap();
+    let r = &author_view["rounds"][0];
+    assert!(r.get("advice").is_none());
+    assert!(r.get("letter").is_none());
+    assert!(r["referee"].get("engine").is_none());
+    assert_eq!(r["audit"]["state"]["result"]["verdict"], "major_revision");
+    assert_eq!(r["referee"]["state"]["result"]["text"], "full answer");
+    let attempt = &r["formal"]["state"]["result"]["attempts"][0];
+    assert_eq!(attempt["outcome"], "compiled");
+    assert_eq!(attempt["theorem"], "Wishpool.C1.main");
+    for field in ["lean", "note", "log", "axioms"] {
+        assert!(attempt.get(field).is_none());
     }
 }
 
 #[tokio::test]
-async fn advice_requires_positive_and_negative_referee_is_skipped() {
-    for recommendation in [
-        Some(Recommendation::Accept),
-        Some(Recommendation::MinorRevision),
-        Some(Recommendation::MajorRevision),
-        Some(Recommendation::Reject),
-        None,
+async fn audited_escape_alone_decides_and_reports_and_records_are_idempotent() {
+    for (correctness, shape, known, recommendation, accepted) in [
+        (
+            Correctness::Correct,
+            ProofShape::Content,
+            None,
+            Recommendation::Reject,
+            true,
+        ),
+        (
+            Correctness::Correct,
+            ProofShape::Content,
+            Some("A named prior work".to_string()),
+            Recommendation::Accept,
+            false,
+        ),
+        (
+            Correctness::Correct,
+            ProofShape::BindOnly,
+            None,
+            Recommendation::Accept,
+            false,
+        ),
+        (
+            Correctness::Gap,
+            ProofShape::Content,
+            None,
+            Recommendation::Accept,
+            false,
+        ),
+        (
+            Correctness::Error,
+            ProofShape::Content,
+            None,
+            Recommendation::Accept,
+            false,
+        ),
+        (
+            Correctness::NotChecked,
+            ProofShape::Content,
+            None,
+            Recommendation::Accept,
+            false,
+        ),
     ] {
         let w = World::new().await;
         let author = w.person("author", &[]).await;
-        let reviewer = w.person("referee", &[Role::Reviewer]).await;
+        let auditor = w.person("wishpool:auditor", &[Role::Reviewer]).await;
         let paper = w.submit(&author, "t", false).await;
-        let paper = w.review_paper(&author, &paper).await;
+        let mut paper = w.review_paper(&author, &paper).await;
+        if matches!(
+            correctness,
+            Correctness::Gap | Correctness::Error | Correctness::NotChecked
+        ) {
+            paper.claims[0].settles = Some(OpenProblemRef {
+                name: "A named problem".into(),
+                source: Source {
+                    kind: SourceKind::Personal,
+                    locator: "Paper".into(),
+                    year: None,
+                },
+            });
+            w.app.save(&mut paper).await.unwrap();
+        }
         w.app
-            .begin_referee_round(&reviewer, &paper.id)
+            .begin_referee_round(&auditor, &paper.id)
             .await
             .unwrap();
         w.app
             .update_referee_round(
-                &reviewer,
+                &auditor,
                 &paper.id,
                 1,
-                RoundUpdate::Referee(done_step(referee_report(recommendation))),
+                RoundUpdate::Referee(done_step(referee_report(Some(recommendation)))),
             )
             .await
             .unwrap();
-        let positive = recommendation.is_some_and(Recommendation::is_positive);
-        let done = done_step(Advice {
-            summary: "help".into(),
-            improvements: vec![],
-            formalization: vec![],
-        });
+        let result = audited(
+            &w,
+            &auditor,
+            &paper,
+            audit_for(&paper, recommendation, correctness, shape, known.clone()),
+        )
+        .await;
         assert_eq!(
-            w.app
-                .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Advice(done))
-                .await
-                .is_ok(),
-            positive
+            matches!(result.status, SubmissionStatus::Accepted { .. }),
+            accepted
         );
-        if !positive {
-            let mut running = Step::pending();
-            running.state = StepState::Running {
-                task: None,
-                queue_position: None,
-                since: chrono::Utc::now(),
-            };
+        let literature = result.latest_report(Stage::Literature).unwrap();
+        assert_eq!(literature.claims_revision, paper.claims_revision);
+        assert!(
+            matches!(&literature.reviewer, ReviewerIdentity::Machine { account, engine, .. } if account == &auditor.person && engine == "codex-cli")
+        );
+        let StagePayload::Literature { prior, .. } = &literature.payload else {
+            panic!()
+        };
+        assert_eq!(prior.len(), usize::from(known.is_some()));
+        let StagePayload::Escape { assessments } =
+            &result.latest_report(Stage::Escape).unwrap().payload
+        else {
+            panic!()
+        };
+        assert_eq!(assessments.len(), 1);
+        if correctness != Correctness::Correct {
+            assert!(assessments[0].witnesses.is_empty());
+        }
+        if let Some(Decision::NotAccepted { reasons }) = &result.decision {
             assert!(
-                w.app
-                    .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Advice(running))
-                    .await
-                    .is_err()
+                reasons
+                    .iter()
+                    .any(|r| matches!(r, RejectReason::KnownResult { .. }))
+                    == known.is_some()
             );
-            let mut skip = Step::pending();
-            skip.state = StepState::Skipped {
-                reason: "not positive".into(),
-            };
+            assert!(!reasons.is_empty());
+        }
+        let replay = w
+            .app
+            .apply_referee_audit(&auditor, &paper.id, 1)
+            .await
+            .unwrap();
+        assert_eq!(result, replay);
+        assert_eq!(
+            w.stores
+                .ports(Arc::new(SystemClock), Arc::new(FakeReader))
+                .records
+                .list(100, None)
+                .await
+                .unwrap()
+                .items
+                .len(),
+            usize::from(accepted)
+        );
+        if !accepted {
             w.app
-                .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Advice(skip.clone()))
+                .update_referee_round(
+                    &auditor,
+                    &paper.id,
+                    1,
+                    RoundUpdate::Advice(done_step(Advice {
+                        summary: "help".into(),
+                        improvements: vec![],
+                        formalization: vec![],
+                    })),
+                )
+                .await
+                .unwrap();
+            w.app
+                .update_referee_round(
+                    &auditor,
+                    &paper.id,
+                    1,
+                    RoundUpdate::Letter(done_step(LetterDraft {
+                        subject: "Review".into(),
+                        body: "Not accepted.".into(),
+                        note: String::new(),
+                    })),
+                )
                 .await
                 .unwrap();
             assert!(
                 w.app
-                    .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Advice(skip))
+                    .update_referee_round(
+                        &auditor,
+                        &paper.id,
+                        1,
+                        RoundUpdate::Formal(done_step(FormalProbe {
+                            toolchain: "lean".into(),
+                            attempts: vec![],
+                            summary: String::new()
+                        }))
+                    )
                     .await
                     .is_err()
             );
+            w.app
+                .update_referee_round(
+                    &auditor,
+                    &paper.id,
+                    1,
+                    RoundUpdate::Formal(Step {
+                        state: StepState::Skipped {
+                            reason: "not accepted".into(),
+                        },
+                        ..Step::pending()
+                    }),
+                )
+                .await
+                .unwrap();
         }
     }
 }
 
 #[tokio::test]
-async fn failed_referee_cannot_produce_advice_or_letter() {
+async fn audit_recovers_record_insert_and_preserves_publication_on_revision() {
     let w = World::new().await;
     let author = w.person("author", &[]).await;
-    let reviewer = w.person("referee", &[Role::Reviewer]).await;
+    let auditor = w.person("auditor", &[Role::Reviewer]).await;
+    let paper = w.submit(&author, "tc", false).await;
+    let paper = w.review_paper(&author, &paper).await;
+    w.app
+        .begin_referee_round(&auditor, &paper.id)
+        .await
+        .unwrap();
+    w.app
+        .update_referee_round(
+            &auditor,
+            &paper.id,
+            1,
+            RoundUpdate::Referee(done_step(referee_report(Some(Recommendation::Reject)))),
+        )
+        .await
+        .unwrap();
+    let accepted = audited(
+        &w,
+        &auditor,
+        &paper,
+        audit_for(
+            &paper,
+            Recommendation::MinorRevision,
+            Correctness::Correct,
+            ProofShape::Content,
+            None,
+        ),
+    )
+    .await;
+    let SubmissionStatus::Accepted { record } = &accepted.status else {
+        panic!()
+    };
+    // Simulate a crash after record insertion, before saving the final status.
+    let mut before_status = accepted.clone();
+    before_status.status = SubmissionStatus::InReview;
+    before_status.decision = None;
+    w.app.save(&mut before_status).await.unwrap();
+    let recovered = w
+        .app
+        .apply_referee_audit(&auditor, &paper.id, 1)
+        .await
+        .unwrap();
+    assert_eq!(recovered.status, accepted.status);
+    assert_eq!(recovered.reports, accepted.reports);
+    let records = w
+        .stores
+        .ports(Arc::new(SystemClock), Arc::new(FakeReader))
+        .records;
+    assert_eq!(records.list(100, None).await.unwrap().items.len(), 1);
+    let immutable = records.get(record).await.unwrap().unwrap();
+    let editor = w.person("editor", &[Role::Editor]).await;
+    let claim = &paper.claims[0].id;
+    w.app
+        .propose_formalization(&editor, &paper.id, claim, "A useful proof".into())
+        .await
+        .unwrap();
+    w.app
+        .respond_to_formalization(&author, &paper.id, claim, true, String::new())
+        .await
+        .unwrap();
+    w.app
+        .verify_formalization(
+            &editor,
+            &paper.id,
+            claim,
+            FormalArtifact {
+                repository: "https://github.com/example/paper".into(),
+                commit: "a".repeat(40),
+                declarations: vec!["Original.main".into()],
+            },
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    w.app
+        .update_conjecture(
+            &editor,
+            &paper.id,
+            &paper.claims[1].id,
+            ConjectureState::NotPursued {
+                reason: "No further approach yet".into(),
+            },
+        )
+        .await
+        .unwrap();
+    w.app
+        .set_analysis_visibility(&author, &paper.id, Visibility::Public)
+        .await
+        .unwrap();
+    let original = w.app.paper(record).await.unwrap();
+    assert!(original.claims[0].lean.is_some());
+    assert!(matches!(
+        w.app
+            .submission(&author, &paper.id)
+            .await
+            .unwrap()
+            .conjectures[0]
+            .state,
+        ConjectureState::NotPursued { .. }
+    ));
+    // Public downloads use the pinned blob even if a later worker recompiles it.
+    w.app
+        .record_compilation(&auditor, &paper.id, 1, Ok(b"%PDF recompiled".to_vec()))
+        .await
+        .unwrap();
+    assert_eq!(
+        w.app
+            .paper_file(None, &paper.id, Some(1), true)
+            .await
+            .unwrap()
+            .bytes,
+        b"%PDF"
+    );
+    let revised = w
+        .app
+        .upload_version(
+            &author,
+            &paper.id,
+            Upload {
+                bytes: b"new source".to_vec(),
+                filename: "tl.tex".into(),
+            },
+            "clarified proof".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revised.status, SubmissionStatus::Draft);
+    assert!(revised.formalization.items.is_empty());
+    assert!(revised.conjectures.is_empty());
+    assert_eq!(w.app.paper(record).await.unwrap(), original);
+    assert_eq!(records.get(record).await.unwrap().unwrap(), immutable);
+    assert!(
+        w.app
+            .paper_file(None, &paper.id, Some(2), true)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        w.app
+            .paper_file(None, &paper.id, None, true)
+            .await
+            .unwrap()
+            .bytes,
+        b"%PDF"
+    );
+    assert!(
+        w.app
+            .apply_referee_audit(&auditor, &paper.id, 1)
+            .await
+            .is_err()
+    );
+    // Reused statement IDs belong to the new inputs, never to the old proof.
+    let confirmed = w.review_version(&author, &revised, 2).await;
+    assert!(confirmed.formalization.items.is_empty());
+    assert_eq!(w.app.paper(record).await.unwrap(), original);
+}
+
+#[tokio::test]
+async fn legacy_publication_can_be_revised_without_mutating_its_record() {
+    let w = World::new().await;
+    let author = w.person("author", &[]).await;
+    let editor = w.person("editor", &[Role::Editor]).await;
+    let paper = w.submit(&author, "t", false).await;
+    let mut paper = w.review_paper(&author, &paper).await;
+    let record = Record {
+        kind: SubmissionKind::Paper,
+        id: RecordId::from("WP-2026-0099"),
+        publication: None,
+        submission: paper.id.clone(),
+        title: paper.title.clone(),
+        authors: paper.authors.clone(),
+        basis: AdmissionBasis::EscapeWitness,
+        accepted_by: editor.person.clone(),
+        accepted_at: w.app.ports.clock.now(),
+    };
+    let records = w
+        .stores
+        .ports(Arc::new(SystemClock), Arc::new(FakeReader))
+        .records;
+    records.insert(&record).await.unwrap();
+    paper.status = SubmissionStatus::Accepted {
+        record: record.id.clone(),
+    };
+    w.app.save(&mut paper).await.unwrap();
+    let original = w.app.paper(&record.id).await.unwrap();
+    let revised = w
+        .app
+        .upload_version(
+            &author,
+            &paper.id,
+            Upload {
+                bytes: b"new source".to_vec(),
+                filename: "tl.tex".into(),
+            },
+            "a revised argument".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revised.status, SubmissionStatus::Draft);
+    assert_eq!(w.app.paper(&record.id).await.unwrap(), original);
+    assert_eq!(records.get(&record.id).await.unwrap().unwrap(), record);
+    assert_eq!(
+        w.app
+            .paper_file(None, &paper.id, None, true)
+            .await
+            .unwrap()
+            .bytes,
+        b"%PDF"
+    );
+    assert!(
+        w.app
+            .paper_file(None, &paper.id, Some(2), true)
+            .await
+            .is_err()
+    );
+    let confirmed = w.review_version(&author, &revised, 2).await;
+    assert!(confirmed.formalization.items.is_empty());
+    assert_eq!(w.app.paper(&record.id).await.unwrap(), original);
+    // A failed second review and another upload still retain the original inputs.
+    let mut declined = confirmed;
+    declined.status = SubmissionStatus::NotAccepted;
+    w.app.save(&mut declined).await.unwrap();
+    w.app
+        .upload_version(
+            &author,
+            &paper.id,
+            Upload {
+                bytes: b"third source".to_vec(),
+                filename: "tlc.tex".into(),
+            },
+            "another revision".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(w.app.paper(&record.id).await.unwrap(), original);
+}
+
+#[tokio::test]
+async fn no_main_result_and_legacy_rounds() {
+    let w = World::new().await;
+    let author = w.person("author", &[]).await;
+    let auditor = w.person("auditor", &[Role::Reviewer]).await;
+    let paper = w.submit(&author, "t", false).await;
+    let mut paper = w.review_paper(&author, &paper).await;
+    paper.claims[0].role = ClaimRole::Supporting;
+    w.app.save(&mut paper).await.unwrap();
+    let file = w
+        .app
+        .begin_referee_round(&auditor, &paper.id)
+        .await
+        .unwrap();
+    let mut legacy = serde_json::to_value(file.current().unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("audit");
+    let legacy: RefereeRound = serde_json::from_value(legacy).unwrap();
+    assert!(
+        matches!(legacy.audit.state, StepState::Skipped { reason } if reason == "not part of this round")
+    );
+    w.app
+        .update_referee_round(
+            &auditor,
+            &paper.id,
+            1,
+            RoundUpdate::Referee(done_step(referee_report(Some(Recommendation::Accept)))),
+        )
+        .await
+        .unwrap();
+    let result = audited(
+        &w,
+        &auditor,
+        &paper,
+        audit_for(
+            &paper,
+            Recommendation::Accept,
+            Correctness::Correct,
+            ProofShape::Content,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        result.decision,
+        Some(Decision::NotAccepted {
+            reasons: vec![RejectReason::NoMainResult]
+        })
+    );
+}
+
+#[tokio::test]
+async fn failed_referee_cannot_produce_audit_advice_or_letter() {
+    let w = World::new().await;
+    let author = w.person("author", &[]).await;
+    let reviewer = w.person("auditor", &[Role::Reviewer]).await;
     let paper = w.submit(&author, "t", false).await;
     let paper = w.review_paper(&author, &paper).await;
     w.app
         .begin_referee_round(&reviewer, &paper.id)
         .await
         .unwrap();
-    let mut failure = Step::pending();
-    failure.state = StepState::Failed {
-        reason: "failed".into(),
-        detail: Some("detail".into()),
-        retryable: true,
-        at: chrono::Utc::now(),
+    let failure = Step {
+        state: StepState::Failed {
+            reason: "failure".into(),
+            detail: None,
+            retryable: false,
+            at: chrono::Utc::now(),
+        },
+        ..Step::pending()
     };
     w.app
-        .update_referee_round(
-            &reviewer,
-            &paper.id,
-            1,
-            RoundUpdate::Referee(failure.clone()),
-        )
-        .await
-        .unwrap();
-    assert!(
-        w.app
-            .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Referee(failure))
-            .await
-            .is_err()
-    );
-    let mut bad = Step::pending();
-    bad.state = StepState::Failed {
-        reason: "bad".into(),
-        detail: None,
-        retryable: false,
-        at: chrono::Utc::now(),
-    };
-    assert!(
-        w.app
-            .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Advice(bad))
-            .await
-            .is_err()
-    );
-    let mut skip = Step::pending();
-    skip.state = StepState::Skipped {
-        reason: "failed referee".into(),
-    };
-    w.app
-        .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Advice(skip))
+        .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Referee(failure))
         .await
         .unwrap();
     assert!(
@@ -1235,12 +1723,20 @@ async fn failed_referee_cannot_produce_advice_or_letter() {
                 &reviewer,
                 &paper.id,
                 1,
-                RoundUpdate::Letter(done_step(LetterDraft {
-                    subject: "x".into(),
-                    body: "x".into(),
-                    note: String::new()
-                }))
+                RoundUpdate::Audit(done_step(audit_for(
+                    &paper,
+                    Recommendation::Accept,
+                    Correctness::Correct,
+                    ProofShape::Content,
+                    None
+                )))
             )
+            .await
+            .is_err()
+    );
+    assert!(
+        w.app
+            .apply_referee_audit(&reviewer, &paper.id, 1)
             .await
             .is_err()
     );
@@ -1262,12 +1758,7 @@ async fn referee_updates_fence_version_and_claims_revision() {
     w.app.save(&mut changed).await.unwrap();
     assert!(matches!(
         w.app
-            .update_referee_round(
-                &reviewer,
-                &paper.id,
-                1,
-                RoundUpdate::Referee(Step::pending())
-            )
+            .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Audit(Step::pending()))
             .await,
         Err(CoreError::Conflict(_))
     ));
@@ -1276,12 +1767,7 @@ async fn referee_updates_fence_version_and_claims_revision() {
     w.app.save(&mut changed).await.unwrap();
     assert!(matches!(
         w.app
-            .update_referee_round(
-                &reviewer,
-                &paper.id,
-                1,
-                RoundUpdate::Referee(Step::pending())
-            )
+            .update_referee_round(&reviewer, &paper.id, 1, RoundUpdate::Audit(Step::pending()))
             .await,
         Err(CoreError::Conflict(_))
     ));
@@ -1311,7 +1797,8 @@ async fn referee_visibility_restart_and_letter_editing() {
             .await
             .unwrap()
             .rounds
-            .is_empty()
+            .len()
+            == 1
     );
     assert!(matches!(
         w.app.referee(&stranger, &paper.id).await,
@@ -1323,6 +1810,20 @@ async fn referee_visibility_restart_and_letter_editing() {
             &paper.id,
             1,
             RoundUpdate::Referee(done_step(referee_report(Some(Recommendation::Reject)))),
+        )
+        .await
+        .unwrap();
+    w.app
+        .update_referee_round(
+            &reviewer,
+            &paper.id,
+            1,
+            RoundUpdate::Audit(Step {
+                state: StepState::Skipped {
+                    reason: "failed audit".into(),
+                },
+                ..Step::pending()
+            }),
         )
         .await
         .unwrap();
@@ -1349,6 +1850,25 @@ async fn referee_visibility_restart_and_letter_editing() {
             .await,
         Err(CoreError::Conflict(_))
     ));
+    let draft = LetterDraft {
+        subject: "Feedback".into(),
+        body: "A precise gap.".into(),
+        note: "Longer argument".into(),
+    };
+    w.app
+        .update_referee_round(
+            &reviewer,
+            &paper.id,
+            1,
+            RoundUpdate::Letter(Step {
+                state: StepState::Skipped {
+                    reason: "no audit".into(),
+                },
+                ..Step::pending()
+            }),
+        )
+        .await
+        .unwrap();
     w.app
         .update_referee_round(
             &reviewer,
@@ -1363,21 +1883,8 @@ async fn referee_visibility_restart_and_letter_editing() {
         )
         .await
         .unwrap();
-    let draft = LetterDraft {
-        subject: "Feedback".into(),
-        body: "A precise gap.".into(),
-        note: "Longer argument".into(),
-    };
-    w.app
-        .update_referee_round(
-            &reviewer,
-            &paper.id,
-            1,
-            RoundUpdate::Letter(done_step(draft.clone())),
-        )
-        .await
-        .unwrap();
     let new = NewLetter {
+        assessment: Some(Recommendation::MajorRevision),
         subject: draft.subject.clone(),
         body: draft.body.clone(),
         note: draft.note.clone(),
@@ -1389,7 +1896,7 @@ async fn referee_visibility_restart_and_letter_editing() {
             .is_err()
     );
     assert!(
-        !w.app
+        w.app
             .send_feedback(&editor, &paper.id, new.clone())
             .await
             .unwrap()
@@ -1412,9 +1919,17 @@ async fn referee_visibility_restart_and_letter_editing() {
     }
     for caller in [&author, &coauthor] {
         let view = w.app.referee(caller, &paper.id).await.unwrap();
-        assert!(view.rounds.is_empty());
+        assert_eq!(view.rounds.len(), 1);
+        assert!(view.rounds[0].advice.is_none() && view.rounds[0].letter.is_none());
+        assert_eq!(view.rounds[0].referee.done().unwrap().text, "full answer");
         assert_eq!(view.letters.len(), 4);
+        assert!(
+            view.letters
+                .iter()
+                .all(|letter| { letter.assessment == Some(Recommendation::MajorRevision) })
+        );
     }
+    assert_eq!(w.app.submission(&author, &paper.id).await.unwrap(), paper);
     assert_eq!(
         w.app
             .referee(&editor, &paper.id)
@@ -1442,6 +1957,7 @@ async fn sent_letter_validation_and_statuses() {
     let editor = w.person("editor", &[Role::Editor]).await;
     let mut paper = w.submit(&author, "t", false).await;
     let new = NewLetter {
+        assessment: None,
         subject: "s".into(),
         body: "b".into(),
         note: String::new(),
@@ -1493,4 +2009,421 @@ async fn sent_letter_validation_and_statuses() {
         w.app.send_feedback(&editor, &paper.id, new).await,
         Err(CoreError::Conflict(_))
     ));
+}
+
+fn open_reading() -> ConjectureReading {
+    ConjectureReading {
+        well_posed: true,
+        well_posed_reason: "All symbols and quantifiers are defined.".into(),
+        status: ConjectureStatus::Open,
+        status_reason: "No solution in the available material.".into(),
+        named_works: vec![],
+        escape: ProofShape::Content,
+        escape_reason: "A proof would require a new estimate.".into(),
+        suggestions: vec!["Explain the boundary case.".into()],
+    }
+}
+
+async fn displayed_conjecture(w: &World, author: &Caller, reviewer: &Caller) -> Submission {
+    let mut paper = w.submit(author, "c", false).await;
+    paper.kind = SubmissionKind::Conjecture;
+    paper.extracted[0].role = ClaimRole::Main;
+    w.app.save(&mut paper).await.unwrap();
+    let paper = w.review_paper(author, &paper).await;
+    w.app
+        .begin_referee_round(reviewer, &paper.id)
+        .await
+        .unwrap();
+    w.app
+        .update_referee_round(
+            reviewer,
+            &paper.id,
+            1,
+            RoundUpdate::Referee(done_step(referee_report(Some(Recommendation::Accept)))),
+        )
+        .await
+        .unwrap();
+    let audit = RefereeAudit {
+        verdict: Recommendation::Accept,
+        agrees_with_referee: true,
+        summary: "PRIVATE_AUDIT_SUMMARY".into(),
+        claims: vec![AuditedClaim {
+            claim: "C1".into(),
+            correctness: Correctness::NotChecked,
+            comment: "PRIVATE_CLAIM_COMMENT".into(),
+            shape: None,
+            witnesses: vec![],
+            known: None,
+            referee_agreed: true,
+            conjecture: Some(open_reading()),
+        }],
+        concerns: vec![],
+    };
+    let paper = audited(w, reviewer, &paper, audit).await;
+    w.app
+        .update_referee_round(
+            reviewer,
+            &paper.id,
+            1,
+            RoundUpdate::Advice(Step {
+                state: StepState::Skipped {
+                    reason: "no advice".into(),
+                },
+                ..Step::pending()
+            }),
+        )
+        .await
+        .unwrap();
+    w.app
+        .update_referee_round(
+            reviewer,
+            &paper.id,
+            1,
+            RoundUpdate::Letter(done_step(LetterDraft {
+                subject: "Display".into(),
+                body: "Dear Author,\n\nPRIVATE_LETTER_TEXT".into(),
+                note: String::new(),
+            })),
+        )
+        .await
+        .unwrap();
+    paper
+}
+
+#[tokio::test]
+async fn lean_statement_confirmation_is_cookie_only_digest_bound_and_voided_on_revision() {
+    let w = World::new().await;
+    let author = w.person("author", &[]).await;
+    let reviewer = w.person("reviewer", &[Role::Reviewer]).await;
+    let paper = displayed_conjecture(&w, &author, &reviewer).await;
+    let record = match &paper.status {
+        SubmissionStatus::Accepted { record } => record,
+        _ => panic!(),
+    };
+    assert!(
+        w.app.referee(&author, &paper.id).await.unwrap().letters[0]
+            .body
+            .contains("Your conjecture is displayed")
+    );
+    w.app
+        .queue_lean_statements(&reviewer, &paper.id)
+        .await
+        .unwrap();
+    let first = w
+        .app
+        .record_lean_statement(
+            &reviewer,
+            &paper.id,
+            1,
+            paper.claims_revision,
+            &"C1".into(),
+            "theorem wishpool_target : True := by sorry".into(),
+            "Lean test".into(),
+            "The conjecture says True.".into(),
+            None,
+        )
+        .await
+        .unwrap();
+    let digest = first.lean_statements[0].digest.clone();
+    assert_eq!(digest.len(), 64);
+    assert!(
+        w.app
+            .respond_lean_statement(
+                &author,
+                AuthenticationMethod::Bearer,
+                &paper.id,
+                &digest,
+                true,
+                String::new()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        w.app
+            .respond_lean_statement(
+                &author,
+                AuthenticationMethod::CookieSession,
+                &paper.id,
+                "different-digest",
+                true,
+                String::new()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        w.app
+            .respond_lean_statement(
+                &author,
+                AuthenticationMethod::CookieSession,
+                &paper.id,
+                &digest,
+                false,
+                " ".into()
+            )
+            .await
+            .is_err()
+    );
+    w.app
+        .respond_lean_statement(
+            &author,
+            AuthenticationMethod::CookieSession,
+            &paper.id,
+            &digest,
+            false,
+            "Use the original quantifier".into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        w.app
+            .respond_lean_statement(
+                &author,
+                AuthenticationMethod::CookieSession,
+                &paper.id,
+                &digest,
+                true,
+                String::new()
+            )
+            .await
+            .is_err()
+    );
+    let second = w
+        .app
+        .record_lean_statement(
+            &reviewer,
+            &paper.id,
+            1,
+            paper.claims_revision,
+            &"C1".into(),
+            "theorem wishpool_target : ∀ n : Nat, n = n := by sorry".into(),
+            "Lean test".into(),
+            "Every natural number equals itself.".into(),
+            Some(digest),
+        )
+        .await
+        .unwrap();
+    let digest = second.lean_statements[1].digest.clone();
+    w.app
+        .respond_lean_statement(
+            &author,
+            AuthenticationMethod::CookieSession,
+            &paper.id,
+            &digest,
+            true,
+            String::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(w.app.paper(record).await.unwrap().lean_statements.len(), 1);
+    assert_eq!(
+        w.app.list_conjectures(None, None).await.unwrap().items[0].lean_statement_status,
+        super::records::LeanStatementStatus::Confirmed
+    );
+    let revised = w
+        .app
+        .upload_version(
+            &author,
+            &paper.id,
+            Upload {
+                filename: "c.tex".into(),
+                bytes: b"new source".to_vec(),
+            },
+            "Revised".into(),
+        )
+        .await
+        .unwrap();
+    assert!(revised.lean_statements.is_empty());
+    assert!(
+        w.app
+            .respond_lean_statement(
+                &author,
+                AuthenticationMethod::CookieSession,
+                &paper.id,
+                &digest,
+                true,
+                String::new()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        w.app
+            .paper(record)
+            .await
+            .unwrap()
+            .lean_statements
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn public_projection_serialization_excludes_all_private_reviews_and_rationales() {
+    let w = World::new().await;
+    let author = w.person("author", &[]).await;
+    let reviewer = w.person("auditor", &[Role::Reviewer]).await;
+    let paper = w.submit(&author, "tl", false).await;
+    let paper = w.review_paper(&author, &paper).await;
+    w.app
+        .begin_referee_round(&reviewer, &paper.id)
+        .await
+        .unwrap();
+    let mut report = referee_report(Some(Recommendation::Accept));
+    report.summary = "PRIVATE_REPORT_SUMMARY".into();
+    report.text = "PRIVATE_GPT_REPORT".into();
+    w.app
+        .update_referee_round(
+            &reviewer,
+            &paper.id,
+            1,
+            RoundUpdate::Referee(done_step(report)),
+        )
+        .await
+        .unwrap();
+    let mut audit = audit_for(
+        &paper,
+        Recommendation::Accept,
+        Correctness::Correct,
+        ProofShape::Content,
+        None,
+    );
+    audit.summary = "PRIVATE_AUDIT_SUMMARY".into();
+    audit.claims[0].comment = "PRIVATE_COMMENT".into();
+    let paper = audited(&w, &reviewer, &paper, audit).await;
+    let record = match &paper.status {
+        SubmissionStatus::Accepted { record } => record,
+        _ => panic!(),
+    };
+    let payload = w.app.paper(record).await.unwrap();
+    assert_eq!(payload.new_content.len(), 1);
+    assert_eq!(payload.new_content[0].lemmas, ["The gap estimate"]);
+    let text = serde_json::to_string(&payload).unwrap();
+    for forbidden in [
+        "correctness",
+        "comment",
+        "rationale",
+        "analysis",
+        "audit_summary",
+        "referee",
+        "letter",
+        "advice",
+        "PRIVATE_",
+        "Correct:",
+        "not_checked",
+        "gap\"",
+    ] {
+        assert!(!text.contains(forbidden), "leaked {forbidden}: {text}");
+    }
+    w.app
+        .set_analysis_visibility(&author, &paper.id, Visibility::Private)
+        .await
+        .unwrap();
+    let private = serde_json::to_value(w.app.paper(record).await.unwrap()).unwrap();
+    assert_eq!(
+        private.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["summary"]
+    );
+    let fields = private["summary"].as_object().unwrap();
+    assert_eq!(
+        fields.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from(["authors", "kind", "record", "title"])
+    );
+    assert!(w.app.paper_file(None, &paper.id, None, true).await.is_err());
+}
+
+#[tokio::test]
+async fn upload_checkbox_maps_to_visibility() {
+    for checked in [false, true] {
+        let w = World::new().await;
+        let author = w.person("author", &[]).await;
+        let mut new: NewPaper = serde_json::from_value(
+            serde_json::json!({"ai_disclosure":{"level":"none","statement":"No AI used."}}),
+        )
+        .unwrap();
+        new.make_public_after_acceptance = checked;
+        let s = w
+            .app
+            .submit_paper(
+                &author,
+                new,
+                Upload {
+                    filename: "t.tex".into(),
+                    bytes: b"source".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            s.analysis_visibility,
+            if checked {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn conjecture_listing_pages_past_other_kinds_and_private_records_in_record_order() {
+    use crate::ports::RecordStore;
+    let w = World::new().await;
+    let author = w.person("author", &[]).await;
+    let reviewer = w.person("reviewer", &[Role::Reviewer]).await;
+    let original = displayed_conjecture(&w, &author, &reviewer).await;
+    let original_record = w
+        .stores
+        .for_submission(&original.id)
+        .await
+        .unwrap()
+        .unwrap();
+    for (index, kind, visibility) in [
+        (2, SubmissionKind::Conjecture, Visibility::Public),
+        (3, SubmissionKind::Paper, Visibility::Public),
+        (4, SubmissionKind::Conjecture, Visibility::Private),
+        (5, SubmissionKind::Note, Visibility::Public),
+        (6, SubmissionKind::Conjecture, Visibility::Undecided),
+        (7, SubmissionKind::Conjecture, Visibility::Public),
+    ] {
+        let mut publication = original.clone();
+        publication.id = format!("listing-{index}").as_str().into();
+        publication.kind = kind;
+        publication.analysis_visibility = visibility;
+        publication.claims[0].statement = format!("For every n,\n  property {index} holds.");
+        publication.title = format!("Submission {index}");
+        publication.status = SubmissionStatus::Accepted {
+            record: format!("WP-2026-{index:04}").as_str().into(),
+        };
+        w.app.ports.submissions.insert(&publication).await.unwrap();
+        let mut record = original_record.clone();
+        record.id = format!("WP-2026-{index:04}").as_str().into();
+        record.kind = kind;
+        record.submission = publication.id.clone();
+        record.title = publication.title.clone();
+        record.publication = Some(Box::new(publication));
+        w.stores.insert(&record).await.unwrap();
+    }
+    let first = w.app.list_conjectures(Some(2), None).await.unwrap();
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(|c| c.record.as_str())
+            .collect::<Vec<_>>(),
+        ["WP-2026-0007", "WP-2026-0002"]
+    );
+    assert_eq!(first.items[0].statement, "For every n, property 7 holds.");
+    assert_eq!(
+        first.items[0].lean_statement_status,
+        super::records::LeanStatementStatus::None
+    );
+    let second = w
+        .app
+        .list_conjectures(Some(2), first.next_before)
+        .await
+        .unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.items[0].record, original_record.id);
+    assert!(second.next_before.is_none());
 }

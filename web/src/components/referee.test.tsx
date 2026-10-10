@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, type ApiClient } from '../api/client';
 import type { Person, RefereeRound, Submission } from '../api/types';
+import { useReferee } from '../api/useReferee';
 import { SubmissionDetailPage } from '../pages/SubmissionDetail';
 import {
   accepted,
@@ -10,6 +11,7 @@ import {
   author,
   contributor,
   editor,
+  notAccepted,
   submission,
   version,
 } from '../test/fixtures';
@@ -61,7 +63,7 @@ describe('referee workspace', () => {
       'Referee report: waiting in queue (#7).',
     );
     expect(within(panel).getByText(/In queue \(#7\)/)).toBeInTheDocument();
-    expect(within(panel).getAllByText('Pending')).toHaveLength(3);
+    expect(within(panel).getAllByText('Pending')).toHaveLength(4);
     expect(panel.querySelector('li[title="NyxID Oracle · ChatGPT Pro"]')).not.toBeNull();
     expect(within(panel).getByRole('button', { name: 'Start a new review' })).toBeDisabled();
     expect(within(panel).getByRole('list', { name: 'Review progress' })).toHaveTextContent(
@@ -86,10 +88,12 @@ describe('referee workspace', () => {
   it('renders the report as advisory, severity groups, readings, limits and the full answer with paper macros', async () => {
     workspace();
     const panel = await staffPanel();
-    expect(within(panel).getAllByText('Done')).toHaveLength(4);
+    expect(within(panel).getAllByText('Done')).toHaveLength(5);
     await userEvent.click(within(panel).getByText('Referee report · minor revision'));
     expect(within(panel).getByText('Referee recommends minor revision')).toBeInTheDocument();
-    expect(within(panel).getByText(/have not been independently verified/)).toBeInTheDocument();
+    expect(
+      within(panel).getByText(/publication decision are recorded separately/),
+    ).toBeInTheDocument();
     expect(within(panel).getByRole('heading', { name: 'Major concerns' })).toBeInTheDocument();
     expect(within(panel).getByRole('heading', { name: 'Minor concerns' })).toBeInTheDocument();
     expect(
@@ -198,6 +202,7 @@ describe('referee workspace', () => {
     workspace({ sendFeedback });
     const panel = await staffPanel();
     const form = within(panel).getByRole('form', { name: 'Send feedback to the author' });
+    expect(within(form).getByLabelText('Assessment')).toHaveDisplayValue('Minor revision');
     const user = userEvent.setup();
     const fields = {
       Subject: 'Revised editorial feedback',
@@ -218,6 +223,7 @@ describe('referee workspace', () => {
       subject: fields.Subject,
       body: fields.Body,
       note: fields.Note,
+      assessment: 'minor_revision',
     });
     expect(
       await within(panel).findByRole('heading', { name: 'Sent editorial feedback', level: 3 }),
@@ -248,7 +254,98 @@ describe('referee workspace', () => {
     expect(within(panel).queryByText('Feedback sent to the author.')).toBeNull();
   });
 
-  it('gives authors sent letters newest first and never displays rounds, advice or drafts', async () => {
+  it.each(['accept', 'minor_revision', 'major_revision', 'reject', undefined] as const)(
+    'defaults the letter assessment to the recommendation %s',
+    async (recommendation) => {
+      workspace({
+        referee: vi.fn(async () =>
+          refereeFile({
+            rounds: [
+              {
+                ...refereeRound,
+                referee: {
+                  ...refereeRound.referee,
+                  state: {
+                    state: 'done',
+                    result: { ...refereeReport, recommendation },
+                    at: refereeRound.started_at,
+                  },
+                },
+              },
+            ],
+          }),
+        ),
+      });
+      const select = within(await staffPanel()).getByLabelText('Assessment');
+      expect(select).toHaveValue(recommendation ?? '');
+      expect(
+        within(select)
+          .getAllByRole('option')
+          .map((option) => option.textContent),
+      ).toEqual(['Accept', 'Minor revision', 'Major revision', 'Reject', 'No assessment']);
+    },
+  );
+
+  it.each(['reject', ''] as const)(
+    'sends the editor’s chosen assessment %s',
+    async (assessment) => {
+      const sendFeedback = vi.fn(async () => ({
+        ...feedbackLetter,
+        assessment: assessment || undefined,
+      }));
+      workspace({ sendFeedback });
+      const form = within(await staffPanel()).getByRole('form', {
+        name: 'Send feedback to the author',
+      });
+      await userEvent.selectOptions(within(form).getByLabelText('Assessment'), assessment);
+      await userEvent.click(within(form).getByRole('button', { name: 'Send to author' }));
+      expect(sendFeedback).toHaveBeenCalledExactlyOnceWith(submission.id, {
+        subject:
+          refereeRound.letter.state.state === 'done'
+            ? refereeRound.letter.state.result.subject
+            : '',
+        body:
+          refereeRound.letter.state.state === 'done' ? refereeRound.letter.state.result.body : '',
+        note:
+          refereeRound.letter.state.state === 'done' ? refereeRound.letter.state.result.note : '',
+        ...(assessment ? { assessment } : {}),
+      });
+    },
+  );
+
+  it.each([editor, author])(
+    'shows the sent assessment beside the subject for $id',
+    async (person) => {
+      workspace(
+        {
+          referee: vi.fn(async () =>
+            refereeFile({ letters: [{ ...feedbackLetter, assessment: 'minor_revision' }] }),
+          ),
+        },
+        person,
+      );
+      const heading = await screen.findByRole('heading', {
+        name: 'Sent editorial feedback Minor revision',
+      });
+      expect(
+        within(heading).getByText('Minor revision', { selector: '.badge' }),
+      ).toBeInTheDocument();
+    },
+  );
+
+  it('shows assessments in the staff’s earlier-letter history', async () => {
+    workspace({
+      referee: vi.fn(async () =>
+        refereeFile({ letters: [{ ...feedbackLetter, round: undefined, assessment: 'reject' }] }),
+      ),
+    });
+    const panel = await staffPanel();
+    await userEvent.click(within(panel).getByText('Earlier reviews'));
+    const badge = within(panel).getByText('Reject', { selector: '.badge' });
+    expect(badge.closest('summary')).toHaveTextContent(feedbackLetter.subject);
+  });
+
+  it('gives authors sent letters newest first and folds the full referee report', async () => {
     workspace(
       {
         referee: vi.fn(async () =>
@@ -262,19 +359,24 @@ describe('referee workspace', () => {
       },
       author,
     );
-    const panel = (
-      await screen.findByRole('heading', { name: 'Feedback from the editors' })
-    ).closest('section')!;
+    const heading = await screen.findByRole('heading', { name: feedbackLetter.subject });
+    const panel = heading.closest('section')!;
+    expect(panel).toHaveAccessibleName('Letter from the editors');
+    const letters = heading.closest('ul')!;
     expect(
-      within(panel)
+      within(letters)
         .getAllByRole('heading', { level: 3 })
         .map((h) => h.textContent),
     ).toEqual(['Sent editorial feedback', 'Earlier feedback']);
     expect(panel.querySelector('.mop')).toHaveTextContent('rep');
     expect(panel.querySelector(KATEX_ERROR)).toBeNull();
-    expect(within(panel).getAllByText('Note')).toHaveLength(2);
+    expect(within(panel).getAllByText('Note', { selector: 'summary' })).toHaveLength(2);
     expect(screen.queryByRole('heading', { name: 'Review' })).toBeNull();
-    expect(screen.queryByText(/Referee recommends/)).toBeNull();
+    const fullReport = within(panel).getByText('Full referee report', { selector: 'summary' });
+    expect(fullReport.closest('details')).not.toHaveAttribute('open');
+    expect(within(panel).getByText(/Referee recommends/)).not.toBeVisible();
+    await userEvent.click(fullReport);
+    expect(within(panel).getByText(/Referee recommends/)).toBeVisible();
     expect(screen.queryByRole('heading', { name: 'Contributor advice' })).toBeNull();
     expect(screen.queryByRole('form', { name: 'Send feedback to the author' })).toBeNull();
   });
@@ -282,9 +384,72 @@ describe('referee workspace', () => {
   it('shows nothing for an author with no sent letters', async () => {
     const referee = vi.fn(async () => refereeFile());
     workspace({ referee }, author);
-    await waitFor(() => expect(referee).toHaveBeenCalledOnce());
-    expect(screen.queryByRole('heading', { name: 'Feedback from the editors' })).toBeNull();
+    await waitFor(() => {
+      expect(referee).toHaveBeenCalledOnce();
+      expect(screen.queryByRole('region', { name: 'Letter from the editors' })).toBeNull();
+    });
+    expect(screen.queryByText('Full referee report', { selector: 'summary' })).toBeNull();
     expect(screen.queryByText('No feedback letters have been sent.')).toBeNull();
+  });
+
+  it('previews the first two paragraphs of a long letter and reveals the rest and note on expansion', async () => {
+    const paragraphs = [
+      'Dear author,',
+      'We checked the induction step.',
+      'Please clarify the boundary case.',
+      'Sincerely, the editors.',
+    ];
+    workspace(
+      {
+        referee: vi.fn(async () =>
+          refereeFile({
+            letters: [
+              {
+                ...feedbackLetter,
+                body: paragraphs.join('\n\n'),
+                note: 'A detailed editorial note.',
+              },
+            ],
+          }),
+        ),
+      },
+      author,
+    );
+    const heading = await screen.findByRole('heading', { name: feedbackLetter.subject });
+    const panel = heading.closest('section')!;
+    for (const paragraph of paragraphs.slice(0, 2))
+      expect(within(panel).getByText(paragraph)).toBeVisible();
+    for (const paragraph of paragraphs.slice(2))
+      expect(within(panel).queryByText(paragraph)).toBeNull();
+    expect(within(panel).queryByText('Note', { selector: 'summary' })).toBeNull();
+    expect(within(panel).queryByText('A detailed editorial note.')).toBeNull();
+    await userEvent.click(within(panel).getByRole('button', { name: 'Read the full letter' }));
+    for (const paragraph of paragraphs) expect(within(panel).getByText(paragraph)).toBeVisible();
+    expect(within(panel).queryByRole('button', { name: 'Read the full letter' })).toBeNull();
+    const note = within(panel).getByText('Note', { selector: 'summary' });
+    expect(note).toBeVisible();
+    expect(within(panel).getByText('A detailed editorial note.')).not.toBeVisible();
+    await userEvent.click(note);
+    expect(within(panel).getByText('A detailed editorial note.')).toBeVisible();
+  });
+
+  it('shows a letter of three paragraphs in full without an expansion button', async () => {
+    const paragraphs = ['Dear author,', 'The result is correct.', 'Sincerely, the editors.'];
+    workspace(
+      {
+        referee: vi.fn(async () =>
+          refereeFile({
+            letters: [{ ...feedbackLetter, body: paragraphs.join('\n\n'), note: '' }],
+          }),
+        ),
+      },
+      author,
+    );
+    const heading = await screen.findByRole('heading', { name: feedbackLetter.subject });
+    const panel = heading.closest('section')!;
+    for (const paragraph of paragraphs) expect(within(panel).getByText(paragraph)).toBeVisible();
+    expect(within(panel).queryByRole('button', { name: 'Read the full letter' })).toBeNull();
+    expect(within(panel).queryByText('Note', { selector: 'summary' })).toBeNull();
   });
 
   it('gives reviewers and admins the staff view, with mutations reserved for editors and admins', async () => {
@@ -447,17 +612,22 @@ describe('referee workspace', () => {
 });
 
 describe('referee polling', () => {
-  function polling(referee: ApiClient['referee'], isStaff = true, paper = submission) {
-    const api = fakeApi({ referee });
-    return renderWithApp(
+  function PollingWorkspace({ paper, isStaff }: { paper: Submission; isStaff: boolean }) {
+    const resource = useReferee(paper, isStaff);
+    return (
       <RefereeWorkspace
         submission={paper}
         isStaff={isStaff}
         isEditor={isStaff}
         onChange={() => {}}
-      />,
-      api,
+        resource={resource}
+      />
     );
+  }
+
+  function polling(referee: ApiClient['referee'], isStaff = true, paper = submission) {
+    const api = fakeApi({ referee });
+    return renderWithApp(<PollingWorkspace paper={paper} isStaff={isStaff} />, api);
   }
 
   it('polls every 30 seconds and stops once all steps settle', async () => {
@@ -606,8 +776,8 @@ describe('referee polling', () => {
     expect(referee).toHaveBeenCalledTimes(2);
   });
 
-  it.each([submission, accepted])(
-    'refreshes sent letters every 30 seconds and on focus for an author while $status.state',
+  it.each([submission, accepted, notAccepted])(
+    'polls with no letter section, then refreshes delivered letters on focus while $status.state',
     async (paper) => {
       vi.useFakeTimers();
       const referee = vi
@@ -617,9 +787,10 @@ describe('referee polling', () => {
         .mockResolvedValue(
           refereeFile({ letters: [{ ...feedbackLetter, subject: 'New feedback on focus' }] }),
         );
-      polling(referee, false, paper);
+      const view = polling(referee, false, paper);
       await act(async () => {});
-      expect(screen.queryByRole('heading', { name: 'Feedback from the editors' })).toBeNull();
+      expect(view.container).toBeEmptyDOMElement();
+      expect(screen.queryByRole('region', { name: 'Letter from the editors' })).toBeNull();
       await act(async () => {
         await vi.advanceTimersByTimeAsync(29_999);
       });
@@ -628,6 +799,7 @@ describe('referee polling', () => {
         await vi.advanceTimersByTimeAsync(1);
       });
       expect(referee).toHaveBeenCalledTimes(2);
+      expect(screen.getByRole('region', { name: 'Letter from the editors' })).toBeInTheDocument();
       expect(screen.getByRole('heading', { name: 'Sent editorial feedback' })).toBeInTheDocument();
       await act(async () => {
         fireEvent.focus(window);
@@ -635,7 +807,7 @@ describe('referee polling', () => {
       expect(referee).toHaveBeenCalledTimes(3);
       expect(screen.getByRole('heading', { name: 'New feedback on focus' })).toBeInTheDocument();
       expect(screen.queryByRole('heading', { name: 'Review' })).toBeNull();
-      expect(screen.queryByText(/Referee recommends/)).toBeNull();
+      expect(screen.getByText('Full referee report', { selector: 'summary' })).toBeInTheDocument();
       expect(screen.queryByRole('form', { name: 'Send feedback to the author' })).toBeNull();
     },
   );
@@ -655,6 +827,7 @@ describe('referee polling', () => {
       await vi.advanceTimersByTimeAsync(30_000);
     });
     expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('region', { name: 'Letter from the editors' })).toBeNull();
     await act(async () => {
       await vi.advanceTimersByTimeAsync(30_000);
     });
@@ -664,6 +837,7 @@ describe('referee polling', () => {
     });
     expect(referee).toHaveBeenCalledTimes(4);
     expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('region', { name: 'Letter from the editors' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Sent editorial feedback' })).toBeInTheDocument();
   });
 

@@ -90,9 +90,31 @@ impl JobLease for MongoStore {
         }))
     }
 
+    async fn renew(&self, job: &LeasedJob) -> CoreResult<bool> {
+        let now = Utc::now();
+        let result = self
+            .raw(REVIEW_JOBS)
+            .update_one(
+                doc! {
+                    "_id": job_id(&job.submission, job.kind),
+                    "state": "leased",
+                    "lease": &job.lease,
+                    // Once the lease has expired, another worker may claim it;
+                    // the old token must not be able to revive it.
+                    "lease_until": { "$gt": BsonDateTime::from_chrono(now) },
+                },
+                doc! {
+                    "$set": { "lease_until": BsonDateTime::from_chrono(now + LEASE) },
+                },
+            )
+            .await
+            .map_err(unavailable)?;
+        Ok(result.matched_count == 1)
+    }
+
     async fn complete(&self, job: &LeasedJob) -> CoreResult<()> {
         self.raw(REVIEW_JOBS)
-            .delete_one(doc! { "_id": job_id(&job.submission, job.kind), "lease": &job.lease })
+            .delete_one(doc! { "_id": job_id(&job.submission, job.kind), "state": "leased", "lease": &job.lease, "lease_until": { "$gt": BsonDateTime::now() } })
             .await
             .map_err(unavailable)?;
         Ok(())
@@ -102,7 +124,7 @@ impl JobLease for MongoStore {
         let delay = chrono::Duration::from_std(delay)
             .map_err(|_| CoreError::invalid("job deferral is too long"))?;
         self.raw(REVIEW_JOBS).update_one(
-            doc! { "_id": job_id(&job.submission, job.kind), "state": "leased", "lease": &job.lease },
+            doc! { "_id": job_id(&job.submission, job.kind), "state": "leased", "lease": &job.lease, "lease_until": { "$gt": BsonDateTime::now() } },
             doc! {
                 "$set": { "state": "queued", "available_at": BsonDateTime::from_chrono(Utc::now() + delay) },
                 "$inc": { "attempts": -1_i32 },
@@ -123,7 +145,7 @@ impl JobLease for MongoStore {
         };
         self.raw(REVIEW_JOBS)
             .update_one(
-                doc! { "_id": job_id(&job.submission, job.kind), "lease": &job.lease },
+                doc! { "_id": job_id(&job.submission, job.kind), "state": "leased", "lease": &job.lease, "lease_until": { "$gt": BsonDateTime::now() } },
                 doc! {
                     "$set": {
                         "state": state,

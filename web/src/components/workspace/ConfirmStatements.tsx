@@ -44,12 +44,16 @@ export function ConfirmStatements({
     );
   }
 
-  const mainCount = rows.filter(isMainResult).length;
+  const mainCount = rows.filter((r) =>
+    submission.kind === 'conjecture'
+      ? !r.excluded && r.role === 'main' && (r.kind === 'conjecture' || r.kind === 'question')
+      : isMainResult(r),
+  ).length;
   const excludedCount = rows.filter((r) => r.excluded).length;
 
   const submit = (event: FormEvent) => {
     event.preventDefault();
-    const built = buildConfirmations(rows);
+    const built = buildConfirmations(rows, submission.kind === 'conjecture');
     if (!built.ok) {
       setError(built.error);
       return;
@@ -74,8 +78,9 @@ export function ConfirmStatements({
         The server read {extracted.length} statement{extracted.length === 1 ? '' : 's'} from the
         source. For each, check the kind, mark whether it is a main result of the paper or
         supporting, and select the statements its proof uses. Exclude anything that was misparsed.
-        At least one proved statement must be a main result; conjectures and questions are never
-        main results.
+        {submission.kind === 'conjecture'
+          ? 'Mark at least one conjecture or question as main.'
+          : 'Mark at least one proved statement as a main result.'}
       </p>
       <div className="table-wrap">
         <table className="data-table confirm-table">

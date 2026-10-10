@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
@@ -18,6 +18,49 @@ import { fakeApi, renderWithApp } from '../test/render';
 import { SubmissionDetailPage } from './SubmissionDetail';
 
 describe('paper workspace', () => {
+  it('refreshes a delayed conjecture target on focus after the review has settled', async () => {
+    const initial: typeof accepted = {
+      ...accepted,
+      kind: 'conjecture' as const,
+      claims: [{ ...accepted.claims[2]!, role: 'main' as const }],
+      lean_statements: [],
+    };
+    let current = initial;
+    const getSubmission = vi.fn(async () => current);
+    renderWithApp(
+      <SubmissionDetailPage id={initial.id} />,
+      fakeApi(
+        {
+          getSubmission,
+          getAnalysis: vi.fn(async () => analysis),
+          previewDecision: vi.fn(async () => initial.decision!),
+        },
+        author,
+      ),
+    );
+    expect(await screen.findByText('The Lean statement is being prepared.')).toBeInTheDocument();
+    current = {
+      ...initial,
+      revision: initial.revision + 1,
+      lean_statements: [
+        {
+          claim: 'C3',
+          version: 1,
+          claims_revision: initial.claims_revision,
+          digest: 'a'.repeat(64),
+          lean: 'theorem wishpool_target : True := by sorry',
+          toolchain: 'Lean test',
+          reading: 'A delayed translation.',
+          response: { state: 'awaiting_author' as const },
+          created_at: '2026-10-10T00:00:00Z',
+        },
+      ],
+    };
+    fireEvent.focus(window);
+    expect(await screen.findByText('A delayed translation.')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Yes, this is my conjecture' })).toBeEnabled();
+  });
+
   it('lets the author confirm the extracted statements', async () => {
     const confirmClaims = vi.fn(async () => submission);
     const api = fakeApi(
@@ -126,18 +169,17 @@ describe('paper workspace', () => {
     );
     renderWithApp(<SubmissionDetailPage id="sub-na" />, api);
 
-    const section = (await screen.findByRole('heading', { name: 'Not accepted' })).closest(
-      'section',
-    ) as HTMLElement;
+    const section = await screen.findByRole('region', { name: 'Paper standing' });
     expect(
-      within(section).getByText(
-        'Known result: statement C1 is stated in, or directly implied by, arXiv:1901.00001.',
-      ),
+      within(section).getByText('Statement C1 already follows from 1901.00001.'),
     ).toBeInTheDocument();
     expect(
-      within(section).getByText(/^Bind-only: no main result carries new content/),
+      within(section).getByText('No checked main result carries new mathematical content.'),
     ).toBeInTheDocument();
-    expect(within(section).getByRole('form', { name: 'Upload a new version' })).toBeInTheDocument();
+    await userEvent.click(
+      within(section).getByRole('button', { name: 'Upload a revised version' }),
+    );
+    expect(screen.getByRole('form', { name: 'Upload a new version' })).toBeInTheDocument();
     expect(screen.queryByRole('heading', { name: 'Editor tools' })).toBeNull();
   });
 

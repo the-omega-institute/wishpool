@@ -121,6 +121,7 @@ struct Harness {
     client: Arc<NyxIdClient>,
     donations: Arc<crate::donations::Donations>,
     gateway: String,
+    stores: Arc<MemoryStores>,
 }
 
 /// A fake NyxID LLM gateway: answers one statement judgement with usage.
@@ -212,6 +213,7 @@ async fn harness() -> Harness {
         client,
         donations,
         gateway,
+        stores,
     }
 }
 
@@ -578,6 +580,9 @@ async fn donated_quota_runs_a_hosted_judgement() {
         .submit_paper(
             &author,
             NewPaper {
+                kind: wishpool_core::model::SubmissionKind::Paper,
+                make_public_after_acceptance: true,
+                typed_conjecture: None,
                 ai_disclosure: AiDisclosure {
                     level: AiUse::None,
                     statement: "No AI was used.".into(),
@@ -706,4 +711,128 @@ async fn donated_quota_runs_a_hosted_judgement() {
         .unwrap();
     assert_eq!(open.items.len(), 1);
     let _ = &h.gateway;
+}
+
+#[tokio::test]
+async fn lean_target_response_requires_cookie_provenance_even_with_a_valid_bearer() {
+    use wishpool_core::{app::Upload, model::*, ports::SubmissionStore};
+    let h = harness().await;
+    let (state, nonce, challenge, binding) = begin(&h, "/submit").await;
+    h.provider
+        .codes
+        .lock()
+        .unwrap()
+        .insert("target-code".into(), (challenge, nonce));
+    let reply = send(
+        &h.router,
+        get_req(
+            &format!("/auth/callback?code=target-code&state={state}"),
+            Some(&binding),
+        ),
+    )
+    .await;
+    let session = cookie_pair(&reply.cookies, "wp_session");
+    let author = h
+        .app
+        .caller(&VerifiedIdentity {
+            subject: "user-1".into(),
+            name: None,
+            email: None,
+            picture: None,
+        })
+        .await
+        .unwrap();
+    let mut paper = h
+        .app
+        .submit_paper(
+            &author,
+            serde_json::from_value(json!({
+                "kind":"conjecture", "authors":[{"name":"Ada Lovelace"}],
+                "ai_disclosure":{"level":"none","statement":"No AI used."},
+                "typed_conjecture":{"title":"Target","statement":"An open mathematical assertion."}
+            }))
+            .unwrap(),
+            Upload {
+                filename: String::new(),
+                bytes: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    // Seed the already elaborated/delivered state: this test exercises HTTP auth,
+    // while the core and worker tests exercise admission and generation.
+    paper.claims = paper.extracted.clone();
+    paper.claims_revision = 1;
+    paper.status = SubmissionStatus::Accepted {
+        record: "WP-2026-9999".into(),
+    };
+    let digest = "d".repeat(64);
+    paper.lean_statements.push(LeanStatementAttempt {
+        claim: "C1".into(),
+        version: 1,
+        claims_revision: 1,
+        lean: "theorem wishpool_target : True := by sorry".into(),
+        digest: digest.clone(),
+        toolchain: "test Lean".into(),
+        reading: "The target assertion.".into(),
+        response: LeanStatementResponse::AwaitingAuthor,
+        created_at: chrono::Utc::now(),
+    });
+    let expected = paper.revision;
+    paper.revision += 1;
+    h.stores.replace(&paper, expected).await.unwrap();
+    let token = sign(
+        json!({"sub":"user-1", "iss":h.provider.issuer, "aud":h.provider.issuer,
+        "exp":now()+600, "iat":now(), "token_type":"access"}),
+    );
+    let uri = format!("/api/v1/submissions/{}/lean-statement/response", paper.id);
+    for cookie in [false, true] {
+        let mut request = Request::post(&uri)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ORIGIN, PUBLIC);
+        if cookie {
+            request = request.header(header::COOKIE, &session);
+        }
+        let reply = send(
+            &h.router,
+            request
+                .body(Body::from(
+                    json!({"digest":digest, "confirm":true}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{:?}", reply.json);
+    }
+    let request = |origin: &str, digest: &str| {
+        Request::post(&uri)
+            .header(header::COOKIE, &session)
+            .header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"digest":digest, "confirm":true}).to_string(),
+            ))
+            .unwrap()
+    };
+    assert_eq!(
+        send(&h.router, request("https://other.invalid", &digest))
+            .await
+            .status,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        send(&h.router, request(PUBLIC, "stale")).await.status,
+        StatusCode::CONFLICT
+    );
+    let confirmed = send(&h.router, request(PUBLIC, &digest)).await;
+    assert_eq!(confirmed.status, StatusCode::OK, "{:?}", confirmed.json);
+    assert_eq!(
+        confirmed.json["lean_statements"][0]["response"]["state"],
+        "confirmed"
+    );
+    assert_eq!(
+        confirmed.json["lean_statements"][0]["response"]["author"],
+        "user-1"
+    );
 }

@@ -6,10 +6,12 @@ import { Link } from '../routing/router';
 import { PaperEntry } from './Papers';
 
 const FLOW = [
-  ['Upload', 'Your LaTeX source, as it is.'],
-  ['Referee', 'A full reading of every statement and proof.'],
-  ['Lean', 'The statements within reach, formalized and checked.'],
-  ['Feedback', 'A letter from the editors, with what we can do together.'],
+  ['Submit', 'A paper, a short note or a conjecture.'],
+  ['Referee', 'A reading of the confirmed statements.'],
+  ['Audit', 'Check the report against the source.'],
+  ['Decision', 'Accepted work appears at once when public.'],
+  ['Letter', 'Private feedback and sharpening suggestions.'],
+  ['Lean', 'Checked proofs or an author-confirmed conjecture statement.'],
 ] as const;
 
 export function HomePage() {
@@ -23,14 +25,14 @@ export function HomePage() {
   return (
     <div className="page home">
       <section className="intro">
-        <h1>Bring your paper. We help it go further.</h1>
+        <h1>Bring your work. We help it go further.</h1>
         <p className="lede">A mathematics venue that referees, formalizes and writes back.</p>
         <div className="intro-actions">
           <Link to={{ kind: 'submit' }} className="button">
-            Submit a paper
+            Submit work
           </Link>
           <Link to={{ kind: 'papers' }} className="button button-quiet">
-            Accepted papers
+            Accepted work
           </Link>
         </div>
       </section>
@@ -46,7 +48,7 @@ export function HomePage() {
       </ol>
 
       <section aria-labelledby="recent-heading" className="featured">
-        <h2 id="recent-heading">Recently accepted</h2>
+        <h2 id="recent-heading">Recently displayed</h2>
         <Async state={papers.state} onRetry={papers.reload}>
           {(listing) =>
             listing.items.length === 0 ? (

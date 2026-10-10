@@ -164,6 +164,14 @@ impl EndorsementStore for MongoStore {
 
 #[async_trait]
 impl RecordStore for MongoStore {
+    async fn for_submission(&self, id: &SubmissionId) -> CoreResult<Option<Record>> {
+        self.raw(RECORDS)
+            .find_one(doc! { "submission": id.as_str() })
+            .await
+            .map_err(unavailable)?
+            .map(from_document)
+            .transpose()
+    }
     async fn next_sequence(&self, year: i32) -> CoreResult<u64> {
         let counter = self
             .raw(COUNTERS)

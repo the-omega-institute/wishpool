@@ -1,4 +1,5 @@
 import type {
+  ConjectureSummary,
   ClaimConfirmation,
   Contribution,
   ContributionMode,
@@ -190,10 +191,10 @@ export const UPLOAD_FIELDS = { metadata: 'metadata', source: 'source', note: 'no
  * The multipart body of `POST /submissions`: `metadata` is the JSON text of
  * `NewPaper`, `source` the LaTeX file (.tex, .zip or .tar.gz).
  */
-export function uploadBody(metadata: NewPaper, source: File): FormData {
+export function uploadBody(metadata: NewPaper, source?: File): FormData {
   const form = new FormData();
   form.append(UPLOAD_FIELDS.metadata, JSON.stringify(metadata));
-  form.append(UPLOAD_FIELDS.source, source, source.name);
+  if (source) form.append(UPLOAD_FIELDS.source, source, source.name);
   return form;
 }
 
@@ -214,7 +215,7 @@ export interface ApiClient {
   setRoles(id: string, roles: Role[]): Promise<Person>;
 
   // Authors.
-  createSubmission(metadata: NewPaper, source: File): Promise<Submission>;
+  createSubmission(metadata: NewPaper, source?: File): Promise<Submission>;
   listSubmissions(
     scope: SubmissionScope,
     page?: PageParams,
@@ -238,6 +239,11 @@ export interface ApiClient {
     response: { approve: boolean; reason?: string },
   ): Promise<Submission>;
 
+  respondLeanStatement(
+    id: string,
+    response: { digest: string; confirm: boolean; comment?: string },
+  ): Promise<Submission>;
+
   // Editors.
   fileReport(id: string, stage: ReportedStage, report: FileReport): Promise<Submission>;
   judgeClaim(id: string, claim: string, judgement: NewJudgement): Promise<ClaimJudgement>;
@@ -255,6 +261,8 @@ export interface ApiClient {
   generateTasks(id: string): Promise<TaskGeneration>;
   restartReferee(id: string): Promise<RefereeFile>;
   sendFeedback(id: string, letter: SendFeedback): Promise<FeedbackLetter>;
+
+  listConjectures(page?: PageParams, options?: RequestOptions): Promise<Listing<ConjectureSummary>>;
 
   // Public papers.
   listPapers(page?: PageParams, options?: RequestOptions): Promise<Listing<PaperSummary>>;
@@ -351,6 +359,9 @@ export function createApiClient(fetchImpl: FetchLike = (input, init) => fetch(in
     respondFormalization: (id, claim, response) =>
       request('POST', sub(id, `/formalization/items/${seg(claim)}/response`), response),
 
+    respondLeanStatement: (id, response) =>
+      request('POST', sub(id, '/lean-statement/response'), response),
+
     fileReport: (id, stage, report) =>
       request('POST', sub(id, `/stages/${seg(stage)}/reports`), report),
     judgeClaim: (id, claim, judgement) =>
@@ -371,6 +382,8 @@ export function createApiClient(fetchImpl: FetchLike = (input, init) => fetch(in
     restartReferee: (id) => request('POST', sub(id, '/referee/restart')),
     sendFeedback: (id, letter) => request('POST', sub(id, '/referee/letters'), letter),
 
+    listConjectures: (p = {}, o) =>
+      request('GET', api(`/conjectures${buildQuery(page(p))}`), undefined, o),
     listPapers: (p = {}, o) => request('GET', api(`/papers${buildQuery(page(p))}`), undefined, o),
     getPaper: (record, o) => request('GET', api(`/papers/${seg(record)}`), undefined, o),
 

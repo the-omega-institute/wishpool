@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { LatexText } from '../components/Markdown';
 import { latexToMarkdown, splitMath, stripComments } from './latex';
 
 describe('latexToMarkdown', () => {
@@ -30,6 +33,54 @@ describe('latexToMarkdown', () => {
     );
     expect(latexToMarkdown('see \\href{https://oeis.org/A1}{OEIS} and \\href{ftp://x}{this}')).toBe(
       'see [OEIS](https://oeis.org/A1) and this',
+    );
+  });
+
+  it('unwraps the nested text styles around math in arXiv 2609.25128', () => {
+    const source = String.raw`\textnormal{\textsc{Sub-Quorum-$K$}} is NP-complete, even for bipartite graphs.`;
+    expect(latexToMarkdown(source)).toBe(
+      'Sub-Quorum-$K$ is NP-complete, even for bipartite graphs.',
+    );
+    const rendered = document.createElement('div');
+    rendered.innerHTML = renderToStaticMarkup(createElement(LatexText, { source }));
+    expect(rendered.querySelector('.katex-mathml annotation')?.textContent).toBe('K');
+    expect(rendered.textContent).toContain('Sub-Quorum-');
+    expect(rendered.textContent).not.toMatch(/\\textnormal|\\textsc|[{}]/);
+  });
+
+  it.each(['textnormal', 'textsc', 'textrm', 'textup', 'textsf', 'texttt'])(
+    'unwraps nested %s while retaining math and emphasis',
+    (command) => {
+      expect(latexToMarkdown(`\\${command}{\\textsc{Sub-Quorum-$K$}}`)).toBe('Sub-Quorum-$K$');
+      expect(latexToMarkdown(`\\${command}{\\emph{every $x$} and \\textbf{some $y$}}`)).toBe(
+        '*every $x$* and **some $y$**',
+      );
+    },
+  );
+
+  it.each([
+    ['emph', '*'],
+    ['textit', '*'],
+    ['textbf', '**'],
+  ])('keeps %s around a complete argument containing math', (command, marker) => {
+    expect(latexToMarkdown(`\\${command}{\\textnormal{every $x^{2}$} is positive}`)).toBe(
+      `${marker}every $x^{2}$ is positive${marker}`,
+    );
+    expect(latexToMarkdown(`\\${command}{\\(x\\) and $y$}`)).toBe(`${marker}$x$ and $y$${marker}`);
+  });
+
+  it('keeps emphasis in the rendered output when its argument contains math', () => {
+    const source = String.raw`\emph{every $x$} and \textbf{some $y$}`;
+    const rendered = document.createElement('div');
+    rendered.innerHTML = renderToStaticMarkup(createElement(LatexText, { source }));
+    expect(rendered.querySelector('em .katex')).not.toBeNull();
+    expect(rendered.querySelector('strong .katex')).not.toBeNull();
+  });
+
+  it('renders grouped citations in statement titles without stray braces', () => {
+    const source = String.raw`Equivalent form of the grid $3$-path-cover formula {\cite{Bresar2013,JakovacTaranenko2013}}`;
+    expect(latexToMarkdown(source)).toBe(
+      'Equivalent form of the grid $3$-path-cover formula \\[Bresar2013, JakovacTaranenko2013\\]',
     );
   });
 

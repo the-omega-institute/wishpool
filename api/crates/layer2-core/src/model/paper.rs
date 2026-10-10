@@ -102,8 +102,98 @@ impl SubmissionStatus {
     }
 }
 
-/// Who may read the analysis of an accepted paper. The author decides after
-/// acceptance; until then it is private.
+/// All submissions use the same sequence and review pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubmissionKind {
+    #[default]
+    Paper,
+    Note,
+    Conjecture,
+}
+
+/// Typed conjectures become ordinary LaTeX sources before reading and storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TypedConjecture {
+    pub title: String,
+    pub statement: String,
+    #[serde(default)]
+    pub background: String,
+    #[serde(default)]
+    pub origin: String,
+}
+
+impl TypedConjecture {
+    pub fn source(&self, authors: &[Author]) -> CoreResult<Vec<u8>> {
+        require_text("title", &self.title, 1_000)?;
+        require_text("statement", &self.statement, 20_000)?;
+        if self.background.chars().count() > 50_000 || self.origin.chars().count() > 2_000 {
+            return Err(CoreError::invalid(
+                "background or origin exceeds its length limit",
+            ));
+        }
+        // The statement/background are untrusted TeX, just like uploaded source.
+        // Keep the generated wrapper intact so exactly one conjecture is read.
+        for text in [&self.statement, &self.background] {
+            if text.contains("\\begin{conjecture}")
+                || text.contains("\\end{conjecture}")
+                || text.contains("\\begin{document}")
+                || text.contains("\\end{document}")
+            {
+                return Err(CoreError::invalid(
+                    "type the mathematical text without document or conjecture environments",
+                ));
+            }
+        }
+        fn plain(text: &str) -> String {
+            text.chars()
+                .map(|c| match c {
+                    '\\' => "\\textbackslash{}".into(),
+                    '{' | '}' | '%' | '&' | '#' | '_' | '$' => format!("\\{c}"),
+                    '^' => "\\textasciicircum{}".into(),
+                    '~' => "\\textasciitilde{}".into(),
+                    _ => c.to_string(),
+                })
+                .collect()
+        }
+        Ok(format!(
+            r"\documentclass{{article}}
+\usepackage{{amsmath,amssymb,amsthm}}
+\newtheorem{{conjecture}}{{Conjecture}}
+\title{{{}}}
+\author{{{}}}
+\begin{{document}}
+\maketitle
+\begin{{abstract}}
+{}
+\end{{abstract}}
+\begin{{conjecture}}
+{}
+\end{{conjecture}}
+\paragraph{{Origin}} {}
+\end{{document}}
+",
+            plain(&self.title),
+            authors
+                .iter()
+                .map(|a| plain(&a.name))
+                .collect::<Vec<_>>()
+                .join(r" \and "),
+            self.background,
+            self.statement,
+            plain(&self.origin)
+        )
+        .into_bytes())
+    }
+}
+
+fn public_by_default() -> bool {
+    true
+}
+
+/// Public mathematical details after acceptance, selected at upload and
+/// changeable later. Legacy documents retain their undecided state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Visibility {
@@ -146,8 +236,24 @@ pub struct ConjectureFollowUp {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Follow-up state for the immutable publication, retained when its author revises.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedProgress {
+    pub version: u32,
+    pub claims_revision: u64,
+    pub formalization: FormalizationPlan,
+    pub conjectures: Vec<ConjectureFollowUp>,
+    /// Legacy records lack pinned inputs; capture them before the first revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<Box<Submission>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission {
+    #[serde(default)]
+    pub kind: SubmissionKind,
+    #[serde(default)]
+    pub lean_statements: Vec<super::LeanStatementAttempt>,
     pub id: SubmissionId,
     pub submitter: PersonId,
     pub title: String,
@@ -182,6 +288,8 @@ pub struct Submission {
     pub formalization: FormalizationPlan,
     #[serde(default)]
     pub conjectures: Vec<ConjectureFollowUp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_progress: Option<PublishedProgress>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub revision: u64,
@@ -190,6 +298,12 @@ pub struct Submission {
 /// Metadata the author supplies with an upload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewPaper {
+    #[serde(default)]
+    pub kind: SubmissionKind,
+    #[serde(default = "public_by_default")]
+    pub make_public_after_acceptance: bool,
+    #[serde(default)]
+    pub typed_conjecture: Option<TypedConjecture>,
     pub ai_disclosure: AiDisclosure,
     /// Overrides the authors read from `\author`.
     #[serde(default)]
@@ -204,6 +318,9 @@ pub struct NewPaper {
 
 impl NewPaper {
     pub fn validate(&self) -> CoreResult<()> {
+        if self.typed_conjecture.is_some() && self.kind != SubmissionKind::Conjecture {
+            return Err(CoreError::invalid("typed input is only for conjectures"));
+        }
         require_text(
             "AI disclosure statement",
             &self.ai_disclosure.statement,
@@ -301,6 +418,9 @@ mod tests {
 
     fn new_paper(doi: Option<&str>) -> NewPaper {
         NewPaper {
+            kind: crate::model::SubmissionKind::Paper,
+            make_public_after_acceptance: true,
+            typed_conjecture: None,
             ai_disclosure: AiDisclosure {
                 level: AiUse::None,
                 statement: "No AI was used.".into(),
@@ -351,5 +471,47 @@ mod tests {
         json["arxiv"] = "2609.33421".into();
         let paper: NewPaper = serde_json::from_value(json).unwrap();
         assert_eq!(paper.doi, None);
+    }
+    #[test]
+    fn upload_checkbox_defaults_public_and_all_kinds_round_trip() {
+        let mut value = serde_json::to_value(new_paper(None)).unwrap();
+        value.as_object_mut().unwrap().remove("kind");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("make_public_after_acceptance");
+        let legacy: NewPaper = serde_json::from_value(value).unwrap();
+        assert_eq!(legacy.kind, SubmissionKind::Paper);
+        assert!(legacy.make_public_after_acceptance);
+        for kind in [
+            SubmissionKind::Paper,
+            SubmissionKind::Note,
+            SubmissionKind::Conjecture,
+        ] {
+            let mut new = legacy.clone();
+            new.kind = kind;
+            assert_eq!(
+                serde_json::from_value::<NewPaper>(serde_json::to_value(&new).unwrap()).unwrap(),
+                new
+            );
+        }
+    }
+    #[test]
+    fn typed_input_has_limits_and_keeps_the_wrapper_intact() {
+        let mut typed = TypedConjecture {
+            title: "A title".into(),
+            statement: "$x = y$".into(),
+            background: String::new(),
+            origin: "my own".into(),
+        };
+        assert!(typed.source(&[]).is_ok());
+        typed.statement = "x".repeat(20_001);
+        assert!(typed.source(&[]).is_err());
+        typed.statement = "$x = y$".into();
+        typed.background = "x".repeat(50_001);
+        assert!(typed.source(&[]).is_err());
+        typed.background.clear();
+        typed.statement = r"\end{conjecture}".into();
+        assert!(typed.source(&[]).is_err());
     }
 }

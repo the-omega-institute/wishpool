@@ -1,11 +1,3 @@
-//! Referee rounds: machine-assisted reviewing of one set of confirmed
-//! statements. A deep-reasoning referee reads the whole paper and reports;
-//! when it recommends acceptance, an advisor assesses what the venue can
-//! help improve and which statements can be formalized; the advisor then
-//! tries to formalize the most tractable statements in Lean as a private
-//! probe; it then drafts a feedback letter. Editors edit and send the letter;
-//! the author sees only letters that were sent.
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -22,15 +14,6 @@ pub enum Recommendation {
     MinorRevision,
     MajorRevision,
     Reject,
-}
-
-impl Recommendation {
-    /// Whether the referee would accept the paper as it stands or after
-    /// minor changes; only then is improvement and formalization advice
-    /// drafted.
-    pub fn is_positive(self) -> bool {
-        matches!(self, Self::Accept | Self::MinorRevision)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +35,8 @@ pub struct RefereeConcern {
 /// The referee's reading of one statement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefereeClaim {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conjecture: Option<super::ConjectureReading>,
     pub claim: ClaimId,
     pub shape: ProofShape,
     #[serde(default)]
@@ -81,6 +66,56 @@ pub struct RefereeReport {
     pub limits: Vec<String>,
     /// The referee's complete answer.
     pub text: String,
+}
+
+/// Codex's source-based audit of the referee report, never a Lean receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Correctness {
+    Correct,
+    Gap,
+    Error,
+    NotChecked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcernStatus {
+    Confirmed,
+    Refuted,
+    NotCheckable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditedClaim {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conjecture: Option<super::ConjectureReading>,
+    pub claim: ClaimId,
+    pub correctness: Correctness,
+    pub comment: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ProofShape>,
+    #[serde(default)]
+    pub witnesses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known: Option<String>,
+    pub referee_agreed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditedConcern {
+    pub concern: String,
+    pub status: ConcernStatus,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefereeAudit {
+    pub verdict: Recommendation,
+    pub agrees_with_referee: bool,
+    pub summary: String,
+    pub claims: Vec<AuditedClaim>,
+    pub concerns: Vec<AuditedConcern>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +341,8 @@ pub struct RefereeRound {
     pub claims_revision: u64,
     pub started_at: DateTime<Utc>,
     pub referee: Step<RefereeReport>,
+    #[serde(default = "Step::not_in_round")]
+    pub audit: Step<RefereeAudit>,
     pub advice: Step<Advice>,
     /// Rounds stored before the probe existed read as skipped.
     #[serde(default = "Step::not_in_round")]
@@ -316,6 +353,7 @@ pub struct RefereeRound {
 impl RefereeRound {
     pub fn is_settled(&self) -> bool {
         self.referee.is_settled()
+            && self.audit.is_settled()
             && self.advice.is_settled()
             && self.formal.is_settled()
             && self.letter.is_settled()
@@ -328,6 +366,9 @@ pub struct FeedbackLetter {
     /// The round the letter answers, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round: Option<u32>,
+    /// The sending editor's assessment; never a publication decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<Recommendation>,
     #[serde(default)]
     pub subject: String,
     pub body: String,
@@ -367,10 +408,143 @@ impl RefereeFile {
     }
 }
 
+/// GET projection: staff receive the full steps; authors receive no advice,
+/// draft, provider metadata, or Lean files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefereeView {
+    pub id: SubmissionId,
+    pub rounds: Vec<RefereeRoundView>,
+    pub letters: Vec<FeedbackLetter>,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefereeRoundView {
+    pub number: u32,
+    pub version: u32,
+    pub claims_revision: u64,
+    pub started_at: DateTime<Utc>,
+    pub referee: Step<RefereeReport>,
+    pub audit: Step<RefereeAudit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advice: Option<Step<Advice>>,
+    pub formal: Step<FormalProbeView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub letter: Option<Step<LetterDraft>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum FormalProbeView {
+    Staff(FormalProbe),
+    Author { attempts: Vec<ProbeOutcomeView> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProbeOutcomeView {
+    pub claim: ClaimId,
+    pub outcome: ProbeOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theorem: Option<String>,
+}
+
+impl<T: Clone> Step<T> {
+    fn project<U>(&self, staff: bool, map: impl FnOnce(&T) -> U) -> Step<U> {
+        let state = match &self.state {
+            StepState::Pending => StepState::Pending,
+            StepState::Running {
+                task,
+                queue_position,
+                since,
+            } => StepState::Running {
+                task: staff.then(|| task.clone()).flatten(),
+                queue_position: staff.then_some(*queue_position).flatten(),
+                since: *since,
+            },
+            StepState::Done { result, at } => StepState::Done {
+                result: map(result),
+                at: *at,
+            },
+            StepState::Failed {
+                reason,
+                detail,
+                retryable,
+                at,
+            } => StepState::Failed {
+                reason: if staff {
+                    reason.clone()
+                } else {
+                    "Review could not finish; please try again later.".into()
+                },
+                detail: staff.then(|| detail.clone()).flatten(),
+                retryable: *retryable,
+                at: *at,
+            },
+            StepState::Skipped { reason } => StepState::Skipped {
+                reason: if staff {
+                    reason.clone()
+                } else {
+                    "Not required.".into()
+                },
+            },
+        };
+        Step {
+            engine: staff.then(|| self.engine.clone()).flatten(),
+            model: staff.then(|| self.model.clone()).flatten(),
+            attempts: if staff { self.attempts } else { 0 },
+            client_ref: staff.then(|| self.client_ref.clone()).flatten(),
+            input_digest: staff.then(|| self.input_digest.clone()).flatten(),
+            state,
+        }
+    }
+}
+
+impl RefereeFile {
+    pub fn view(self, staff: bool) -> RefereeView {
+        RefereeView {
+            id: self.id,
+            letters: self.letters,
+            revision: self.revision,
+            rounds: self
+                .rounds
+                .into_iter()
+                .map(|r| RefereeRoundView {
+                    number: r.number,
+                    version: r.version,
+                    claims_revision: r.claims_revision,
+                    started_at: r.started_at,
+                    referee: r.referee.project(staff, Clone::clone),
+                    audit: r.audit.project(staff, Clone::clone),
+                    advice: staff.then_some(r.advice),
+                    letter: staff.then_some(r.letter),
+                    formal: r.formal.project(staff, |p| {
+                        if staff {
+                            FormalProbeView::Staff(p.clone())
+                        } else {
+                            FormalProbeView::Author {
+                                attempts: p
+                                    .attempts
+                                    .iter()
+                                    .map(|a| ProbeOutcomeView {
+                                        claim: a.claim.clone(),
+                                        outcome: a.outcome,
+                                        theorem: a.theorem.clone(),
+                                    })
+                                    .collect(),
+                            }
+                        }
+                    }),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// A machine update to one step of a round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoundUpdate {
     Referee(Step<RefereeReport>),
+    Audit(Step<RefereeAudit>),
     Advice(Step<Advice>),
     Formal(Step<FormalProbe>),
     Letter(Step<LetterDraft>),
@@ -380,8 +554,61 @@ pub enum RoundUpdate {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewLetter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<Recommendation>,
     pub subject: String,
     pub body: String,
     #[serde(default)]
     pub note: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn letter_assessments_round_trip_and_older_letters_remain_valid() {
+        let legacy = serde_json::json!({
+            "subject": "Feedback", "body": "A useful point.",
+            "sent_by": "editor", "sent_at": "2026-10-08T12:00:00Z"
+        });
+        let letter: FeedbackLetter = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(letter.assessment, None);
+        assert!(
+            serde_json::to_value(&letter)
+                .unwrap()
+                .get("assessment")
+                .is_none()
+        );
+        let new: NewLetter = serde_json::from_value(serde_json::json!({
+            "subject": "Feedback", "body": "A useful point."
+        }))
+        .unwrap();
+        assert_eq!(new.assessment, None);
+        assert!(
+            serde_json::to_value(&new)
+                .unwrap()
+                .get("assessment")
+                .is_none()
+        );
+
+        for assessment in [
+            Recommendation::Accept,
+            Recommendation::MinorRevision,
+            Recommendation::MajorRevision,
+            Recommendation::Reject,
+        ] {
+            let mut letter = letter.clone();
+            letter.assessment = Some(assessment);
+            let value = serde_json::to_value(&letter).unwrap();
+            assert_eq!(
+                serde_json::from_value::<FeedbackLetter>(value).unwrap(),
+                letter
+            );
+            let mut new = new.clone();
+            new.assessment = Some(assessment);
+            let value = serde_json::to_value(&new).unwrap();
+            assert_eq!(serde_json::from_value::<NewLetter>(value).unwrap(), new);
+        }
+    }
 }

@@ -196,6 +196,16 @@ impl App {
                 "only the paper's conjectures and questions are followed up",
             ));
         }
+        if submission.kind == SubmissionKind::Conjecture
+            && matches!(
+                state,
+                ConjectureState::TakenUp | ConjectureState::Settled { .. }
+            )
+        {
+            return Err(CoreError::conflict(
+                "conjecture attacks belong to phase B; only an author-confirmed Lean statement may be attacked",
+            ));
+        }
         match &state {
             ConjectureState::NotPursued { reason } => validate_reason(reason)?,
             ConjectureState::Settled { summary, .. } => validate_reason(summary)?,

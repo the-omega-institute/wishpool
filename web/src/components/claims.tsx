@@ -19,7 +19,7 @@ export interface StatementLike {
   depends_on?: string[];
   settles?: Settles;
   has_proof?: boolean;
-  lean?: FormalArtifact;
+  lean?: FormalArtifact | null;
 }
 
 export function claimAnchor(id: string, scope = 'statement'): string {
@@ -88,6 +88,8 @@ export function StatementView({
             </span>
           ))}
         </p>
+      ) : scope === 'public' ? (
+        <p className="claim-deps">Uses no other statements.</p>
       ) : null}
       {claim.settles ? (
         <p className="claim-settles">

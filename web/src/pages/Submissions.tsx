@@ -6,14 +6,14 @@ import { hasRole, useSession } from '../auth/session';
 import { SubmissionStatusBadge } from '../components/badges';
 import { Pager } from '../components/Pager';
 import { Async, DateText, Loading, SignInPrompt } from '../components/ui';
-import { formatAuthors } from '../lib/labels';
+import { formatAuthors, SUBMISSION_KIND_LABELS } from '../lib/labels';
 import { Link } from '../routing/router';
 
 const COPY: { [K in SubmissionScope]: { title: string; lede: string; empty: string } } = {
   mine: {
-    title: 'My papers',
-    lede: 'Papers you have submitted, newest first. A draft waits for you to confirm its statements.',
-    empty: 'You have not submitted a paper yet.',
+    title: 'My work',
+    lede: 'Papers, short notes and conjectures you have submitted, newest first. A draft waits for you to confirm its statements.',
+    empty: 'You have not submitted work yet.',
   },
   queue: {
     title: 'Review queue',
@@ -44,7 +44,7 @@ export function SubmissionsPage({ scope }: { scope: SubmissionScope }) {
         </div>
         {scope === 'mine' && person ? (
           <Link to={{ kind: 'submit' }} className="button">
-            Submit a paper
+            Submit work
           </Link>
         ) : null}
       </header>
@@ -69,6 +69,7 @@ export function SubmissionsPage({ scope }: { scope: SubmissionScope }) {
                     {s.title}
                   </Link>
                   <p className="entry-meta">
+                    <span>{SUBMISSION_KIND_LABELS[s.kind]}</span>
                     <SubmissionStatusBadge status={s.status} />
                     <span>{formatAuthors(s.authors)}</span>
                     <span>

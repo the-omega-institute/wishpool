@@ -12,6 +12,8 @@ pub enum SourceKind {
     Zenodo,
     Oeis,
     Url,
+    /// Named work from a paper/report, without inventing a public identifier.
+    NamedWork,
     /// Communicated directly by the poser; no public locator.
     Personal,
 }
@@ -40,7 +42,7 @@ impl Source {
             }
             SourceKind::Zenodo => locator.starts_with("10.5281/zenodo.") || is_web_url(locator),
             SourceKind::Hexagon | SourceKind::Url => is_web_url(locator),
-            SourceKind::Personal => true,
+            SourceKind::Personal | SourceKind::NamedWork => true,
         };
         if !ok {
             return Err(CoreError::invalid(format!(

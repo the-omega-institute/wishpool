@@ -30,6 +30,25 @@ export type Listing<T> = { items: T[]; next_before: string | null };
 
 export type Recommendation = 'accept' | 'minor_revision' | 'major_revision' | 'reject';
 export type Severity = 'major' | 'minor';
+export type Correctness = 'correct' | 'gap' | 'error' | 'not_checked';
+export type AuditedClaim = {
+  conjecture?: ConjectureReading;
+  claim: string;
+  correctness: Correctness;
+  comment: string;
+  shape?: ProofShape | null;
+  witnesses: string[];
+  known?: string | null;
+  referee_agreed: boolean;
+};
+export type RefereeAudit = {
+  verdict: Recommendation;
+  agrees_with_referee: boolean;
+  summary: string;
+  claims: AuditedClaim[];
+  concerns: { concern: string; status: 'confirmed' | 'refuted' | 'not_checkable'; note: string }[];
+};
+
 export type ImprovementKind =
   'gap' | 'strengthen' | 'generalize' | 'computation' | 'literature' | 'exposition';
 export type Effort = 'small' | 'medium' | 'large';
@@ -38,6 +57,7 @@ export type Feasibility = 'ready' | 'needs_library' | 'hard';
 
 export type RefereeConcern = { claim?: string; severity: Severity; issue: string };
 export type RefereeClaim = {
+  conjecture?: ConjectureReading;
   claim: string;
   shape: 'content' | 'bind_only';
   witnesses: string[];
@@ -82,13 +102,13 @@ export type FormalAttempt = {
   claim: string;
   outcome: ProbeOutcome;
   theorem?: string;
-  lean: string;
-  axioms: string[];
-  note: string;
-  log: string;
+  lean?: string;
+  axioms?: string[];
+  note?: string;
+  log?: string;
 };
 /** A private, staff-only formalization probe; never a recorded formalization. */
-export type FormalProbe = { toolchain: string; attempts: FormalAttempt[]; summary: string };
+export type FormalProbe = { toolchain?: string; attempts: FormalAttempt[]; summary?: string };
 
 export type StepState<T> =
   | { state: 'pending' }
@@ -110,13 +130,17 @@ export type RefereeRound = {
   claims_revision: number;
   started_at: string;
   referee: Step<RefereeReport>;
-  advice: Step<Advice>;
+  audit?: Step<RefereeAudit>;
+  /** Omitted from the author projection. */
+  advice?: Step<Advice>;
   /** Absent on rounds stored before the probe existed. */
   formal?: Step<FormalProbe>;
-  letter: Step<LetterDraft>;
+  /** Drafts are staff-only; authors read sent letters. */
+  letter?: Step<LetterDraft>;
 };
 export type FeedbackLetter = {
   round?: number;
+  assessment?: Recommendation | null;
   subject: string;
   body: string;
   note: string;
@@ -130,7 +154,12 @@ export type RefereeFile = {
   letters: FeedbackLetter[];
   revision: number;
 };
-export type SendFeedback = { subject: string; body: string; note?: string };
+export type SendFeedback = {
+  subject: string;
+  body: string;
+  note?: string;
+  assessment?: Recommendation;
+};
 
 // ── People and sign-in ───────────────────────────────────────────────────
 
@@ -172,7 +201,17 @@ export type PolicyDocument = { policy: Policy; stages: PolicyStage[] };
 export type AiUseLevel = 'none' | 'assisted' | 'substantial' | 'primarily';
 export type AiDisclosure = { level: AiUseLevel; statement: string };
 
+export type SubmissionKind = 'paper' | 'note' | 'conjecture';
+export type TypedConjecture = {
+  title: string;
+  statement: string;
+  background?: string;
+  origin?: string;
+};
 export type NewPaper = {
+  kind?: SubmissionKind;
+  make_public_after_acceptance?: boolean;
+  typed_conjecture?: TypedConjecture;
   ai_disclosure: AiDisclosure;
   /** Overrides `\author`. */
   authors?: Author[];
@@ -184,7 +223,8 @@ export type NewPaper = {
 };
 export type Author = { name: string; person?: string; orcid?: string; affiliation?: string };
 
-export type SourceKind = 'doi' | 'arxiv' | 'hexagon' | 'zenodo' | 'oeis' | 'url' | 'personal';
+export type SourceKind =
+  'doi' | 'arxiv' | 'hexagon' | 'zenodo' | 'oeis' | 'url' | 'personal' | 'named_work';
 export type Source = { kind: SourceKind; locator: string; year?: number };
 
 export type ClaimKind =
@@ -238,6 +278,8 @@ export type SubmissionStatus =
 export type AnalysisVisibility = 'undecided' | 'public' | 'private';
 
 export type Submission = {
+  kind: SubmissionKind;
+  lean_statements: LeanStatementAttempt[];
   id: string;
   submitter: string;
   title: string;
@@ -276,6 +318,7 @@ export type RejectReason =
   | { reason: 'known_result'; claim: string; prior: Source }
   | { reason: 'bind_only' }
   | { reason: 'no_main_result' }
+  | { reason: 'conjecture'; detail: string }
   | { reason: 'out_of_scope'; detail: string };
 
 export type Outcome =
@@ -293,10 +336,12 @@ export type PriorWork = { claim: string; source: Source; relation: PriorRelation
 export type ProofShape = 'bind_only' | 'content';
 export type EscapeRate = { arena: string; before: Ratio; after: Ratio; artifact: string };
 export type EscapeAssessment = {
+  conjecture?: ConjectureReading;
   claim: string;
   shape: ProofShape;
   witnesses: string[];
   rationale: string;
+  correctness?: Correctness;
   escape_rate?: EscapeRate;
 };
 
@@ -325,7 +370,7 @@ export type ReportDraft = {
 /** `POST /submissions/{id}/stages/{stage}/reports`. */
 export type FileReport = { report: ReportDraft; filed_by?: { engine: string; model?: string } };
 
-export type AdmissionBasis = 'escape_witness' | 'open_problem_settlement';
+export type AdmissionBasis = 'escape_witness' | 'open_problem_settlement' | 'open_conjecture';
 export type Decision =
   | { decision: 'pending'; awaiting: Stage; detail: string }
   | { decision: 'accept'; basis: AdmissionBasis }
@@ -406,20 +451,52 @@ export type ConjectureState =
   | { state: 'settled'; outcome: SettlementOutcome; summary: string; evidence: Evidence[] };
 export type ConjectureFollowUp = { claim: string; state: ConjectureState; updated_at: string };
 
+export type ConjectureReading = {
+  well_posed: boolean;
+  well_posed_reason: string;
+  status: 'open' | 'known_true' | 'known_false' | 'special_case_of_known' | 'unclear';
+  status_reason: string;
+  named_works: string[];
+  escape: ProofShape;
+  escape_reason: string;
+  suggestions: string[];
+};
+export type LeanStatementAttempt = {
+  claim: string;
+  version: number;
+  claims_revision: number;
+  lean: string;
+  digest: string;
+  toolchain: string;
+  reading: string;
+  created_at: string;
+  response:
+    | { state: 'awaiting_author' }
+    | { state: 'confirmed'; author: string; at: string }
+    | { state: 'rejected'; comment: string; at: string };
+};
+export type ConjectureSummary = {
+  record: string;
+  title: string;
+  statement: string;
+  lean_statement_status: 'none' | 'awaiting_author' | 'confirmed';
+};
+
 // ── Public papers ────────────────────────────────────────────────────────
 
 export type PaperSummary = {
   record: string;
-  submission: string;
+  kind: SubmissionKind;
   title: string;
   authors: Author[];
-  abstract_text: string;
-  msc: string[];
+  submission?: string;
+  abstract_text?: string;
+  msc?: string[];
   doi?: string;
-  basis: AdmissionBasis;
-  accepted_at: string;
-  main_results: number;
-  lean_verified: number;
+  basis?: AdmissionBasis;
+  accepted_at?: string;
+  main_results?: number;
+  lean_verified?: number;
 };
 export type PublicClaim = {
   id: string;
@@ -428,20 +505,17 @@ export type PublicClaim = {
   label: string;
   statement: string;
   section?: string;
-  lean?: FormalArtifact;
+  depends_on: string[];
+  lean?: FormalArtifact | null;
 };
 export type PublicPaper = {
   summary: PaperSummary;
-  ai_disclosure: AiDisclosure;
-  versions: { number: number; uploaded_at: string; has_pdf: boolean; note: string }[];
-  claims: PublicClaim[];
+  versions?: { number: number; uploaded_at: string; has_pdf: boolean }[];
+  claims?: PublicClaim[];
   formalization_repository?: string;
-  /** Of the current version, for rendering statements. */
-  macros: Record<string, string>;
-  /** Only when the author made it public. */
-  analysis?: PaperAnalysis;
-  /** Only when the author made the analysis public. */
-  conjectures: ConjectureFollowUp[];
+  macros?: Record<string, string>;
+  new_content?: { claim: string; lemmas: string[] }[];
+  lean_statements?: { claim: string; lean: string; digest: string; toolchain: string }[];
 };
 
 // ── Contributors ─────────────────────────────────────────────────────────

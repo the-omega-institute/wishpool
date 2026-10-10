@@ -113,11 +113,13 @@ export function isOpenKind(kind: ClaimKind): boolean {
 
 export const BASIS_LABELS: { readonly [K in AdmissionBasis]: string } = {
   escape_witness: 'Escape witness',
+  open_conjecture: 'Open conjecture',
   open_problem_settlement: 'Open-problem settlement',
 };
 export const BASIS_DESCRIPTIONS: { readonly [K in AdmissionBasis]: string } = {
   escape_witness:
     'A main result carries an escape witness (judged content) and no prior work states or directly implies it.',
+  open_conjecture: 'Open conjecture',
   open_problem_settlement:
     'A main result settles a named, sourced open problem that the literature had not settled.',
 };
@@ -138,6 +140,7 @@ export const SOURCE_KIND_LABELS: { readonly [K in SourceKind]: string } = {
   oeis: 'OEIS',
   url: 'URL',
   personal: 'Personal communication',
+  named_work: 'Named work',
 };
 export const SOURCE_KINDS = Object.keys(SOURCE_KIND_LABELS) as SourceKind[];
 
@@ -224,6 +227,7 @@ export function rejectReasonText(reason: RejectReason): string {
       return 'Bind-only: no main result carries new content; each follows from prior results by instantiation, projection or normalisation.';
     case 'no_main_result':
       return 'No main result: the paper marks no proved statement as a main result.';
+    case 'conjecture':
     case 'out_of_scope':
       return `Out of scope: ${reason.detail}`;
   }
@@ -286,3 +290,9 @@ export function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
+
+export const SUBMISSION_KIND_LABELS = {
+  paper: 'Paper',
+  note: 'Short note',
+  conjecture: 'Conjecture',
+} as const;

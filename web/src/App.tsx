@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { Header } from './components/Header';
+import { ConjecturesPage } from './pages/Conjectures';
 import { ContributePage } from './pages/Contribute';
 import { ContributorsPage } from './pages/Contributors';
 import { HomePage } from './pages/Home';
@@ -18,6 +19,8 @@ function titleFor(route: Route): string {
   switch (route.kind) {
     case 'home':
       return 'wishpool';
+    case 'conjectures':
+      return 'Conjectures';
     case 'papers':
       return 'Accepted papers';
     case 'paper':
@@ -25,9 +28,9 @@ function titleFor(route: Route): string {
     case 'policy':
       return 'Review policy';
     case 'submit':
-      return 'Submit a paper';
+      return 'Submit your work';
     case 'submissions':
-      return 'My papers';
+      return 'My work';
     case 'queue':
       return 'Review queue';
     case 'submission':
@@ -51,6 +54,8 @@ function Page({ route }: { route: Route }) {
   switch (route.kind) {
     case 'home':
       return <HomePage />;
+    case 'conjectures':
+      return <ConjecturesPage />;
     case 'papers':
       return <PapersPage />;
     case 'paper':

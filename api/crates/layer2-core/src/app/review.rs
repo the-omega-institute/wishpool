@@ -235,6 +235,8 @@ impl App {
                     let shape = c.shape.unwrap_or(ProofShape::BindOnly);
                     let source = mine.iter().rev().find(|j| j.shape == shape);
                     assessments.push(EscapeAssessment {
+                        conjecture: None,
+                        correctness: None,
                         claim: claim.id.clone(),
                         shape,
                         witnesses: if shape == ProofShape::Content {
@@ -323,7 +325,23 @@ impl App {
     /// the others keep a private report and may be revised.
     pub async fn decide(&self, caller: &Caller, id: &SubmissionId) -> CoreResult<Submission> {
         caller.require(Role::Editor)?;
-        let mut submission = self.submission(caller, id).await?;
+        let submission = self.submission(caller, id).await?;
+        self.apply_decision(caller, submission).await
+    }
+
+    /// Shared decision application, including recovery after record insertion.
+    pub(super) async fn apply_decision(
+        &self,
+        caller: &Caller,
+        mut submission: Submission,
+    ) -> CoreResult<Submission> {
+        let id = &submission.id.clone();
+        if matches!(
+            submission.status,
+            SubmissionStatus::Accepted { .. } | SubmissionStatus::NotAccepted
+        ) {
+            return Ok(submission);
+        }
         if !submission.is_open() {
             return Err(CoreError::conflict(format!(
                 "the paper is {}",
@@ -348,16 +366,25 @@ impl App {
             Decision::NotAccepted { .. } => submission.status = SubmissionStatus::NotAccepted,
             Decision::Accept { basis } => {
                 let year = now.year();
-                let record = Record {
-                    id: RecordId::format(year, self.ports.records.next_sequence(year).await?),
-                    submission: submission.id.clone(),
-                    title: submission.title.clone(),
-                    authors: submission.authors.clone(),
-                    basis: *basis,
-                    accepted_by: caller.person.clone(),
-                    accepted_at: now,
+                let record = if let Some(record) = self.ports.records.for_submission(id).await? {
+                    record
+                } else {
+                    let proposed = Record {
+                        kind: submission.kind,
+                        publication: Some(Box::new(submission.clone())),
+                        id: RecordId::format(year, self.ports.records.next_sequence(year).await?),
+                        submission: submission.id.clone(),
+                        title: submission.title.clone(),
+                        authors: submission.authors.clone(),
+                        basis: *basis,
+                        accepted_by: caller.person.clone(),
+                        accepted_at: now,
+                    };
+                    match self.ports.records.insert(&proposed).await {
+                        Ok(()) => proposed,
+                        Err(error) => self.ports.records.for_submission(id).await?.ok_or(error)?,
+                    }
                 };
-                self.ports.records.insert(&record).await?;
                 submission.status = SubmissionStatus::Accepted { record: record.id };
                 submission.conjectures = submission
                     .claims

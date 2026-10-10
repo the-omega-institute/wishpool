@@ -3,6 +3,7 @@
 
 mod donations;
 mod formalization;
+mod lean_statements;
 mod papers;
 mod people;
 mod records;
@@ -13,7 +14,7 @@ mod tasks;
 use std::{collections::BTreeSet, sync::Arc};
 
 pub use papers::{MAX_UPLOAD_BYTES, PaperFile, SubmissionScope, Upload};
-pub use records::{PaperSummary, PublicClaim, PublicPaper};
+pub use records::{ConjectureSummary, PaperSummary, PublicClaim, PublicPaper};
 pub use review::FiledBy;
 pub use tasks::{MAX_ACTIVE_LEASES, Reconciliation, TaskContext, TaskGeneration};
 

@@ -13,18 +13,18 @@ use wishpool_core::{
     app::{App, Upload},
     memory::MemoryStores,
     model::{
-        AiDisclosure, AiUse, Caller, ClaimConfirmation, NewPaper, Recommendation, ReviewerIdentity,
-        Role, StepState, Submission,
+        AiDisclosure, AiUse, Caller, ClaimConfirmation, FeedbackLetter, NewLetter, NewPaper,
+        Recommendation, ReviewerIdentity, Role, StepState, Submission,
     },
     policy::Policy,
-    ports::{JobKind, SystemClock},
+    ports::{JobKind, JobLease, SystemClock},
 };
 use wishpool_review::{
     ReviewResult,
     advisor::{Advisor, AdvisorInput},
     lean::{CheckedFile, FormalInput, FormalOut, Formalizer},
     oracle::{Oracle, OracleRequest, OracleStatus, OracleSubmitted},
-    referee_prompts::{AdviceOut, FormalizationOut, LetterOut},
+    referee_prompts::{AdviceOut, AuditOut, AuditedClaimOut, FormalizationOut, LetterOut},
 };
 
 use super::*;
@@ -90,13 +90,18 @@ struct FakeAdvisor {
     fail_letter: bool,
     /// Propose C1 and the open C2 for formalization.
     propose: AtomicBool,
-    formal_seen: Mutex<Option<serde_json::Value>>,
+    audits: AtomicUsize,
+    known: bool,
+    audit_delay: Duration,
+    audit_failures: AtomicUsize,
+    reclaim_during_audit: Option<Arc<MemoryJobs>>,
 }
 
 #[derive(Default)]
 struct FakeFormalizer {
     calls: AtomicUsize,
     never_completes: bool,
+    corrections: Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait]
@@ -115,6 +120,33 @@ impl Formalizer for FakeFormalizer {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.never_completes {
             return std::future::pending().await;
+        }
+        if input.conjecture {
+            self.corrections.lock().await.push(input.correction.clone());
+            let suffix = if input.correction.is_some() {
+                "∀ n : Nat, n + 0 = n"
+            } else {
+                "∀ n : Nat, n = n"
+            };
+            return Ok(FormalOut {
+                toolchain: "Lean fake checked workspace".into(),
+                files: input
+                    .targets
+                    .iter()
+                    .map(|t| CheckedFile {
+                        claim: t.claim.clone(),
+                        theorem: Some("wishpool_target".into()),
+                        lean: format!(
+                            "import Mathlib\ntheorem wishpool_target : {suffix} := by sorry\n"
+                        ),
+                        compiled: true,
+                        axioms: vec!["sorryAx".into()],
+                        note: "Every natural number equals itself.".into(),
+                        log: String::new(),
+                    })
+                    .collect(),
+                summary: "Statement elaborated".into(),
+            });
         }
         assert!(
             input
@@ -162,7 +194,66 @@ impl Advisor for FakeAdvisor {
     fn model(&self) -> &str {
         "codex-test"
     }
+    async fn audit(&self, input: &AdvisorInput) -> ReviewResult<AuditOut> {
+        self.audits.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(self.audit_delay).await;
+        if self
+            .audit_failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(ReviewError::Transport("advisor CLI timed out".into()));
+        }
+        if let Some(jobs) = &self.reclaim_during_audit {
+            // Model completion after a replacement worker obtained the lease.
+            tokio::time::sleep(Duration::from_secs(31 * 60)).await;
+            jobs.claim().await.unwrap().expect("replacement lease");
+        }
+        assert!(
+            input
+                .source_dir
+                .as_ref()
+                .unwrap()
+                .join("paper.tex")
+                .exists()
+        );
+        assert!(!input.referee.text.is_empty());
+        Ok(AuditOut {
+            verdict: "major_revision".into(),
+            summary: "The argument is correct and carries new content.".into(),
+            claims: input
+                .statements
+                .iter()
+                .map(|c| AuditedClaimOut {
+                    claim: c.id.clone(),
+                    conjecture: (input.kind == "conjecture" && !c.proved).then(|| {
+                        wishpool_review::referee_prompts::ConjectureOut {
+                            well_posed: Some(true),
+                            well_posed_reason: "Defined and quantified".into(),
+                            status: "open".into(),
+                            status_reason: "Open in available source/report".into(),
+                            escape: "content".into(),
+                            escape_reason: "Needs a new bound".into(),
+                            ..Default::default()
+                        }
+                    }),
+                    correctness: if c.proved { "correct" } else { "not_checked" }.into(),
+                    comment: "The source supplies a compactness lemma.".into(),
+                    shape: c.proved.then(|| "content".into()),
+                    witnesses: if c.proved {
+                        vec!["A compactness lemma".into()]
+                    } else {
+                        vec![]
+                    },
+                    known: (self.known && c.proved).then(|| "A reported source".into()),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
     async fn advise(&self, input: &AdvisorInput) -> ReviewResult<AdviceOut> {
+        assert!(input.audit.is_some() && input.decision.is_some());
         self.advice.fetch_add(1, Ordering::SeqCst);
         if self.fail_advice {
             return Err(ReviewError::Transport("advisor deadline".into()));
@@ -200,12 +291,13 @@ impl Advisor for FakeAdvisor {
     }
     async fn draft_letter(
         &self,
-        _: &AdvisorInput,
+        input: &AdvisorInput,
         advice: Option<&AdviceOut>,
-        formal: Option<&serde_json::Value>,
     ) -> ReviewResult<LetterOut> {
+        assert!(
+            input.audit.is_some() && input.decision.as_ref().unwrap().get("decision").is_some()
+        );
         self.letters.fetch_add(1, Ordering::SeqCst);
-        *self.formal_seen.lock().await = formal.cloned();
         if self.fail_letter {
             return Err(ReviewError::Output("unusable letter".into()));
         }
@@ -222,6 +314,8 @@ impl Advisor for FakeAdvisor {
 
 struct World {
     worker: Worker,
+    jobs: Arc<MemoryJobs>,
+    stores: Arc<MemoryStores>,
     paper: Submission,
     author: Caller,
     oracle: Arc<FakeOracle>,
@@ -232,6 +326,13 @@ struct World {
 
 impl World {
     async fn new(outcomes: Vec<ReviewResult<OracleStatus>>, pdf: bool) -> Self {
+        Self::new_kind(outcomes, pdf, wishpool_core::model::SubmissionKind::Paper).await
+    }
+    async fn new_kind(
+        outcomes: Vec<ReviewResult<OracleStatus>>,
+        pdf: bool,
+        kind: wishpool_core::model::SubmissionKind,
+    ) -> Self {
         let stores = Arc::new(MemoryStores::default());
         let app = App::new(
             stores.ports(Arc::new(SystemClock), Arc::new(LatexReader)),
@@ -254,6 +355,9 @@ impl World {
             .submit_paper(
                 &author,
                 NewPaper {
+                    kind,
+                    make_public_after_acceptance: true,
+                    typed_conjecture: None,
                     ai_disclosure: AiDisclosure {
                         level: AiUse::None,
                         statement: "No AI used in this paper.".into(),
@@ -293,7 +397,7 @@ impl World {
             .await
             .unwrap();
         while stores.take_job().await.is_some() {}
-        let jobs = Arc::new(MemoryJobs::new(stores));
+        let jobs = Arc::new(MemoryJobs::new(stores.clone()));
         let oracle = Arc::new(FakeOracle {
             submitted: AtomicUsize::new(0),
             references: Mutex::new(vec![]),
@@ -303,9 +407,13 @@ impl World {
         let advisor = Arc::new(FakeAdvisor::default());
         let formalizer = Arc::new(FakeFormalizer::default());
         let work = tempfile::tempdir().unwrap();
+        let auditor_account = app
+            .ensure_service_account(&"wishpool:auditor".into(), "Auditor", Role::Reviewer)
+            .await
+            .unwrap();
         let worker = Worker {
             app,
-            jobs,
+            jobs: jobs.clone(),
             compile: Compile {
                 tex_bin: "unused".into(),
                 cache_dir: work.path().into(),
@@ -317,6 +425,7 @@ impl World {
                 wishpool_review::openalex::OpenAlex::new("http://127.0.0.1:1", None).unwrap(),
             ),
             reviewer,
+            auditor_account,
             referee_account,
             referee_model: "chatgpt-pro".into(),
             oracle: Some(oracle.clone()),
@@ -324,9 +433,13 @@ impl World {
             formalizer: Some(formalizer.clone()),
             oracle_poll: Duration::ZERO,
             advisor_work_dir: work.path().into(),
+            audit_budget: Duration::from_secs(3900),
+            formal_budget: Duration::from_secs(1500),
         };
         Self {
             worker,
+            jobs,
+            stores,
             paper,
             author,
             oracle,
@@ -336,25 +449,25 @@ impl World {
         }
     }
 
-    fn job(&self) -> LeasedJob {
-        LeasedJob {
-            submission: self.paper.id.clone(),
-            kind: JobKind::Referee,
-            attempts: 1,
-            lease: "local".into(),
+    async fn job(&self) -> LeasedJob {
+        if let Some(job) = self.jobs.current(&self.paper.id, JobKind::Referee).await {
+            return job;
         }
+        wishpool_core::ports::ReviewQueue::enqueue(&*self.stores, &self.paper.id, JobKind::Referee)
+            .await
+            .unwrap();
+        self.jobs.claim().await.unwrap().unwrap()
     }
 
     async fn file(&self) -> wishpool_core::model::RefereeFile {
-        self.worker
-            .app
-            .referee(&self.worker.referee_account, &self.paper.id)
+        wishpool_core::ports::RefereeStore::get(&*self.stores, &self.paper.id)
             .await
             .unwrap()
+            .unwrap_or_else(|| wishpool_core::model::RefereeFile::new(self.paper.id.clone()))
     }
 
     async fn run_round(&self) {
-        let mut job = self.job();
+        let mut job = self.job().await;
         for _ in 0..12 {
             match self.worker.referee_job(&job).await {
                 Ok(false) => return,
@@ -375,7 +488,7 @@ impl World {
 }
 
 fn completed(recommendation: &str) -> ReviewResult<OracleStatus> {
-    Ok(OracleStatus::Completed { text: serde_json::json!({"recommendation":recommendation,"summary":"A review",
+    Ok(OracleStatus::Completed { model: None, text: serde_json::json!({"recommendation":recommendation,"summary":"A review",
         "claims":[{"claim":"C1","shape":"content","witnesses":["A compactness lemma"],"known":"A reported source","note":"The intermediate argument"},
             {"claim":"C2","shape":"bind_only"}], "limits":["Computation was not reproduced"]}).to_string() })
 }
@@ -428,9 +541,10 @@ async fn polling_survives_transport_errors_without_resubmitting_or_burning_attem
             .await
             .unwrap()
             .letters
-            .is_empty()
+            .len()
+            == 1
     );
-    assert!(!w.worker.referee_job(&w.job()).await.unwrap());
+    assert!(!w.worker.referee_job(&w.job().await).await.unwrap());
     assert_eq!(
         w.worker
             .app
@@ -446,7 +560,7 @@ async fn polling_survives_transport_errors_without_resubmitting_or_burning_attem
 async fn uncertain_submit_reuses_persisted_reference() {
     let w = World::new(vec![completed("minor_revision")], true).await;
     w.oracle.submit_error.store(1, Ordering::SeqCst);
-    assert!(w.worker.referee_job(&w.job()).await.unwrap());
+    assert!(w.worker.referee_job(&w.job().await).await.unwrap());
     let step = w.file().await.current().unwrap().referee.clone();
     assert!(matches!(step.state, StepState::Pending));
     assert!(step.client_ref.is_some() && step.input_digest.is_some());
@@ -460,7 +574,7 @@ async fn uncertain_submit_reuses_persisted_reference() {
 }
 
 #[tokio::test]
-async fn positive_round_formalizes_proposed_proved_statements_before_the_letter() {
+async fn accepted_round_sends_letter_before_formalizing_proved_statements() {
     let w = World::new(vec![completed("minor_revision")], true).await;
     w.advisor.propose.store(true, Ordering::SeqCst);
     w.run_round().await;
@@ -475,19 +589,25 @@ async fn positive_round_formalizes_proposed_proved_statements_before_the_letter(
         probe.attempts[0].outcome,
         wishpool_core::model::ProbeOutcome::Compiled
     );
-    let seen = w
-        .advisor
-        .formal_seen
-        .lock()
-        .await
-        .clone()
-        .expect("letter saw the probe");
-    assert_eq!(seen["attempts"][0]["outcome"], "compiled");
+    let StepState::Done { at: letter_at, .. } = round.letter.state else {
+        panic!()
+    };
+    let StepState::Done { at: formal_at, .. } = round.formal.state else {
+        panic!()
+    };
+    assert!(letter_at <= formal_at);
+    assert_eq!(file.letters.len(), 1);
+    assert_eq!(file.letters[0].sent_by.as_str(), "wishpool:auditor");
+    assert_eq!(
+        file.letters[0].assessment,
+        Some(Recommendation::MajorRevision)
+    );
+    assert!(!file.letters[0].edited);
     assert!(round.letter.done().is_some());
 }
 
 #[tokio::test(start_paused = true)]
-async fn formalization_budget_failure_defers_the_job_and_still_drafts_letter() {
+async fn formalization_budget_failure_follows_delivered_letter_and_defers_job() {
     let mut w = World::new(vec![completed("accept")], true).await;
     w.advisor.propose.store(true, Ordering::SeqCst);
     let formalizer = Arc::new(FakeFormalizer {
@@ -495,18 +615,18 @@ async fn formalization_budget_failure_defers_the_job_and_still_drafts_letter() {
         ..Default::default()
     });
     w.worker.formalizer = Some(formalizer.clone());
-    let mut job = w.job();
-    // Submit, collect the report, and settle advice before the formal step.
-    for _ in 0..3 {
+    w.worker.formal_budget = Duration::from_secs(3600 + 300);
+    let mut job = w.job().await;
+    // Submit, report, audit, decision + advice, then deliver letter.
+    for _ in 0..5 {
         assert!(w.worker.referee_job(&job).await.unwrap());
         job = w.worker.jobs.claim().await.unwrap().expect("deferred job");
     }
     let started = tokio::time::Instant::now();
-    assert!(w.worker.referee_job(&job).await.unwrap());
-    // Independent of the production constant: the step must settle well
-    // inside the 30-minute job lease.
-    assert_eq!(started.elapsed(), Duration::from_secs(1500));
-    assert!(started.elapsed() < Duration::from_secs(1800));
+    w.worker.handle(job.clone()).await;
+    // A one-hour Codex deadline plus discovery/check margin runs beyond the
+    // original lease, which the heartbeat must keep alive until deferral.
+    assert_eq!(started.elapsed(), Duration::from_secs(3900));
     let file = w.file().await;
     let round = file.current().unwrap();
     assert!(matches!(
@@ -519,35 +639,34 @@ async fn formalization_budget_failure_defers_the_job_and_still_drafts_letter() {
         } if reason == "the formalization step exceeded its time budget"
     ));
     assert_eq!(round.formal.attempts, 1);
-    assert!(matches!(round.letter.state, StepState::Pending));
-    assert_eq!(w.advisor.letters.load(Ordering::SeqCst), 0);
+    assert!(round.letter.done().is_some());
+    assert_eq!(w.advisor.letters.load(Ordering::SeqCst), 1);
 
     let deferred = w.worker.jobs.claim().await.unwrap().expect("deferred job");
     assert_eq!(deferred.submission, job.submission);
     assert_eq!(deferred.kind, job.kind);
     assert_eq!(deferred.attempts, job.attempts);
-    assert_eq!(deferred.lease, job.lease);
+    assert_ne!(deferred.lease, job.lease);
     assert!(!w.worker.referee_job(&deferred).await.unwrap());
     let file = w.file().await;
     let round = file.current().unwrap();
     assert!(round.is_settled());
     assert!(round.letter.done().is_some());
     assert_eq!(w.advisor.letters.load(Ordering::SeqCst), 1);
-    assert!(w.advisor.formal_seen.lock().await.is_none());
     assert!(!w.worker.referee_job(&deferred).await.unwrap());
     assert_eq!(formalizer.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn negative_recommendation_skips_advice_and_still_drafts_letter() {
+async fn negative_recommendation_still_gets_decision_advice_and_letter() {
     let w = World::new(vec![completed("major_revision")], true).await;
     w.run_round().await;
     let file = w.file().await;
     let round = file.current().unwrap();
-    assert!(matches!(round.advice.state, StepState::Skipped { .. }));
+    assert!(round.advice.done().is_some());
     assert!(matches!(round.formal.state, StepState::Skipped { .. }));
     assert!(round.letter.done().is_some());
-    assert_eq!(w.advisor.advice.load(Ordering::SeqCst), 0);
+    assert_eq!(w.advisor.advice.load(Ordering::SeqCst), 1);
     assert_eq!(w.formalizer.calls.load(Ordering::SeqCst), 0);
     assert_eq!(w.advisor.letters.load(Ordering::SeqCst), 1);
 }
@@ -555,7 +674,7 @@ async fn negative_recommendation_skips_advice_and_still_drafts_letter() {
 #[tokio::test]
 async fn confirmation_before_compilation_waits_without_submitting_or_burning_attempts() {
     let w = World::new(vec![completed("accept")], false).await;
-    let mut job = w.job();
+    let mut job = w.job().await;
     for _ in 0..3 {
         assert!(w.worker.referee_job(&job).await.unwrap());
         let step = w.file().await.current().unwrap().referee.clone();
@@ -638,7 +757,12 @@ async fn remote_failure_and_missing_pdf_settle_without_advisor_work() {
         .record_compilation(&w.worker.reviewer, &w.paper.id, 1, Err("TeX error".into()))
         .await
         .unwrap();
-    assert!(w.worker.resume_referee(&w.job(), &w.paper).await.unwrap());
+    assert!(
+        w.worker
+            .resume_referee(&w.job().await, &w.paper)
+            .await
+            .unwrap()
+    );
     w.run_round().await;
     assert_eq!(w.oracle.submitted.load(Ordering::SeqCst), 0);
     assert!(
@@ -650,7 +774,7 @@ async fn remote_failure_and_missing_pdf_settle_without_advisor_work() {
 async fn disabled_oracle_completes_without_starting_round() {
     let mut w = World::new(vec![], true).await;
     w.worker.oracle = None;
-    assert!(!w.worker.referee_job(&w.job()).await.unwrap());
+    assert!(!w.worker.referee_job(&w.job().await).await.unwrap());
     assert!(w.file().await.rounds.is_empty());
 }
 
@@ -673,7 +797,7 @@ fn digest_binds_boundaries_and_retryable_failure_reasons() {
 #[tokio::test]
 async fn existing_round_continues_after_editorial_decision() {
     let w = World::new(vec![completed("accept")], true).await;
-    assert!(w.worker.referee_job(&w.job()).await.unwrap());
+    assert!(w.worker.referee_job(&w.job().await).await.unwrap());
     let job = w.worker.jobs.claim().await.unwrap().unwrap();
     let stores = w.worker.app.clone();
     // The public policy flow is independent of the in-flight referee round;
@@ -754,11 +878,11 @@ async fn referee_reading_corroborates_claude_without_changing_policy() {
         .submission(&w.author, &w.paper.id)
         .await
         .unwrap();
-    assert!(paper.is_open());
+    assert!(matches!(paper.status, SubmissionStatus::Accepted { .. }));
     assert!(
         paper
             .latest_report(wishpool_core::model::Stage::Escape)
-            .is_none()
+            .is_some()
     );
 }
 
@@ -767,6 +891,7 @@ async fn malformed_answer_is_retained_and_missing_advisor_is_explicit() {
     let mut w = World::new(
         vec![Ok(OracleStatus::Completed {
             text: "A readable but unstructured review".into(),
+            model: None,
         })],
         true,
     )
@@ -781,14 +906,15 @@ async fn malformed_answer_is_retained_and_missing_advisor_is_explicit() {
     assert!(!report.limits.is_empty());
     assert!(matches!(round.advice.state, StepState::Skipped { .. }));
     assert!(
-        matches!(&round.letter.state, StepState::Failed { reason, retryable: false, .. } if reason == "no advisor configured")
+        matches!(&round.audit.state, StepState::Failed { reason, .. } if reason == "no Codex auditor configured")
     );
     let mut w = World::new(vec![completed("accept")], true).await;
     w.worker.advisor = None;
     w.run_round().await;
-    assert!(
-        matches!(&w.file().await.current().unwrap().advice.state, StepState::Failed { reason, .. } if reason == "no advisor configured")
-    );
+    assert!(matches!(
+        &w.file().await.current().unwrap().audit.state,
+        StepState::Failed { reason, .. } if reason == "no Codex auditor configured"
+    ));
 }
 
 #[tokio::test]
@@ -830,9 +956,41 @@ async fn advisor_failure_still_allows_letter_and_invalid_letter_settles_failed()
 }
 
 #[tokio::test]
+async fn observed_oracle_model_is_recorded_on_the_step_and_judgements() {
+    let OracleStatus::Completed { text, .. } = completed("accept").unwrap() else {
+        unreachable!();
+    };
+    let mut w = World::new(
+        vec![Ok(OracleStatus::Completed {
+            text,
+            model: Some("gpt_6 · pro".into()),
+        })],
+        true,
+    )
+    .await;
+    assert!(w.worker.referee_job(&w.job().await).await.unwrap());
+    w.worker.referee_model = "gpt-new-label".into();
+    w.run_round().await;
+    assert_eq!(
+        w.file().await.current().unwrap().referee.model.as_deref(),
+        Some("gpt_6 · pro")
+    );
+    let judgements = w
+        .worker
+        .app
+        .judgements(&w.worker.referee_account, &w.paper.id)
+        .await
+        .unwrap();
+    assert_eq!(judgements.len(), 1);
+    assert!(
+        matches!(&judgements[0].reviewer, ReviewerIdentity::Machine { model, .. } if model.as_deref() == Some("gpt_6 · pro"))
+    );
+}
+
+#[tokio::test]
 async fn model_provenance_survives_config_changes_and_uncertain_admission() {
     let mut w = World::new(vec![completed("accept")], true).await;
-    assert!(w.worker.referee_job(&w.job()).await.unwrap());
+    assert!(w.worker.referee_job(&w.job().await).await.unwrap());
     w.worker.referee_model = "gpt-new-label".into();
     let job = w.worker.jobs.claim().await.unwrap().unwrap();
     assert!(w.worker.referee_job(&job).await.unwrap());
@@ -847,7 +1005,7 @@ async fn model_provenance_survives_config_changes_and_uncertain_admission() {
     );
     let mut w = World::new(vec![], true).await;
     w.oracle.submit_error.store(1, Ordering::SeqCst);
-    assert!(w.worker.referee_job(&w.job()).await.unwrap());
+    assert!(w.worker.referee_job(&w.job().await).await.unwrap());
     w.worker.referee_model = "gpt-new-label".into();
     w.run_round().await;
     assert_eq!(w.oracle.submitted.load(Ordering::SeqCst), 1);
@@ -858,4 +1016,388 @@ async fn model_provenance_survives_config_changes_and_uncertain_admission() {
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn sent_assessment_round_trips_without_becoming_a_publication_decision() {
+    let w = World::new(vec![completed("accept")], true).await;
+    w.run_round().await;
+    let app = &w.worker.app;
+    let editor = app
+        .ensure_service_account(&"editor".into(), "Editor", Role::Editor)
+        .await
+        .unwrap();
+    let before = app.submission(&w.author, &w.paper.id).await.unwrap();
+    let decision = app.preview_decision(&editor, &w.paper.id).await.unwrap();
+    let draft = w
+        .file()
+        .await
+        .current()
+        .unwrap()
+        .letter
+        .done()
+        .unwrap()
+        .clone();
+    let mut request = serde_json::json!({
+        "subject": draft.subject, "body": draft.body, "note": draft.note
+    });
+    let legacy: NewLetter = serde_json::from_value(request.clone()).unwrap();
+    assert_eq!(legacy.assessment, None);
+    let legacy = app
+        .send_feedback(&editor, &w.paper.id, legacy)
+        .await
+        .unwrap();
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    assert!(legacy_json.get("assessment").is_none());
+    assert_eq!(
+        serde_json::from_value::<FeedbackLetter>(legacy_json).unwrap(),
+        legacy
+    );
+
+    // The editor can choose an assessment different from the referee's advice.
+    request["assessment"] = serde_json::json!("major_revision");
+    let letter = app
+        .send_feedback(
+            &editor,
+            &w.paper.id,
+            serde_json::from_value(request).unwrap(),
+        )
+        .await
+        .unwrap();
+    let serialized = serde_json::to_value(&letter).unwrap();
+    assert_eq!(serialized["assessment"], "major_revision");
+    assert_eq!(
+        serde_json::from_value::<FeedbackLetter>(serialized).unwrap(),
+        letter
+    );
+    let view = app.referee(&w.author, &w.paper.id).await.unwrap();
+    assert_eq!(view.rounds.len(), 1);
+    assert_eq!(&view.letters[1..], &[legacy, letter]);
+    assert_eq!(
+        app.submission(&w.author, &w.paper.id).await.unwrap(),
+        before
+    );
+    assert_eq!(
+        app.preview_decision(&editor, &w.paper.id).await.unwrap(),
+        decision
+    );
+}
+
+#[tokio::test]
+async fn known_main_result_gets_advice_and_auto_letter_but_no_formal_probe() {
+    let mut w = World::new(vec![completed("accept")], true).await;
+    let advisor = Arc::new(FakeAdvisor {
+        known: true,
+        ..Default::default()
+    });
+    advisor.propose.store(true, Ordering::SeqCst);
+    w.worker.advisor = Some(advisor.clone());
+    w.run_round().await;
+    let paper = w
+        .worker
+        .app
+        .submission(&w.author, &w.paper.id)
+        .await
+        .unwrap();
+    assert_eq!(paper.status, SubmissionStatus::NotAccepted);
+    assert_eq!(advisor.advice.load(Ordering::SeqCst), 1);
+    assert_eq!(advisor.letters.load(Ordering::SeqCst), 1);
+    assert_eq!(w.formalizer.calls.load(Ordering::SeqCst), 0);
+    let file = w.file().await;
+    assert!(
+        file.letters[0]
+            .body
+            .starts_with("Your paper is not accepted.")
+    );
+    assert!(file.letters[0].body.contains("A reported source"));
+    assert!(matches!(
+        file.current().unwrap().formal.state,
+        StepState::Skipped { .. }
+    ));
+    assert_eq!(
+        file.letters[0].assessment,
+        Some(Recommendation::MajorRevision)
+    );
+}
+
+async fn prepare_audit(w: &World) -> LeasedJob {
+    let mut job = w.job().await;
+    for _ in 0..2 {
+        assert!(w.worker.referee_job(&job).await.unwrap());
+        job = w.worker.jobs.claim().await.unwrap().unwrap();
+    }
+    assert!(w.file().await.current().unwrap().referee.done().is_some());
+    job
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeat_allows_audit_to_finish_past_the_original_lease() {
+    let mut w = World::new(vec![completed("accept")], true).await;
+    let advisor = Arc::new(FakeAdvisor {
+        audit_delay: Duration::from_secs(41 * 60),
+        ..Default::default()
+    });
+    w.worker.advisor = Some(advisor.clone());
+    let job = prepare_audit(&w).await;
+    let started = tokio::time::Instant::now();
+    w.worker.handle(job.clone()).await;
+    assert_eq!(started.elapsed(), Duration::from_secs(41 * 60));
+    let file = w.file().await;
+    let round = file.current().unwrap();
+    assert!(round.audit.done().is_some());
+    assert_eq!(round.audit.attempts, 1);
+    assert!(matches!(round.advice.state, StepState::Pending));
+    let next = w.worker.jobs.claim().await.unwrap().unwrap();
+    assert_eq!(next.attempts, job.attempts);
+    assert_ne!(next.lease, job.lease);
+    assert_eq!(advisor.audits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_transport_timeout_retries_only_audit_with_existing_accounting() {
+    let mut w = World::new(vec![completed("accept")], true).await;
+    let advisor = Arc::new(FakeAdvisor {
+        audit_failures: AtomicUsize::new(1),
+        ..Default::default()
+    });
+    w.worker.advisor = Some(advisor.clone());
+    let job = prepare_audit(&w).await;
+    w.worker.handle(job).await;
+    let file = w.file().await;
+    let round = file.current().unwrap();
+    assert!(matches!(round.audit.state, StepState::Running { .. }));
+    assert_eq!(round.audit.attempts, 1);
+    assert!(matches!(round.advice.state, StepState::Pending));
+    assert!(matches!(round.letter.state, StepState::Pending));
+    assert!(matches!(round.formal.state, StepState::Pending));
+    assert_eq!(advisor.advice.load(Ordering::SeqCst), 0);
+    assert!(w.worker.jobs.claim().await.unwrap().is_none());
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let retry = w.worker.jobs.claim().await.unwrap().unwrap();
+    assert_eq!(retry.attempts, 2);
+    w.worker.handle(retry).await;
+    let file = w.file().await;
+    assert!(file.current().unwrap().audit.done().is_some());
+    assert_eq!(file.current().unwrap().audit.attempts, 2);
+    assert_eq!(file.current().unwrap().referee.attempts, 1);
+    assert_eq!(w.oracle.submitted.load(Ordering::SeqCst), 1);
+    assert_eq!(advisor.audits.load(Ordering::SeqCst), 2);
+    assert_eq!(advisor.advice.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_audit_result_cannot_overwrite_the_replacement_workers_step() {
+    let mut w = World::new(vec![completed("accept")], true).await;
+    let job = prepare_audit(&w).await;
+    w.worker.advisor = Some(Arc::new(FakeAdvisor {
+        reclaim_during_audit: Some(w.jobs.clone()),
+        ..Default::default()
+    }));
+    assert!(matches!(
+        w.worker.referee_job(&job).await,
+        Err(Failure::LeaseLost)
+    ));
+    assert!(!w.jobs.renew(&job).await.unwrap());
+    let replacement = w.jobs.current(&w.paper.id, JobKind::Referee).await.unwrap();
+    assert_ne!(replacement.lease, job.lease);
+    let before = w.file().await;
+    assert!(matches!(
+        before.current().unwrap().audit.state,
+        StepState::Running { .. }
+    ));
+    w.worker.advisor = Some(w.advisor.clone());
+    assert!(w.worker.referee_job(&replacement).await.unwrap());
+    let after = w.file().await;
+    assert!(after.current().unwrap().audit.done().is_some());
+    let revision = after.revision;
+    assert!(matches!(
+        w.worker.referee_job(&job).await,
+        Err(Failure::LeaseLost)
+    ));
+    assert_eq!(w.file().await.revision, revision);
+}
+
+struct LostHeartbeat {
+    jobs: Arc<MemoryJobs>,
+    lose_at: tokio::time::Instant,
+    renewals: AtomicUsize,
+    settlements: AtomicUsize,
+}
+
+#[async_trait]
+impl JobLease for LostHeartbeat {
+    async fn claim(&self) -> wishpool_core::CoreResult<Option<LeasedJob>> {
+        self.jobs.claim().await
+    }
+    async fn renew(&self, job: &LeasedJob) -> wishpool_core::CoreResult<bool> {
+        self.renewals.fetch_add(1, Ordering::SeqCst);
+        if tokio::time::Instant::now() >= self.lose_at {
+            Ok(false)
+        } else {
+            self.jobs.renew(job).await
+        }
+    }
+    async fn complete(&self, _job: &LeasedJob) -> wishpool_core::CoreResult<()> {
+        self.settlements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn defer(&self, _job: &LeasedJob, _delay: Duration) -> wishpool_core::CoreResult<()> {
+        self.settlements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn retry(&self, _job: &LeasedJob, _error: &str) -> wishpool_core::CoreResult<()> {
+        self.settlements.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_heartbeat_cancels_audit_and_never_settles_the_job() {
+    let mut w = World::new(vec![completed("accept")], true).await;
+    let job = prepare_audit(&w).await;
+    w.worker.advisor = Some(Arc::new(FakeAdvisor {
+        audit_delay: Duration::from_secs(41 * 60),
+        ..Default::default()
+    }));
+    let jobs = Arc::new(LostHeartbeat {
+        jobs: w.jobs.clone(),
+        lose_at: tokio::time::Instant::now() + Duration::from_secs(60),
+        renewals: AtomicUsize::new(0),
+        settlements: AtomicUsize::new(0),
+    });
+    w.worker.jobs = jobs.clone();
+    let started = tokio::time::Instant::now();
+    w.worker.handle(job).await;
+    assert_eq!(started.elapsed(), Duration::from_secs(5 * 60));
+    let file = w.file().await;
+    assert!(matches!(
+        file.current().unwrap().audit.state,
+        StepState::Running { .. }
+    ));
+    assert!(matches!(
+        file.current().unwrap().advice.state,
+        StepState::Pending
+    ));
+    assert_eq!(jobs.settlements.load(Ordering::SeqCst), 0);
+    let renewals = jobs.renewals.load(Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert_eq!(
+        jobs.renewals.load(Ordering::SeqCst),
+        renewals,
+        "heartbeat ended with the job"
+    );
+}
+
+#[tokio::test]
+async fn conjecture_pipeline_displays_before_letter_then_generates_and_regenerates_target() {
+    use wishpool_core::model::{
+        AuthenticationMethod, LeanStatementResponse, SubmissionKind, SubmissionStatus,
+    };
+    let answer = serde_json::json!({"recommendation":"accept","summary":"Open conjecture", "claims":[{"claim":"C2","conjecture":{
+        "well_posed":true,"well_posed_reason":"Defined symbols", "status":"open","status_reason":"Open as far as available material establishes", "named_works":[],
+        "escape":"content","escape_reason":"Needs a new bound","suggestions":["Give the boundary case"]}}]}).to_string();
+    let w = World::new_kind(
+        vec![Ok(OracleStatus::Completed {
+            text: answer,
+            model: None,
+        })],
+        true,
+        SubmissionKind::Conjecture,
+    )
+    .await;
+    let mut job = w.job().await;
+    // Admission, report, audit; publication is applied in the next call before advice/letter.
+    for _ in 0..4 {
+        assert!(w.worker.referee_job(&job).await.unwrap());
+        job = w.jobs.claim().await.unwrap().unwrap();
+    }
+    let current = w
+        .worker
+        .app
+        .submission(&w.author, &w.paper.id)
+        .await
+        .unwrap();
+    let record = match current.status {
+        SubmissionStatus::Accepted { record } => record,
+        _ => panic!("not displayed"),
+    };
+    assert_eq!(
+        w.worker
+            .app
+            .list_conjectures(None, None)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    assert!(w.file().await.letters.is_empty());
+    assert!(w.worker.app.paper(&record).await.unwrap().claims.len() == 2);
+    // Letter and target scheduling.
+    assert!(w.worker.referee_job(&job).await.unwrap());
+    job = w.jobs.claim().await.unwrap().unwrap();
+    assert!(
+        w.file().await.letters[0]
+            .body
+            .contains("Your conjecture is displayed")
+    );
+    assert!(w.worker.referee_job(&job).await.unwrap());
+    // Claim whichever queued job is next, process both safely.
+    for _ in 0..3 {
+        let Some(next) = w.jobs.claim().await.unwrap() else {
+            break;
+        };
+        w.worker.handle(next).await;
+    }
+    let current = w
+        .worker
+        .app
+        .submission(&w.author, &w.paper.id)
+        .await
+        .unwrap();
+    assert_eq!(current.lean_statements.len(), 1);
+    assert!(matches!(
+        current.lean_statements[0].response,
+        LeanStatementResponse::AwaitingAuthor
+    ));
+    assert!(
+        w.worker
+            .app
+            .paper(&record)
+            .await
+            .unwrap()
+            .lean_statements
+            .is_empty()
+    );
+    let digest = &current.lean_statements[0].digest;
+    w.worker
+        .app
+        .respond_lean_statement(
+            &w.author,
+            AuthenticationMethod::CookieSession,
+            &w.paper.id,
+            digest,
+            false,
+            "Keep the zero term explicit".into(),
+        )
+        .await
+        .unwrap();
+    let target_job = w.jobs.claim().await.unwrap().unwrap();
+    assert_eq!(target_job.kind, JobKind::LeanStatement);
+    w.worker.handle(target_job).await;
+    let current = w
+        .worker
+        .app
+        .submission(&w.author, &w.paper.id)
+        .await
+        .unwrap();
+    assert_eq!(current.lean_statements.len(), 2);
+    assert_ne!(
+        current.lean_statements[0].digest,
+        current.lean_statements[1].digest
+    );
+    assert_eq!(
+        w.formalizer.corrections.lock().await.as_slice(),
+        [None, Some("Keep the zero term explicit".into())]
+    );
 }

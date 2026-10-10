@@ -171,4 +171,92 @@ mod tests {
         assert!(read.statements[0].has_proof);
         assert!(LatexReader.read(b"not latex", "paper.tex").is_err());
     }
+    #[tokio::test]
+    async fn typed_conjecture_generates_stored_tex_and_a_confirmable_main_claim() {
+        use std::{collections::BTreeSet, sync::Arc};
+        use wishpool_core::{
+            app::{App, Upload},
+            memory::MemoryStores,
+            model::*,
+            policy::Policy,
+            ports::SystemClock,
+        };
+        let stores = Arc::new(MemoryStores::default());
+        let app = App::new(
+            stores.ports(Arc::new(SystemClock), Arc::new(LatexReader)),
+            Policy::default(),
+            BTreeSet::new(),
+        );
+        let author = app
+            .ensure_service_account(&"author".into(), "A. Author", Role::Endorser)
+            .await
+            .unwrap();
+        let new: NewPaper = serde_json::from_value(serde_json::json!({
+            "kind":"conjecture", "ai_disclosure":{"level":"none","statement":"No AI used."}, "authors":[{"name":"A. Author"}],
+            "typed_conjecture":{"title":"A conjecture: 100% & x_y","statement":"For every $n > 1$, $f(n) > 0$.", "background":"Let $f$ be the given function.", "origin":"my own"}
+        })).unwrap();
+        let paper = app
+            .submit_paper(
+                &author,
+                new,
+                Upload {
+                    filename: String::new(),
+                    bytes: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(paper.title, "A conjecture: 100% & x_y");
+        assert_eq!(paper.extracted.len(), 1);
+        assert_eq!(paper.extracted[0].kind, ClaimKind::Conjecture);
+        assert_eq!(paper.extracted[0].role, ClaimRole::Main);
+        assert_eq!(paper.status, SubmissionStatus::Draft);
+        let source = app
+            .paper_file(Some(&author), &paper.id, None, false)
+            .await
+            .unwrap();
+        assert_eq!(source.filename, "conjecture.tex");
+        let text = String::from_utf8(source.bytes.clone()).unwrap();
+        assert!(text.contains(r"\begin{conjecture}"));
+        assert!(text.contains("my own"));
+        let reread = LatexReader.read(&source.bytes, &source.filename).unwrap();
+        assert_eq!(reread.statements.len(), 1);
+        assert_eq!(reread.statements[0].kind, ClaimKind::Conjecture);
+        let confirmed = app
+            .confirm_claims(
+                &author,
+                &paper.id,
+                vec![ClaimConfirmation {
+                    id: "C1".into(),
+                    kind: ClaimKind::Conjecture,
+                    role: ClaimRole::Main,
+                    depends_on: vec![],
+                    settles: None,
+                    excluded: false,
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            confirmed.claims[0].statement,
+            "For every $n > 1$, $f(n) > 0$."
+        );
+        assert_eq!(confirmed.status, SubmissionStatus::InReview);
+        if let Ok(bin) = std::env::var("WISHPOOL_TEST_TEX_BIN") {
+            let cache = tempfile::tempdir().unwrap();
+            let compile = Compile {
+                tex_bin: bin.into(),
+                cache_dir: cache.path().into(),
+                texmf_home: None,
+                timeout: Duration::from_secs(60),
+            };
+            assert!(
+                compile
+                    .pdf(source.bytes, source.filename)
+                    .await
+                    .unwrap()
+                    .starts_with(b"%PDF")
+            );
+        }
+    }
 }

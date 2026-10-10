@@ -269,10 +269,239 @@ pub fn plain(fragment: &str) -> String {
         .join(" ")
 }
 
-/// An author's name: the first line of their `\author` entry, before any
-/// `\\` line break that starts affiliations, ORCID or e-mail lines.
-fn author_name(entry: &str) -> String {
-    plain(entry.split("\\\\").next().unwrap_or_default())
+/// A control word and the index after it; control symbols are not words.
+fn control_word(s: &str, start: usize) -> Option<(&str, usize)> {
+    if s.as_bytes().get(start) != Some(&b'\\') {
+        return None;
+    }
+    let mut end = start + 1;
+    while s.as_bytes().get(end).is_some_and(u8::is_ascii_alphabetic) {
+        end += 1;
+    }
+    (end > start + 1).then(|| (&s[start + 1..end], end))
+}
+
+/// A delimited math span, with its content and end. Never interpret its commands.
+fn math_span(s: &str, start: usize) -> Option<(&str, usize)> {
+    let rest = &s[start..];
+    let (open, close) = [("$$", "$$"), ("$", "$"), (r"\(", r"\)"), (r"\[", r"\]")]
+        .into_iter()
+        .find(|(open, _)| rest.starts_with(open))?;
+    let content = start + open.len();
+    let mut i = content;
+    while i < s.len() {
+        if s[i..].starts_with(close) {
+            return Some((&s[content..i], i + close.len()));
+        }
+        if s.as_bytes()[i] == b'\\' {
+            i += 1;
+        }
+        i += s[i..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+/// Remove layout containers around a shared names/affiliations block.
+fn unwrap_author_layout(mut entry: &str) -> &str {
+    loop {
+        entry = entry.trim();
+        if let Some((body, end)) = braced(entry, 0)
+            && end == entry.len()
+        {
+            entry = body;
+            continue;
+        }
+        let Some((env, mut after)) = entry
+            .strip_prefix("\\begin")
+            .and_then(|_| braced(entry, skip_space(entry, "\\begin".len())))
+        else {
+            return entry;
+        };
+        if !matches!(env, "center" | "tabular" | "tabular*") {
+            return entry;
+        }
+        if env == "tabular*" {
+            let Some((_, end)) = braced(entry, skip_space(entry, after)) else {
+                return entry;
+            };
+            after = end;
+        }
+        if env != "center" {
+            if let Some((_, end)) = bracketed(entry, after) {
+                after = end;
+            }
+            let Some((_, end)) = braced(entry, skip_space(entry, after)) else {
+                return entry;
+            };
+            after = end;
+        }
+        let Some(body) = entry[after..].strip_suffix(&format!("\\end{{{env}}}")) else {
+            return entry;
+        };
+        entry = body;
+    }
+}
+
+/// Remove name annotations before splitting: a superscript or thanks may itself
+/// contain commas, `and`, or line breaks which are not author separators.
+fn strip_author_marks(entry: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < entry.len() {
+        if let Some((content, end)) = math_span(entry, i) {
+            let marker = content.trim().strip_prefix("{}").unwrap_or(content.trim());
+            if !marker.trim_start().starts_with('^') {
+                out.push_str(&entry[i..end]);
+            }
+            i = end;
+            continue;
+        }
+        if let Some((command, after)) = control_word(entry, i)
+            && matches!(
+                command,
+                "thanks"
+                    | "footnote"
+                    | "inst"
+                    | "orcidlink"
+                    | "email"
+                    | "textsuperscript"
+                    | "footnotemark"
+            )
+        {
+            let mut end = after;
+            if let Some((_, after)) = bracketed(entry, end) {
+                end = after;
+            }
+            if let Some((_, after)) = braced(entry, skip_space(entry, end)) {
+                i = after;
+                continue;
+            }
+            if command == "footnotemark" {
+                i = end;
+                continue;
+            }
+        }
+        let c = entry[i..].chars().next().unwrap();
+        out.push(c);
+        i += c.len_utf8();
+        if c == '\\'
+            && let Some(escaped) = entry[i..].chars().next()
+        {
+            out.push(escaped);
+            i += escaped.len_utf8();
+        }
+    }
+    out
+}
+
+/// Split entries on `\and`, then names on spacing commands, commas, `and`
+/// and table columns. Brace groups and control-word suffixes stay intact.
+fn author_parts(entry: &str, names: bool) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < entry.len() {
+        let c = entry[i..].chars().next().unwrap();
+        let mut end = i + c.len_utf8();
+        let separator = if let Some((command, after)) = control_word(entry, i) {
+            end = after;
+            command == "and" || (names && matches!(command, "quad" | "qquad"))
+        } else if let Some((_, after)) = braced(entry, i) {
+            end = after;
+            false
+        } else if names
+            && entry[i..].starts_with("and")
+            && entry[..i]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+            && entry[i + 3..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+        {
+            end = i + 3;
+            true
+        } else {
+            names && matches!(c, ',' | '&')
+        };
+        if separator {
+            parts.push(entry[start..i].trim());
+            start = end;
+        }
+        i = end;
+    }
+    parts.push(entry[start..].trim());
+    parts
+}
+
+/// Names occupy the first row of each `\and` entry; later rows contain
+/// affiliations, addresses, ORCID or e-mail lines.
+fn author_names(entry: &str) -> Vec<String> {
+    author_parts(unwrap_author_layout(entry), false)
+        .into_iter()
+        .flat_map(|entry| {
+            let clean = strip_author_marks(unwrap_author_layout(entry));
+            let row = clean.split("\\\\").next().unwrap_or_default();
+            author_parts(row, true)
+                .into_iter()
+                .map(plain)
+                .collect::<Vec<_>>()
+        })
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Titles become plain UI labels. Render citation keys and text grouping, while
+/// retaining math (including its braces) and unknown commands as LaTeX source.
+fn statement_title(fragment: &str) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < fragment.len() {
+        if let Some((_, end)) = math_span(fragment, i) {
+            out.push_str(&fragment[i..end]);
+            i = end;
+            continue;
+        }
+        if let Some((command, after)) = control_word(fragment, i) {
+            let mut arg_start = skip_space(fragment, after);
+            let mut optional = None;
+            if let Some((option, end)) = bracketed(fragment, arg_start) {
+                optional = Some(option);
+                arg_start = skip_space(fragment, end);
+            }
+            if let Some((arg, end)) = braced(fragment, arg_start) {
+                if matches!(command, "cite" | "citep" | "citet") {
+                    out.push('[');
+                    out.push_str(&arg.split(',').map(str::trim).collect::<Vec<_>>().join(", "));
+                    if let Some(option) = optional {
+                        out.push_str(", ");
+                        out.push_str(&plain(option));
+                    }
+                    out.push(']');
+                } else {
+                    out.push_str(&fragment[i..end]);
+                }
+                i = end;
+                continue;
+            }
+            out.push_str(&fragment[i..after]);
+            i = after;
+            continue;
+        }
+        let c = fragment[i..].chars().next().unwrap();
+        if !matches!(c, '{' | '}') {
+            out.push(c);
+        }
+        i += c.len_utf8();
+        if c == '\\'
+            && let Some(escaped) = fragment[i..].chars().next()
+        {
+            out.push(escaped);
+            i += escaped.len_utf8();
+        }
+    }
+    plain(&out)
 }
 
 /// Remove every `\label{..}` and cleveref `\label[type]{..}`.
@@ -474,8 +703,7 @@ pub fn parse(files: &Files) -> LatexResult<ParsedPaper> {
         .filter(|t| !t.is_empty());
     let mut authors: Vec<String> = all_arguments(&source, "\\author")
         .iter()
-        .flat_map(|a| a.split("\\and").map(author_name).collect::<Vec<_>>())
-        .filter(|a| !a.is_empty())
+        .flat_map(|a| author_names(a))
         .collect();
     authors.dedup();
     let abstract_text = environment_body(&source, "abstract")
@@ -524,7 +752,7 @@ pub fn parse(files: &Files) -> LatexResult<ParsedPaper> {
             continue;
         };
         let (title, content_start) = match bracketed(&source, after_name) {
-            Some((t, end)) => (Some(plain(t)), end),
+            Some((t, end)) => (Some(statement_title(t)), end),
             None => (None, after_name),
         };
         // Matching \end, allowing nested environments of the same name.
@@ -738,6 +966,92 @@ Bo Builder\\[-2pt] \small Some University\\[-2pt] \small\texttt{b@u.edu}
         assert!(theorem.has_proof, "the proof given later names the theorem");
         assert_eq!(lemma.label.as_deref(), Some("lem:a"));
         assert_eq!(lemma.body, "A step.");
+    }
+
+    #[test]
+    fn tabular_authors_from_arxiv_2609_25128() {
+        let source = r#"\documentclass{article}
+\author{\begin{tabular}{c}
+Haobo Ma$^{1,2}$ \qquad Rafik Sahbi$^3$ \qquad Wenlin Zhang$^{1,4}$\\[6pt]
+\small $^1$The Omega Institute\\
+\small $^2$ChronoAI Pte Ltd\\
+\small $^3$Department of Fundamental Science and Technology\\
+\small National Higher School of Advanced Technologies\\
+\small B.P. 474, Martyrs Square, Algiers 16001, Algeria\\
+\small $^4$National University of Singapore\\
+\small 21 Lower Kent Ridge Road, Singapore 119077\\[4pt]
+\small \texttt{auric@aelf.io}; \texttt{r.sahbi@g.essa-alger.edu.dz}\\
+\small \texttt{e1327962@u.nus.edu}
+\end{tabular}}
+\begin{document}\end{document}"#;
+        let paper = parse(&files(&[("main.tex", source)])).unwrap();
+        assert_eq!(paper.authors, ["Haobo Ma", "Rafik Sahbi", "Wenlin Zhang"]);
+    }
+
+    #[test]
+    fn author_layouts_separators_and_annotations() {
+        let cases = [
+            (
+                r"\begin{center}\begin{tabular}[t]{ccc}
+Ada Author\textsuperscript{1,2} & Bo Builder\thanks{Support from A and B, Inc.\\Thanks.} & Chloé Chen\inst{3}
+\\[4pt]University, City and Country\\\texttt{a@example.org}
+\end{tabular}\end{center}",
+                vec!["Ada Author", "Bo Builder", "Chloé Chen"],
+            ),
+            (
+                r"\begin{center}Ada Author$^\dagger$ \quad Bo Builder${}^{2}$ and Chloé Chen\footnotemark[3]\\Institute\end{center}",
+                vec!["Ada Author", "Bo Builder", "Chloé Chen"],
+            ),
+            (
+                r"Ada Author\footnotemark and Bo Builder\footnote{Contact, address} , Chloé Chen\inst{1,2}",
+                vec!["Ada Author", "Bo Builder", "Chloé Chen"],
+            ),
+            (
+                r"Ada Author\\University, City \and Bo Builder\\Institute and Address",
+                vec!["Ada Author", "Bo Builder"],
+            ),
+            (
+                r"\begin{tabular*}{\textwidth}{c}Ada Author \and Bo Builder\end{tabular*}",
+                vec!["Ada Author", "Bo Builder"],
+            ),
+        ];
+        for (entry, expected) in cases {
+            let source = format!(
+                "\\documentclass{{article}}\\author{{{entry}}}\\begin{{document}}\\end{{document}}"
+            );
+            let paper = parse(&files(&[("main.tex", &source)])).unwrap();
+            assert_eq!(paper.authors, expected, "{entry}");
+        }
+        assert_eq!(author_names(r"Ada \anderson"), [r"Ada \anderson"]);
+    }
+
+    #[test]
+    fn statement_titles_with_citations_keep_math() {
+        let source = r#"\documentclass{article}
+\begin{document}
+\begin{theorem}[Equivalent form of the grid $3$-path-cover formula {\cite{Bresar2013,JakovacTaranenko2013}}]
+\label{thm:gridbeta} A grid formula.
+\end{theorem}
+\begin{lemma}[Estimate for $x^{2}+\frac{a}{b}$ {{\citep[Thm.~2]{alpha, beta}}}]
+An estimate.
+\end{lemma}
+\end{document}"#;
+        let paper = parse(&files(&[("main.tex", source)])).unwrap();
+        assert_eq!(
+            paper.statements[0].title.as_deref(),
+            Some(
+                "Equivalent form of the grid $3$-path-cover formula [Bresar2013, JakovacTaranenko2013]"
+            )
+        );
+        assert_eq!(
+            paper.statements[1].title.as_deref(),
+            Some(r"Estimate for $x^{2}+\frac{a}{b}$ [alpha, beta, Thm. 2]")
+        );
+        assert_eq!(statement_title(r"By \citet{alpha}"), "By [alpha]");
+        assert_eq!(
+            statement_title(r"An unknown \custom{a,b} and \(x^{2}\)"),
+            r"An unknown \custom{a,b} and \(x^{2}\)"
+        );
     }
 
     #[test]

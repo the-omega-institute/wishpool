@@ -60,6 +60,8 @@ fn uuid_like() -> String {
 
 fn submission(id: &str, submitter: &str, status: SubmissionStatus) -> Submission {
     Submission {
+        kind: wishpool_core::model::SubmissionKind::Paper,
+        lean_statements: vec![],
         id: SubmissionId(id.into()),
         submitter: PersonId(submitter.into()),
         title: "t".into(),
@@ -82,6 +84,7 @@ fn submission(id: &str, submitter: &str, status: SubmissionStatus) -> Submission
         analysis_visibility: Visibility::Undecided,
         formalization: FormalizationPlan::default(),
         conjectures: vec![],
+        published_progress: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
         revision: 0,
@@ -281,6 +284,9 @@ async fn paper_flow_against_mongo() {
     let helper = caller("helper", &[]).await;
 
     let new = NewPaper {
+        kind: wishpool_core::model::SubmissionKind::Paper,
+        make_public_after_acceptance: true,
+        typed_conjecture: None,
         ai_disclosure: AiDisclosure {
             level: AiUse::Assisted,
             statement: "A model proofread the lemma.".into(),
@@ -436,12 +442,24 @@ async fn paper_flow_against_mongo() {
         Some("10.48550/arXiv.2609.33421")
     );
     assert_eq!(public.claims.len(), 3);
-    assert!(public.analysis.is_none());
+    assert!(
+        serde_json::to_value(&public)
+            .unwrap()
+            .get("analysis")
+            .is_none()
+    );
     app.set_analysis_visibility(&author, &paper.id, Visibility::Public)
         .await
         .unwrap();
     let public = app.paper(&RecordId(record.0.clone())).await.unwrap();
-    assert_eq!(public.analysis.unwrap().main_with_content, 1);
+    assert_eq!(public.claims.len(), 3);
+    assert_eq!(
+        app.analysis(&author, &paper.id)
+            .await
+            .unwrap()
+            .main_with_content,
+        1
+    );
     assert_eq!(app.list_papers(None, None).await.unwrap().items.len(), 1);
     let pdf = app.paper_file(None, &paper.id, None, true).await.unwrap();
     assert_eq!(pdf.bytes, b"%PDF-1.7");
@@ -542,6 +560,7 @@ async fn referee_files_are_unique_and_revision_fenced() {
     ));
     file.letters.push(FeedbackLetter {
         round: None,
+        assessment: Some(Recommendation::MinorRevision),
         subject: "Feedback".into(),
         body: "Useful point".into(),
         note: String::new(),
@@ -595,5 +614,65 @@ async fn referee_job_deferral_preserves_attempts_and_lease_fence() {
         .await
         .unwrap();
     assert!(JobLease::claim(s).await.unwrap().is_none());
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn job_renewal_extends_live_lease_and_never_revives_a_stale_token() {
+    let Some(db) = TestDb::open().await else {
+        return;
+    };
+    let s = &db.store;
+    ReviewQueue::enqueue(s, &"paper".into(), JobKind::Referee)
+        .await
+        .unwrap();
+    let first = JobLease::claim(s).await.unwrap().unwrap();
+    s.raw(REVIEW_JOBS).update_one(
+        doc! { "lease": &first.lease },
+        doc! { "$set": { "lease_until": mongodb::bson::DateTime::from_chrono(Utc::now() + chrono::Duration::minutes(2)) } },
+    ).await.unwrap();
+    let before = Utc::now();
+    assert!(JobLease::renew(s, &first).await.unwrap());
+    let renewed = s
+        .raw(REVIEW_JOBS)
+        .find_one(doc! { "lease": &first.lease })
+        .await
+        .unwrap()
+        .unwrap();
+    let until = renewed.get_datetime("lease_until").unwrap().to_chrono();
+    assert!(until >= before + chrono::Duration::minutes(30) - chrono::Duration::milliseconds(1));
+    assert_eq!(renewed.get_i32("attempts").unwrap(), 1);
+    assert!(JobLease::claim(s).await.unwrap().is_none());
+
+    s.raw(REVIEW_JOBS).update_one(
+        doc! { "lease": &first.lease },
+        doc! { "$set": { "lease_until": mongodb::bson::DateTime::from_chrono(Utc::now() - chrono::Duration::seconds(1)) } },
+    ).await.unwrap();
+    assert!(!JobLease::renew(s, &first).await.unwrap());
+    JobLease::complete(s, &first).await.unwrap();
+    let second = JobLease::claim(s)
+        .await
+        .unwrap()
+        .expect("expired lease is reclaimable");
+    assert_eq!(second.attempts, 2);
+    assert_ne!(second.lease, first.lease);
+    assert!(!JobLease::renew(s, &first).await.unwrap());
+    JobLease::complete(s, &first).await.unwrap();
+    JobLease::defer(s, &first, std::time::Duration::ZERO)
+        .await
+        .unwrap();
+    JobLease::retry(s, &first, "stale worker").await.unwrap();
+    assert!(JobLease::renew(s, &second).await.unwrap());
+    let current = s
+        .raw(REVIEW_JOBS)
+        .find_one(doc! { "lease": &second.lease })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.get_i32("attempts").unwrap(), 2);
+    assert_eq!(current.get_str("state").unwrap(), "leased");
+    assert!(current.get("last_error").unwrap().as_null().is_some());
+    JobLease::complete(s, &second).await.unwrap();
+    assert!(!JobLease::renew(s, &second).await.unwrap());
     db.drop().await;
 }

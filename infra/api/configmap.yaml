@@ -41,18 +41,23 @@ data:
   RUST_LOG: "info"
   # Referee rounds are opt-in. CLI modes are refused on this production bind.
   WISHPOOL_ORACLE: ""
-  WISHPOOL_ORACLE_BASE_URL: "https://nyx.chrono-ai.fun"
-  WISHPOOL_ORACLE_POOL: "chrono-chatgpt-pro-500-pool,company-chatgpt-pro"
+  WISHPOOL_ORACLE_BASE_URL: "https://nyx-api.chrono-ai.fun/api/v1/proxy/s/oracle"
+  WISHPOOL_ORACLE_POOL: "chrono-chatgpt-pro-pool"
   WISHPOOL_ORACLE_MODEL: "chatgpt-6-pro"
   WISHPOOL_ORACLE_CLI: "nyxid"
   WISHPOOL_ORACLE_POLL_SECS: "60"
   WISHPOOL_REFEREE_ACCOUNT: "wishpool:referee"
+  WISHPOOL_AUDITOR_ACCOUNT: "wishpool:auditor"
   WISHPOOL_ADVISOR: ""
   WISHPOOL_CODEX_BIN: "codex"
   WISHPOOL_CODEX_MODEL: ""
   WISHPOOL_ADVISOR_MODEL: "gpt-5.5"
+  # Advice and letters default to 20 minutes; the audit has its own longer
+  # deadline because the worker renews its 30-minute lease while it runs.
   WISHPOOL_ADVISOR_TIMEOUT_SECS: "1200"
+  WISHPOOL_AUDIT_TIMEOUT_SECS: "3600"
   WISHPOOL_ADVISOR_WORK_DIR: "/tmp/wishpool-advisor"
+  # Prepared Lean/Mathlib project for private proof probes and conjecture targets.
   WISHPOOL_LEAN_WORKSPACE: ""
-  # Codex: at most 1200 seconds; the whole formal step is bounded by 25 minutes.
+  # Codex: at most 3600 seconds; the step budget includes discovery/check margin.
   WISHPOOL_FORMAL_TIMEOUT_SECS: "1200"

@@ -1,13 +1,15 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useState, type FormEvent } from 'react';
 import { useApi } from '../api/context';
-import { useAsync } from '../api/useAsync';
+import type { RefereeResource } from '../api/useReferee';
 import type {
   Advice,
   FeedbackLetter,
   FormalProbe,
   FormalizationCandidate,
   LetterDraft,
+  Recommendation,
   RefereeReport,
+  RefereeAudit,
   RefereeRound,
   Step,
   Submission,
@@ -35,52 +37,11 @@ type WorkspaceProps = {
   onChange: (submission: Submission) => void;
 };
 
-function isActive(round: RefereeRound): boolean {
-  return [round.referee, round.advice, round.formal, round.letter].some(
-    (step) =>
-      step !== undefined && (step.state.state === 'pending' || step.state.state === 'running'),
-  );
-}
-
-/** Staff see the review history; authors see only the letters editors have sent. */
-export function RefereeWorkspace(props: WorkspaceProps) {
-  const { submission, isStaff, isEditor } = props;
+/** Staff see the full history; authors see delivered letters and referee reports. */
+export function RefereeWorkspace(props: WorkspaceProps & { resource: RefereeResource }) {
+  const { submission, isStaff, isEditor, resource } = props;
   const api = useApi();
-  const revision = submission.revision;
-  const load = useCallback(
-    (signal: AbortSignal) => {
-      void revision;
-      return api.referee(submission.id, { signal });
-    },
-    [api, submission.id, revision],
-  );
-  const resource = useAsync(load);
-  const { reload } = resource;
-  const latest = resource.value?.rounds.reduce<RefereeRound | undefined>(
-    (latest, round) => (!latest || round.number > latest.number ? round : latest),
-    undefined,
-  );
-  const active = isStaff && latest !== undefined && isActive(latest);
-  const status = resource.state.status;
-  const wasActive = useRef(false);
-  useEffect(() => {
-    // A temporary fetch failure must not stop a round that is still in progress.
-    if (status === 'ok') wasActive.current = active;
-    if (!isStaff || !wasActive.current) return;
-    const timer = window.setInterval(reload, 30_000);
-    return () => window.clearInterval(timer);
-  }, [active, isStaff, status, reload]);
-
-  const paperStatus = submission.status.state;
-  useEffect(() => {
-    if (isStaff || (paperStatus !== 'in_review' && paperStatus !== 'accepted')) return;
-    const timer = window.setInterval(reload, 30_000);
-    window.addEventListener('focus', reload);
-    return () => {
-      window.clearInterval(timer);
-      window.removeEventListener('focus', reload);
-    };
-  }, [isStaff, paperStatus, reload]);
+  const { reload, active } = resource;
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -97,13 +58,32 @@ export function RefereeWorkspace(props: WorkspaceProps) {
   };
 
   if (!isStaff) {
-    const letters = resource.value?.letters ?? [];
-    if (letters.length === 0 && resource.state.status !== 'error') return null;
+    // Nothing to show the author until the first letter arrives.
+    if (resource.state.status === 'ok' && resource.value?.letters.length === 0) return null;
     return (
       <section className="referee-panel" aria-labelledby="feedback-h">
-        <h2 id="feedback-h">Feedback from the editors</h2>
+        <h2 id="feedback-h">Letter from the editors</h2>
         <Async state={resource.state} onRetry={reload}>
-          {(file) => <SentLetters letters={file.letters} authorView />}
+          {(file) => {
+            const current = [...file.rounds]
+              .reverse()
+              .find(
+                (r) =>
+                  r.version === submission.versions.at(-1)?.number &&
+                  r.claims_revision === submission.claims_revision,
+              );
+            return (
+              <>
+                <SentLetters letters={file.letters} authorView />
+                {current?.referee.state.state === 'done' ? (
+                  <details className="history">
+                    <summary>Full referee report</summary>
+                    <ReportView report={current.referee.state.result} submission={submission} />
+                  </details>
+                ) : null}
+              </>
+            );
+          }}
         </Async>
       </section>
     );
@@ -194,6 +174,7 @@ export function RefereeWorkspace(props: WorkspaceProps) {
 
 const STEP_NAMES = {
   referee: 'Referee report',
+  audit: 'Audit',
   advice: 'Suggestions',
   formal: 'Lean check',
   letter: 'Letter',
@@ -205,9 +186,10 @@ function roundStatus(round: RefereeRound, sent: readonly FeedbackLetter[]): stri
   if (last) return `Feedback sent to the authors on ${formatDay(last.sent_at)}.`;
   const steps = [
     ['referee', round.referee],
+    ['audit', round.audit],
     ['advice', round.advice],
-    ['formal', round.formal],
     ['letter', round.letter],
+    ['formal', round.formal],
   ] as const;
   for (const [key, step] of steps) {
     if (!step) continue;
@@ -220,7 +202,7 @@ function roundStatus(round: RefereeRound, sent: readonly FeedbackLetter[]): stri
     }
     if (state.state === 'pending') return `${STEP_NAMES[key]}: waiting to start.`;
   }
-  if (round.letter.state.state === 'done') {
+  if (round.letter?.state.state === 'done') {
     return 'The feedback letter is ready. Read it, edit if needed, and send it to the authors.';
   }
   return 'The review finished without a letter.';
@@ -285,19 +267,25 @@ function RoundView({
     <div className="referee-round">
       <ol className="referee-progress" aria-label="Review progress">
         <StepProgress name={STEP_NAMES.referee} step={round.referee} />
-        <StepProgress name={STEP_NAMES.advice} step={round.advice} />
+        {round.audit ? <StepProgress name={STEP_NAMES.audit} step={round.audit} /> : null}
+        {round.advice ? <StepProgress name={STEP_NAMES.advice} step={round.advice} /> : null}
+        {round.letter ? <StepProgress name={STEP_NAMES.letter} step={round.letter} /> : null}
         {round.formal ? <StepProgress name={STEP_NAMES.formal} step={round.formal} /> : null}
-        <StepProgress name={STEP_NAMES.letter} step={round.letter} />
       </ol>
       {sent.length > 0 ? (
         <SentLetters letters={[...sent]} authorView showSender />
-      ) : round.letter.state.state === 'done' ? (
+      ) : round.letter?.state.state === 'done' ? (
         <div className="tool-form">
           <h3>Letter to the authors</h3>
           {isEditor ? (
             <LetterForm
               key={round.letter.state.at}
               draft={round.letter.state.result}
+              recommendation={
+                round.referee.state.state === 'done'
+                  ? round.referee.state.result.recommendation
+                  : undefined
+              }
               submissionId={submission.id}
               onSent={onSent}
             />
@@ -317,7 +305,13 @@ function RoundView({
           <ReportView report={round.referee.state.result} submission={submission} />
         </details>
       ) : null}
-      {round.advice.state.state === 'done' ? (
+      {round.audit?.state.state === 'done' ? (
+        <details className="history">
+          <summary>Audit result</summary>
+          <AuditView audit={round.audit.state.result} />
+        </details>
+      ) : null}
+      {round.advice?.state.state === 'done' ? (
         <details className="history">
           <summary>
             Suggestions · {round.advice.state.result.improvements.length} improvements,{' '}
@@ -372,20 +366,26 @@ function MarkdownList({ items }: { items: readonly string[] }) {
   );
 }
 
-function ReportView({ report, submission }: { report: RefereeReport; submission: Submission }) {
+export function ReportView({
+  report,
+  submission,
+}: {
+  report: RefereeReport;
+  submission: Submission;
+}) {
   return (
     <div className="report">
       <h3>Referee report</h3>
       {report.recommendation ? (
-        <Badge tone="accent" title="Advisory recommendation for the editors">
+        <Badge tone="accent" title="Referee assessment; the publication criteria decide acceptance">
           Referee recommends {RECOMMENDATION_LABELS[report.recommendation]}
         </Badge>
       ) : (
         <p className="muted">No readable recommendation was returned.</p>
       )}
       <p className="small muted">
-        This recommendation is advice to the editors. These are the referee’s readings and claims;
-        they have not been independently verified. The decision is recorded separately.
+        This recommendation is feedback. The source-based check and publication decision are
+        recorded separately.
       </p>
       <Markdown text={report.summary} />
       {report.strengths.length > 0 ? (
@@ -463,6 +463,41 @@ function ReportView({ report, submission }: { report: RefereeReport; submission:
         <summary>Full referee answer</summary>
         <Markdown text={report.text} />
       </details>
+    </div>
+  );
+}
+
+function AuditView({ audit }: { audit: RefereeAudit }) {
+  return (
+    <div className="report">
+      <h3>Audit</h3>
+      <Badge>{RECOMMENDATION_LABELS[audit.verdict]}</Badge>
+      <p>{audit.summary}</p>
+      <p>Agrees with referee: {audit.agrees_with_referee ? 'Yes' : 'No'}</p>
+      <ul>
+        {audit.claims.map((c) => (
+          <li key={c.claim}>
+            <strong>
+              {c.claim} · {c.correctness}
+            </strong>
+            <p>{c.comment}</p>
+            <p>
+              {c.shape ?? 'No proof reading'}
+              {c.known ? ` · ${c.known}` : ''}
+            </p>
+            <MarkdownList items={c.witnesses} />
+          </li>
+        ))}
+      </ul>
+      <ul>
+        {audit.concerns.map((c, i) => (
+          <li key={i}>
+            <strong>{c.status}</strong>
+            <p>{c.concern}</p>
+            <p>{c.note}</p>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -639,7 +674,7 @@ function ProbeView({ probe, submission }: { probe: FormalProbe; submission: Subm
             </div>
             {attempt.outcome === 'compiled' ? (
               <p className="small">
-                Axioms: {attempt.axioms.length > 0 ? attempt.axioms.join(', ') : 'none'}
+                Axioms: {(attempt.axioms?.length ?? 0) > 0 ? attempt.axioms?.join(', ') : 'none'}
               </p>
             ) : null}
             {attempt.note ? <Markdown text={attempt.note} /> : null}
@@ -672,10 +707,12 @@ function ProbeView({ probe, submission }: { probe: FormalProbe; submission: Subm
 
 function LetterForm({
   draft,
+  recommendation,
   submissionId,
   onSent,
 }: {
   draft: LetterDraft;
+  recommendation?: Recommendation;
   submissionId: string;
   onSent: (letter: FeedbackLetter) => void;
 }) {
@@ -683,6 +720,7 @@ function LetterForm({
   const [subject, setSubject] = useState(draft.subject);
   const [body, setBody] = useState(draft.body);
   const [note, setNote] = useState(draft.note);
+  const [assessment, setAssessment] = useState<Recommendation | ''>(recommendation ?? '');
   const [busy, setBusy] = useState(false);
   const [sent, setSent] = useState(false);
   const [error, setError] = useState<unknown>(null);
@@ -696,7 +734,14 @@ function LetterForm({
     setSent(false);
     setError(null);
     try {
-      onSent(await api.sendFeedback(submissionId, { subject, body, note }));
+      onSent(
+        await api.sendFeedback(submissionId, {
+          subject,
+          body,
+          note,
+          ...(assessment ? { assessment } : {}),
+        }),
+      );
       setSent(true);
     } catch (e) {
       setError(e);
@@ -710,6 +755,20 @@ function LetterForm({
       aria-label="Send feedback to the author"
       onSubmit={(event) => void submit(event)}
     >
+      <Field label="Assessment" htmlFor="feedback-assessment">
+        <select
+          id="feedback-assessment"
+          value={assessment}
+          onChange={(e) => setAssessment(e.target.value as Recommendation | '')}
+          disabled={busy}
+        >
+          <option value="accept">Accept</option>
+          <option value="minor_revision">Minor revision</option>
+          <option value="major_revision">Major revision</option>
+          <option value="reject">Reject</option>
+          <option value="">No assessment</option>
+        </select>
+      </Field>
       <Field label="Subject" htmlFor="feedback-subject">
         <input
           id="feedback-subject"
@@ -783,6 +842,33 @@ function LetterText({ letter }: { letter: LetterDraft }) {
   );
 }
 
+/** The opening paragraphs of a letter, with the rest one click away. */
+function LetterBody({ body, note }: { body: string; note: string }) {
+  const [full, setFull] = useState(false);
+  const paragraphs = body.split(/\n\s*\n/);
+  const short = paragraphs.length > 3 && !full;
+  return (
+    <>
+      <Markdown text={short ? paragraphs.slice(0, 2).join('\n\n') : body} lineBreaks />
+      {short ? (
+        <button
+          type="button"
+          className="button button-quiet button-small letter-more"
+          onClick={() => setFull(true)}
+        >
+          Read the full letter
+        </button>
+      ) : null}
+      {note && !short ? (
+        <details className="history">
+          <summary>Note</summary>
+          <Markdown text={note} />
+        </details>
+      ) : null}
+    </>
+  );
+}
+
 function SentLetters({
   letters,
   authorView = false,
@@ -799,24 +885,34 @@ function SentLetters({
         <li className="report" key={`${letter.sent_at}-${i}`}>
           {authorView ? (
             <>
-              <h3>{letter.subject}</h3>
+              <h3>
+                {letter.subject}
+                {letter.assessment ? (
+                  <>
+                    {' '}
+                    <AssessmentBadge assessment={letter.assessment} />
+                  </>
+                ) : null}
+              </h3>
               <p className="entry-meta">
                 <DateText iso={letter.sent_at} withTime />
                 {showSender ? <span>Sent by {letter.sent_by}</span> : null}
                 {showSender && letter.edited ? <Badge tone="muted">Edited</Badge> : null}
               </p>
-              <Markdown text={letter.body} lineBreaks />
-              {letter.note ? (
-                <details className="history">
-                  <summary>Note</summary>
-                  <Markdown text={letter.note} />
-                </details>
-              ) : null}
+              <LetterBody body={letter.body} note={letter.note} />
             </>
           ) : (
             <details className="history">
               <summary>
-                <strong>{letter.subject}</strong> · <DateText iso={letter.sent_at} withTime />
+                <strong>{letter.subject}</strong>
+                {letter.assessment ? (
+                  <>
+                    {' '}
+                    <AssessmentBadge assessment={letter.assessment} />
+                  </>
+                ) : null}
+                {' · '}
+                <DateText iso={letter.sent_at} withTime />
                 {' · Sent by '}
                 <span>{letter.sent_by}</span>
                 {letter.edited ? (
@@ -838,5 +934,14 @@ function SentLetters({
         </li>
       ))}
     </ul>
+  );
+}
+
+function AssessmentBadge({ assessment }: { assessment: Recommendation }) {
+  const label = RECOMMENDATION_LABELS[assessment];
+  return (
+    <Badge tone={assessment === 'accept' ? 'good' : assessment === 'reject' ? 'bad' : 'warn'}>
+      {label[0]!.toUpperCase() + label.slice(1)}
+    </Badge>
   );
 }

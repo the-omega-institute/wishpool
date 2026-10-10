@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from 'react';
 import { useApi } from '../../api/context';
 import type { Submission } from '../../api/types';
+import { useSession } from '../../auth/session';
 import { VISIBILITY_LABELS } from '../../lib/labels';
 import { SOURCE_ACCEPT, sourceFileProblem } from '../../lib/upload';
 import { Link } from '../../routing/router';
@@ -200,10 +201,10 @@ export function VisibilityChoice({
   const current = submission.analysis_visibility;
   return (
     <fieldset className="radio-list visibility">
-      <legend>Who sees the analysis</legend>
+      <legend>Public display</legend>
       <p className="small">
-        Currently: <strong>{VISIBILITY_LABELS[current]}</strong>. The title, authors, abstract, PDF,
-        statements and Lean badges are public in either case.
+        Currently: <strong>{VISIBILITY_LABELS[current]}</strong>. Reviews and letters are only shown
+        to you.
       </p>
       <label className="radio">
         <input
@@ -214,9 +215,7 @@ export function VisibilityChoice({
           onChange={() => m.run(() => api.setVisibility(submission.id, 'public'))}
         />
         <span>
-          <strong>Public</strong> — the public page also shows, per statement, the literature check
-          (prior works and their relation), the escape analysis (bind-only or content, with
-          witnesses and the standing of the judgements), and the conjecture follow-ups.
+          <strong>Public</strong> — show statements, dependencies, new lemmas and verified Lean.
         </span>
       </label>
       <label className="radio">
@@ -228,8 +227,7 @@ export function VisibilityChoice({
           onChange={() => m.run(() => api.setVisibility(submission.id, 'private'))}
         />
         <span>
-          <strong>Private</strong> — only you and the editors see the analysis and the conjecture
-          follow-ups.
+          <strong>Private</strong> — show only the title, authors, kind and record.
         </span>
       </label>
       <InlineError error={m.error} />
@@ -343,6 +341,144 @@ function FormalizationResponse({
         </button>
       </div>
       <InlineError error={m.error} />
+    </div>
+  );
+}
+
+export function LeanStatementCard({
+  submission,
+  onChange,
+}: {
+  submission: Submission;
+  onChange: OnChange;
+}) {
+  const current = submission.versions.at(-1)?.number;
+  const claims = submission.claims.filter(
+    (c) => c.role === 'main' && (c.kind === 'conjecture' || c.kind === 'question'),
+  );
+  return (
+    <section className="lean-statement-card" aria-label="Lean statement">
+      <h2>Is this your conjecture?</h2>
+      <p>
+        Lean checks that this statement is well formed. Confirm that its meaning matches your
+        conjecture.
+      </p>
+      {claims.map((claim) => {
+        const attempt = [...submission.lean_statements]
+          .reverse()
+          .find(
+            (a) =>
+              a.claim === claim.id &&
+              a.version === current &&
+              a.claims_revision === submission.claims_revision,
+          );
+        return (
+          <div key={claim.id}>
+            {attempt ? (
+              <LeanStatementResponse
+                key={attempt.digest}
+                submission={submission}
+                attempt={attempt}
+                onChange={onChange}
+              />
+            ) : (
+              <p role="status">The Lean statement is being prepared.</p>
+            )}
+          </div>
+        );
+      })}
+    </section>
+  );
+}
+
+function LeanStatementResponse({
+  submission,
+  attempt,
+  onChange,
+}: {
+  submission: Submission;
+  attempt: Submission['lean_statements'][number];
+  onChange: OnChange;
+}) {
+  const api = useApi();
+  const { person } = useSession();
+  const canRespond = person?.id === submission.submitter;
+  const mutation = useMutation(onChange);
+  const [comment, setComment] = useState('');
+  const [rejecting, setRejecting] = useState(false);
+  const respond = (confirm: boolean) => {
+    if (!confirm && !comment.trim()) {
+      mutation.setError('Describe what the statement should say.');
+      return;
+    }
+    mutation.run(() =>
+      api.respondLeanStatement(submission.id, {
+        digest: attempt.digest,
+        confirm,
+        ...(confirm ? {} : { comment: comment.trim() }),
+      }),
+    );
+  };
+  return (
+    <div>
+      <p>{attempt.reading}</p>
+      <pre className="lean-source">
+        <code>{attempt.lean}</code>
+      </pre>
+      {attempt.response.state === 'confirmed' ? (
+        <p role="status">
+          {canRespond
+            ? 'You confirmed this statement.'
+            : 'The submitting author confirmed this statement.'}
+        </p>
+      ) : attempt.response.state === 'rejected' ? (
+        <p role="status">A revised statement is being prepared with your correction.</p>
+      ) : !canRespond ? (
+        <p role="status">Awaiting confirmation from the submitting author.</p>
+      ) : (
+        <>
+          <div className="button-row">
+            <button
+              type="button"
+              className="button"
+              disabled={mutation.busy}
+              onClick={() => respond(true)}
+            >
+              Yes, this is my conjecture
+            </button>
+            <button
+              type="button"
+              className="button button-quiet"
+              disabled={mutation.busy}
+              onClick={() => setRejecting(true)}
+            >
+              No, it should say…
+            </button>
+          </div>
+          {rejecting ? (
+            <div className="form">
+              <Field label="What should it say?" htmlFor={`lean-correction-${attempt.claim}`}>
+                <textarea
+                  id={`lean-correction-${attempt.claim}`}
+                  rows={3}
+                  maxLength={10000}
+                  value={comment}
+                  onChange={(e) => setComment(e.target.value)}
+                />
+              </Field>
+              <button
+                type="button"
+                className="button"
+                disabled={mutation.busy}
+                onClick={() => respond(false)}
+              >
+                Request a revised statement
+              </button>
+            </div>
+          ) : null}
+        </>
+      )}
+      <InlineError error={mutation.error} />
     </div>
   );
 }

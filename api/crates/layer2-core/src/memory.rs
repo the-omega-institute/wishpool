@@ -277,6 +277,15 @@ impl EndorsementStore for MemoryStores {
 
 #[async_trait]
 impl RecordStore for MemoryStores {
+    async fn for_submission(&self, id: &SubmissionId) -> CoreResult<Option<Record>> {
+        Ok(self
+            .records
+            .lock()
+            .await
+            .values()
+            .find(|r| &r.submission == id)
+            .cloned())
+    }
     async fn next_sequence(&self, year: i32) -> CoreResult<u64> {
         let mut sequences = self.sequences.lock().await;
         let next = sequences.entry(year).or_insert(0);
@@ -286,7 +295,9 @@ impl RecordStore for MemoryStores {
 
     async fn insert(&self, record: &Record) -> CoreResult<()> {
         let mut records = self.records.lock().await;
-        if records.contains_key(record.id.as_str()) {
+        if records.contains_key(record.id.as_str())
+            || records.values().any(|r| r.submission == record.submission)
+        {
             return Err(CoreError::conflict(format!("record {} exists", record.id)));
         }
         records.insert(record.id.0.clone(), record.clone());

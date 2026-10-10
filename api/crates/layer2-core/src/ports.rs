@@ -78,6 +78,7 @@ pub trait EndorsementStore: Send + Sync {
 
 #[async_trait]
 pub trait RecordStore: Send + Sync {
+    async fn for_submission(&self, id: &SubmissionId) -> CoreResult<Option<Record>>;
     async fn next_sequence(&self, year: i32) -> CoreResult<u64>;
     async fn insert(&self, record: &Record) -> CoreResult<()>;
     async fn get(&self, id: &RecordId) -> CoreResult<Option<Record>>;
@@ -130,6 +131,35 @@ pub enum JobKind {
     Stage(Stage),
     Compile,
     Referee,
+    LeanStatement,
+}
+
+/// A job together with the opaque lease token that fences its worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeasedJob {
+    pub submission: SubmissionId,
+    pub kind: JobKind,
+    pub attempts: u32,
+    /// Fences completion and renewal against a lease that has since been
+    /// re-issued to another worker.
+    pub lease: String,
+}
+
+/// Durable review-job lease operations. Implementations must match the lease
+/// token on every mutation; a stale worker may never renew or settle a job.
+#[async_trait]
+pub trait JobLease: Send + Sync {
+    /// Lease the oldest available job.
+    async fn claim(&self) -> CoreResult<Option<LeasedJob>>;
+    /// Renew the lease for another lease length. `false` means the token no
+    /// longer owns the job and the worker must discard any pending result.
+    async fn renew(&self, job: &LeasedJob) -> CoreResult<bool>;
+    async fn complete(&self, job: &LeasedJob) -> CoreResult<()>;
+    /// Release a waiting job without recording a failure or consuming an attempt.
+    async fn defer(&self, job: &LeasedJob, delay: std::time::Duration) -> CoreResult<()>;
+    /// Return the job for a later retry, or park it as failed after the
+    /// implementation's retry limit.
+    async fn retry(&self, job: &LeasedJob, error: &str) -> CoreResult<()>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -62,6 +62,7 @@ export function sourceHref(source: Source): string | null {
     case 'hexagon':
     case 'url':
       return safeHttpUrl(locator);
+    case 'named_work':
     case 'personal':
       return null;
   }
@@ -86,6 +87,9 @@ export function sourceLabel(source: Source): string {
       break;
     case 'hexagon':
       label = `Hexagon ${locator}`;
+      break;
+    case 'named_work':
+      label = locator;
       break;
     case 'personal':
       label = `Personal communication${locator ? `: ${locator}` : ''}`;

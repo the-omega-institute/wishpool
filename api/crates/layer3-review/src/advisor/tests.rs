@@ -2,11 +2,14 @@ use super::*;
 
 fn input() -> AdvisorInput {
     AdvisorInput {
+        kind: "paper".into(),
         title: "T".into(),
         abstract_text: "A".into(),
         authors: vec!["A. Author".into()],
         statements: vec![],
         referee: RefereeOut::default(),
+        audit: None,
+        decision: None,
         text: Some("paper".into()),
         source_dir: None,
         main_file: Some("main.tex".into()),
@@ -26,6 +29,17 @@ fn local_environment_is_an_allowlist() {
 
 #[test]
 fn prompts_carry_evidence_consent_and_letter_rules() {
+    let audit = referee_prompts::audit(&input());
+    for requirement in [
+        "not_checkable",
+        "Network access is disabled",
+        "./scratch",
+        "per confirmed statement",
+        "Never invent",
+        "full answer",
+    ] {
+        assert!(audit.contains(requirement), "{requirement}");
+    }
     let advice = referee_prompts::advice(&input());
     for requirement in [
         "./scratch",
@@ -37,7 +51,7 @@ fn prompts_carry_evidence_consent_and_letter_rules() {
     ] {
         assert!(advice.contains(requirement), "{requirement}");
     }
-    let letter = referee_prompts::letter(&input(), None, None);
+    let letter = referee_prompts::letter(&input(), None);
     for requirement in [
         "No process narration",
         "no links in the body",
@@ -80,9 +94,14 @@ printf '%s' '{"summary":"useful advice"}' > "$answer_path"
         program,
         model: Some("test".into()),
         timeout: Duration::from_secs(5),
+        audit_timeout: Duration::from_secs(10),
     };
     let mut input = input();
     input.source_dir = Some(source.clone());
+    assert_eq!(
+        advisor.audit(&input).await.unwrap().summary,
+        "useful advice"
+    );
     assert_eq!(
         advisor.advise(&input).await.unwrap().summary,
         "useful advice"
@@ -119,4 +138,40 @@ async fn chat_uses_source_text_and_shared_prompts() {
         Advisor::advise(&chat, &input()).await.unwrap().summary,
         "A written argument"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_uses_its_own_deadline_without_extending_advice_or_letters() {
+    use std::os::unix::fs::PermissionsExt;
+    let work = tempfile::tempdir().unwrap();
+    let program = work.path().join("fake-codex");
+    std::fs::write(
+        &program,
+        r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in -o) shift; answer_path="$1";; esac
+  shift
+done
+sleep 0.2
+printf '%s' '{}' > "$answer_path"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let advisor = CodexCli {
+        program,
+        model: None,
+        timeout: Duration::from_millis(25),
+        audit_timeout: Duration::from_secs(5),
+    };
+    assert!(advisor.audit(&input()).await.is_ok());
+    for error in [
+        advisor.advise(&input()).await.unwrap_err(),
+        advisor.draft_letter(&input(), None).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(error, ReviewError::Transport(ref reason) if reason == "advisor CLI timed out")
+        );
+    }
 }

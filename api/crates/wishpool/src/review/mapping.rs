@@ -318,10 +318,81 @@ pub(crate) fn confirmed_statements(claims: &[Claim]) -> Vec<Statement> {
         .collect()
 }
 
+fn conjecture_reading(
+    raw: wishpool_review::referee_prompts::ConjectureOut,
+    named: Option<&str>,
+) -> Option<wishpool_core::model::ConjectureReading> {
+    use wishpool_core::model::{ConjectureReading, ConjectureStatus};
+    let well_posed = raw.well_posed?;
+    for reason in [
+        &raw.well_posed_reason,
+        &raw.status_reason,
+        &raw.escape_reason,
+    ] {
+        if reason.trim().is_empty() || reason.chars().count() > 8_000 {
+            return None;
+        }
+    }
+    let mut status = match raw.status.as_str() {
+        "open" => ConjectureStatus::Open,
+        "known_true" => ConjectureStatus::KnownTrue,
+        "known_false" => ConjectureStatus::KnownFalse,
+        "special_case_of_known" => ConjectureStatus::SpecialCaseOfKnown,
+        "unclear" => ConjectureStatus::Unclear,
+        _ => return None,
+    };
+    if raw.named_works.len() > 20
+        || raw.named_works.iter().any(|w| {
+            w.trim().is_empty()
+                || w.chars().count() > 2_000
+                || named.is_some_and(|text| !text.contains(w.as_str()))
+        })
+    {
+        return None;
+    }
+    if named.is_some()
+        && matches!(
+            status,
+            ConjectureStatus::KnownTrue
+                | ConjectureStatus::KnownFalse
+                | ConjectureStatus::SpecialCaseOfKnown
+        )
+        && (raw.status_basis != "offline" || raw.status_evidence.trim().is_empty())
+    {
+        status = ConjectureStatus::Unclear;
+    }
+    let escape = match raw.escape.as_str() {
+        "content" => ProofShape::Content,
+        "bind_only" => ProofShape::BindOnly,
+        _ => return None,
+    };
+    if raw.suggestions.len() > 20 || raw.suggestions.iter().any(|s| s.chars().count() > 5_000) {
+        return None;
+    }
+    Some(ConjectureReading {
+        well_posed,
+        well_posed_reason: raw.well_posed_reason,
+        status,
+        status_reason: raw.status_reason,
+        named_works: raw.named_works,
+        escape,
+        escape_reason: raw.escape_reason,
+        suggestions: raw.suggestions,
+    })
+}
 pub(crate) fn referee(
     raw: wishpool_review::referee_prompts::RefereeOut,
     text: String,
     claims: &[Claim],
+) -> wishpool_core::model::RefereeReport {
+    referee_for_kind(raw, text, claims, false)
+}
+
+pub(crate) fn referee_for_kind(
+    raw: wishpool_review::referee_prompts::RefereeOut,
+    text: String,
+    claims: &[Claim],
+    conjecture: bool,
 ) -> wishpool_core::model::RefereeReport {
     use wishpool_core::model::{
         Recommendation, RefereeClaim, RefereeConcern, RefereeReport, Severity,
@@ -336,7 +407,7 @@ pub(crate) fn referee(
     let proved = |id: &str| {
         claims
             .iter()
-            .find(|c| c.id.as_str() == id && !c.kind.is_open())
+            .find(|c| c.id.as_str() == id && (!c.kind.is_open() || conjecture))
     };
     let mut limits = raw.limits;
     let mut readings = Vec::new();
@@ -346,6 +417,25 @@ pub(crate) fn referee(
             dropped_readings += 1;
             continue;
         };
+        if claim.kind.is_open() {
+            let Some(checked) = reading.conjecture.and_then(|r| conjecture_reading(r, None)) else {
+                dropped_readings += 1;
+                continue;
+            };
+            if readings.iter().any(|r: &RefereeClaim| r.claim == claim.id) {
+                dropped_readings += 1;
+                continue;
+            }
+            readings.push(RefereeClaim {
+                claim: claim.id.clone(),
+                shape: checked.escape,
+                witnesses: vec![],
+                known: None,
+                note: String::new(),
+                conjecture: Some(checked),
+            });
+            continue;
+        }
         let shape = match reading.shape.as_str() {
             "content" => ProofShape::Content,
             "bind_only" => ProofShape::BindOnly,
@@ -369,6 +459,7 @@ pub(crate) fn referee(
             continue;
         }
         let reading = RefereeClaim {
+            conjecture: None,
             claim: claim.id.clone(),
             shape,
             witnesses: witness,
@@ -435,6 +526,9 @@ pub(crate) fn referee(
 pub(crate) fn referee_judgement(
     reading: &wishpool_core::model::RefereeClaim,
 ) -> Option<ContributionOutput> {
+    if reading.conjecture.is_some() {
+        return None;
+    }
     let note = match &reading.known {
         Some(source) => format!(
             "{}\nKnown source (referee's report): {source}",
@@ -456,6 +550,208 @@ pub(crate) fn referee_judgement(
         .validate(TaskKind::JudgeEscape)
         .is_ok()
         .then_some(output)
+}
+
+/// Model output is untrusted: no invented ids, witnesses or citations.
+/// Missing/unusable statement readings become explicit not_checked readings.
+pub(crate) fn audit(
+    raw: wishpool_review::referee_prompts::AuditOut,
+    input: &wishpool_review::advisor::AdvisorInput,
+    claims: &[Claim],
+) -> wishpool_review::ReviewResult<wishpool_core::model::RefereeAudit> {
+    use wishpool_core::model::{
+        AuditedClaim, AuditedConcern, ConcernStatus, Correctness, Recommendation, RefereeAudit,
+    };
+    let verdict = match raw.verdict.as_str() {
+        "accept" => Recommendation::Accept,
+        "minor_revision" => Recommendation::MinorRevision,
+        "major_revision" => Recommendation::MajorRevision,
+        "reject" => Recommendation::Reject,
+        _ => {
+            return Err(wishpool_review::ReviewError::Output(
+                "unrecognised audit verdict".into(),
+            ));
+        }
+    };
+    if raw.summary.trim().is_empty() || raw.summary.chars().count() > 18_000 {
+        return Err(wishpool_review::ReviewError::Output(
+            "unusable audit summary".into(),
+        ));
+    }
+    let named = format!(
+        "{}\n{}",
+        serde_json::to_string(&input.referee).unwrap_or_default(),
+        input.text.as_deref().unwrap_or_default()
+    );
+    let mut dropped = 0;
+    let mut readings = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for r in raw.claims {
+        let Some(claim) = claims.iter().find(|c| c.id.as_str() == r.claim) else {
+            dropped += 1;
+            continue;
+        };
+        if !seen.insert(claim.id.clone()) {
+            readings.retain(|a: &AuditedClaim| a.claim != claim.id);
+            dropped += 1;
+            continue;
+        }
+        if r.comment.trim().is_empty() || r.comment.chars().count() > 8_000 {
+            dropped += 1;
+            continue;
+        }
+        if input.kind == "conjecture" && claim.kind.is_open() {
+            let Some(checked) = r
+                .conjecture
+                .and_then(|r| conjecture_reading(r, Some(&named)))
+            else {
+                dropped += 1;
+                continue;
+            };
+            readings.push(AuditedClaim {
+                claim: claim.id.clone(),
+                correctness: Correctness::NotChecked,
+                comment: r.comment,
+                shape: None,
+                witnesses: vec![],
+                known: None,
+                referee_agreed: r.referee_agreed,
+                conjecture: Some(checked),
+            });
+            continue;
+        }
+        let correctness = match r.correctness.as_str() {
+            "correct" if !claim.kind.is_open() => Correctness::Correct,
+            "gap" if !claim.kind.is_open() => Correctness::Gap,
+            "error" if !claim.kind.is_open() => Correctness::Error,
+            "not_checked" => Correctness::NotChecked,
+            _ => {
+                dropped += 1;
+                continue;
+            }
+        };
+        let shape = match r.shape.as_deref() {
+            None => None,
+            Some("content") if !claim.kind.is_open() => Some(ProofShape::Content),
+            Some("bind_only") if !claim.kind.is_open() => Some(ProofShape::BindOnly),
+            _ => {
+                dropped += 1;
+                continue;
+            }
+        };
+        let witnesses: Vec<String> = r
+            .witnesses
+            .into_iter()
+            .filter(|w| !w.trim().is_empty())
+            .collect();
+        if (correctness == Correctness::Correct && shape.is_none())
+            || (shape == Some(ProofShape::Content) && witnesses.is_empty())
+            || (shape != Some(ProofShape::Content) && !witnesses.is_empty())
+            || witnesses.len() > 20
+            || witnesses.iter().any(|w| w.chars().count() > 10_000)
+        {
+            dropped += 1;
+            continue;
+        }
+        let known = r.known.filter(|k| !k.trim().is_empty());
+        if known
+            .as_ref()
+            .is_some_and(|k| k.chars().count() > 2_000 || !named.contains(k.as_str()))
+        {
+            dropped += 1;
+            continue;
+        }
+        readings.push(AuditedClaim {
+            conjecture: None,
+            claim: claim.id.clone(),
+            correctness,
+            comment: r.comment,
+            shape,
+            witnesses,
+            known,
+            referee_agreed: r.referee_agreed,
+        });
+    }
+    let mut missing = 0;
+    for claim in claims {
+        if !readings.iter().any(|r| r.claim == claim.id) {
+            missing += 1;
+            readings.push(AuditedClaim {
+                conjecture: None,
+                claim: claim.id.clone(),
+                correctness: Correctness::NotChecked,
+                comment: "No usable source-based check was returned for this statement.".into(),
+                shape: None,
+                witnesses: vec![],
+                known: None,
+                referee_agreed: false,
+            });
+        }
+    }
+    let mut concerns = Vec::new();
+    for c in raw.concerns {
+        if c.concern.trim().is_empty()
+            || c.note.trim().is_empty()
+            || c.concern.chars().count() > 5_000
+            || c.note.chars().count() > 10_000
+        {
+            dropped += 1;
+            continue;
+        }
+        let status = match c.status.as_str() {
+            "confirmed" | "refuted" if c.basis == "offline" && !c.evidence.trim().is_empty() => {
+                // Attribution/search claims cannot be turned into offline evidence.
+                let text = format!("{} {}", c.concern, c.note).to_lowercase();
+                if [
+                    "oeis",
+                    "attribution",
+                    "doi",
+                    "citation",
+                    "published",
+                    "literature",
+                    "openalex",
+                    "arxiv",
+                ]
+                .iter()
+                .any(|word| text.contains(word))
+                {
+                    ConcernStatus::NotCheckable
+                } else if c.status == "confirmed" {
+                    ConcernStatus::Confirmed
+                } else {
+                    ConcernStatus::Refuted
+                }
+            }
+            "confirmed" | "refuted" | "not_checkable" => ConcernStatus::NotCheckable,
+            _ => {
+                dropped += 1;
+                continue;
+            }
+        };
+        concerns.push(AuditedConcern {
+            concern: c.concern,
+            status,
+            note: c.note,
+        });
+    }
+    let mut summary = raw.summary;
+    if missing > 0 {
+        summary.push_str(&format!(
+            " {missing} statements had no usable check and were marked not checked."
+        ));
+    }
+    if dropped > 0 {
+        summary.push_str(&format!(
+            " {dropped} unusable readings, concerns or unsupported sources were dropped."
+        ));
+    }
+    Ok(RefereeAudit {
+        verdict,
+        agrees_with_referee: raw.agrees_with_referee,
+        summary,
+        claims: readings,
+        concerns,
+    })
 }
 
 pub(crate) fn referee_out(
@@ -702,7 +998,7 @@ mod referee_tests {
         AdviceOut, ConcernOut, FormalizationOut, ImprovementOut, LetterOut, ReadingOut, RefereeOut,
     };
 
-    fn claims() -> Vec<Claim> {
+    pub(super) fn claims() -> Vec<Claim> {
         [ClaimKind::Theorem, ClaimKind::Conjecture]
             .into_iter()
             .enumerate()
@@ -896,6 +1192,7 @@ mod referee_fidelity_tests {
     #[test]
     fn referee_witness_and_rationale_are_not_truncated() {
         let reading = RefereeClaim {
+            conjecture: None,
             claim: "C1".into(),
             shape: ProofShape::Content,
             witnesses: vec!["x".repeat(1_500)],
@@ -912,5 +1209,255 @@ mod referee_fidelity_tests {
             ..reading
         };
         assert!(referee_judgement(&reading).is_none());
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use wishpool_core::model::{ConcernStatus, Correctness};
+    use wishpool_review::{
+        advisor::AdvisorInput,
+        referee_prompts::{AuditOut, AuditedClaimOut, AuditedConcernOut, RefereeOut},
+    };
+
+    #[test]
+    fn audit_drops_invented_sources_ids_and_witnesses_and_marks_offline_limits() {
+        let claims = super::referee_tests::claims();
+        let input = AdvisorInput {
+            kind: "paper".into(),
+            title: "Paper".into(),
+            abstract_text: String::new(),
+            authors: vec![],
+            statements: confirmed_statements(&claims),
+            referee: RefereeOut {
+                text: "A named earlier work".into(),
+                ..Default::default()
+            },
+            text: Some("The paper cites A source in the paper.".into()),
+            source_dir: None,
+            main_file: None,
+            audit: None,
+            decision: None,
+        };
+        let out = AuditOut {
+            verdict: "accept".into(),
+            summary: "A source-based check.".into(),
+            claims: vec![
+                AuditedClaimOut {
+                    claim: "C1".into(),
+                    correctness: "correct".into(),
+                    comment: "A check.".into(),
+                    shape: Some("content".into()),
+                    witnesses: vec!["An explicit new intermediate identity".into()],
+                    known: Some("Invented paper".into()),
+                    ..Default::default()
+                },
+                AuditedClaimOut {
+                    claim: "C2".into(),
+                    correctness: "correct".into(),
+                    comment: "No witness.".into(),
+                    shape: Some("content".into()),
+                    ..Default::default()
+                },
+                AuditedClaimOut {
+                    claim: "C99".into(),
+                    correctness: "correct".into(),
+                    ..Default::default()
+                },
+            ],
+            concerns: vec![
+                AuditedConcernOut {
+                    concern: "The OEIS attribution is correct".into(),
+                    status: "confirmed".into(),
+                    note: "Attribution claimed in the report".into(),
+                    evidence: "Read the referee".into(),
+                    basis: "offline".into(),
+                },
+                AuditedConcernOut {
+                    concern: "The base case is wrong".into(),
+                    status: "refuted".into(),
+                    note: "At n = 1 both sides are 1".into(),
+                    evidence: "Substituting 1 yields 1 = 1".into(),
+                    basis: "offline".into(),
+                },
+                AuditedConcernOut {
+                    concern: "Missing proof".into(),
+                    status: "confirmed".into(),
+                    note: "Not checked".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let result = audit(out, &input, &claims).unwrap();
+        assert_eq!(result.claims.len(), claims.len());
+        assert!(result.claims[0].known.is_none());
+        assert_eq!(result.claims[1].correctness, Correctness::NotChecked);
+        assert!(result.claims[1].witnesses.is_empty());
+        assert!(result.summary.contains("dropped"));
+        assert_eq!(result.concerns[0].status, ConcernStatus::NotCheckable);
+        assert_eq!(result.concerns[1].status, ConcernStatus::Refuted);
+        assert_eq!(result.concerns[2].status, ConcernStatus::NotCheckable);
+        let named = AuditOut {
+            verdict: "reject".into(),
+            summary: "Known main result.".into(),
+            claims: vec![AuditedClaimOut {
+                claim: "C1".into(),
+                correctness: "correct".into(),
+                comment: "An instantiation of the named work.".into(),
+                shape: Some("bind_only".into()),
+                known: Some("A named earlier work".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            audit(named, &input, &claims).unwrap().claims[0]
+                .known
+                .as_deref(),
+            Some("A named earlier work")
+        );
+        assert!(
+            audit(
+                AuditOut {
+                    verdict: "made_up".into(),
+                    ..Default::default()
+                },
+                &input,
+                &claims
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod conjecture_tests {
+    use super::*;
+    use wishpool_core::model::{AuditedClaim, ConjectureStatus, RefereeAudit};
+    use wishpool_review::{
+        advisor::AdvisorInput,
+        referee_prompts::{AuditOut, AuditedClaimOut, ConjectureOut, ReadingOut, RefereeOut},
+    };
+
+    fn reading() -> ConjectureOut {
+        ConjectureOut {
+            well_posed: Some(true),
+            well_posed_reason: "Symbols and quantifiers are defined.".into(),
+            status: "open".into(),
+            status_reason: "No solution in the supplied material.".into(),
+            escape: "content".into(),
+            escape_reason: "Would require a new estimate.".into(),
+            named_works: vec!["Named source".into()],
+            ..Default::default()
+        }
+    }
+
+    fn target(result: RefereeAudit) -> AuditedClaim {
+        result
+            .claims
+            .into_iter()
+            .find(|c| c.claim.as_str() == "C2")
+            .unwrap()
+    }
+
+    #[test]
+    fn conjecture_audit_requires_source_identity_and_offline_known_status_evidence() {
+        let claims = super::referee_tests::claims();
+        let input = AdvisorInput {
+            kind: "conjecture".into(),
+            title: "Question".into(),
+            abstract_text: String::new(),
+            authors: vec![],
+            statements: confirmed_statements(&claims),
+            referee: RefereeOut::default(),
+            text: Some("Named source states a particular case.".into()),
+            source_dir: None,
+            main_file: None,
+            audit: None,
+            decision: None,
+        };
+        let check = |conjecture: ConjectureOut| {
+            audit(
+                AuditOut {
+                    verdict: "accept".into(),
+                    summary: "Checked source.".into(),
+                    claims: vec![AuditedClaimOut {
+                        claim: "C2".into(),
+                        comment: "A source-based reading.".into(),
+                        conjecture: Some(conjecture),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                &input,
+                &claims,
+            )
+            .unwrap()
+        };
+        let open = check(reading());
+        assert!(target(open).conjecture.as_ref().unwrap().displayable());
+        let mut external = reading();
+        external.status = "known_true".into();
+        external.status_basis = "external".into();
+        external.status_evidence = "Referee attribution.".into();
+        assert_eq!(
+            target(check(external.clone()))
+                .conjecture
+                .as_ref()
+                .unwrap()
+                .status,
+            ConjectureStatus::Unclear
+        );
+        external.status_basis = "offline".into();
+        external.status_evidence = "The source's stated theorem specializes verbatim.".into();
+        assert_eq!(
+            target(check(external)).conjecture.as_ref().unwrap().status,
+            ConjectureStatus::KnownTrue
+        );
+        let mut invented = reading();
+        invented.named_works = vec!["Invented source".into()];
+        let invalid = check(invented);
+        assert!(target(invalid.clone()).conjecture.is_none());
+        assert!(invalid.summary.contains("dropped"));
+        for bad in ["made_up", "OPEN"] {
+            let mut invalid = reading();
+            invalid.status = bad.into();
+            assert!(target(check(invalid)).conjecture.is_none());
+        }
+        let claim = AuditedClaimOut {
+            claim: "C2".into(),
+            comment: "Checked.".into(),
+            conjecture: Some(reading()),
+            ..Default::default()
+        };
+        let duplicate = audit(
+            AuditOut {
+                verdict: "accept".into(),
+                summary: "Duplicate readings.".into(),
+                claims: vec![claim.clone(), claim],
+                ..Default::default()
+            },
+            &input,
+            &claims,
+        )
+        .unwrap();
+        assert!(target(duplicate).conjecture.is_none());
+        let report = referee_for_kind(
+            RefereeOut {
+                claims: vec![ReadingOut {
+                    claim: "C99".into(),
+                    conjecture: Some(reading()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            "Raw answer".into(),
+            &claims,
+            true,
+        );
+        assert!(report.claims.is_empty());
+        assert!(!report.limits.is_empty());
     }
 }

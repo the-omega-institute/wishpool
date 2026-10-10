@@ -15,7 +15,7 @@ use axum::{
     response::Response,
 };
 use wishpool_core::{CoreError, ids::PersonId, model::VerifiedIdentity};
-use wishpool_public::{AuthenticatedCaller, problem_response};
+use wishpool_public::{AuthenticatedCaller, RequestAuthentication, problem_response};
 
 use super::{AuthState, Provider, SESSION_COOKIE, cookies, digest, flow::SESSION_DOMAIN};
 
@@ -54,6 +54,11 @@ pub async fn authenticate(
     next: Next,
 ) -> Response {
     let headers = request.headers();
+    let method = if bearer(headers).is_some() {
+        wishpool_core::model::AuthenticationMethod::Bearer
+    } else {
+        wishpool_core::model::AuthenticationMethod::CookieSession
+    };
     let identity = if let Some(token) = bearer(headers) {
         let verified = match &state.provider {
             Provider::NyxId(client) => client.verify_access_token(token).await,
@@ -105,6 +110,9 @@ pub async fn authenticate(
         match state.app.caller(&identity).await {
             Ok(caller) => {
                 request.extensions_mut().insert(AuthenticatedCaller(caller));
+                request
+                    .extensions_mut()
+                    .insert(RequestAuthentication(method));
             }
             Err(error) => return refuse(StatusCode::SERVICE_UNAVAILABLE, error),
         }

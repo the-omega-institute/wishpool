@@ -6,6 +6,7 @@ import type {
   RefereeFile,
   RefereeReport,
   RefereeRound,
+  RefereeAudit,
 } from '../api/types';
 import { editor, submission } from './fixtures';
 
@@ -34,6 +35,37 @@ export const refereeReport: RefereeReport = {
   ],
   limits: ['The referee did not check every literature source.'],
   text: 'Full answer: the map $\\rep$ acts on $\\code{ab}$.',
+};
+
+export const refereeAudit: RefereeAudit = {
+  verdict: 'minor_revision',
+  agrees_with_referee: true,
+  summary: 'The induction argument is correct and contains a new estimate.',
+  claims: [
+    {
+      claim: 'C1',
+      correctness: 'correct',
+      comment: 'The boundary calculation verifies the induction.',
+      shape: 'content',
+      witnesses: ['The intermediate identity.'],
+      referee_agreed: true,
+    },
+    {
+      claim: 'C2',
+      correctness: 'correct',
+      comment: 'This follows by monotonicity.',
+      shape: 'bind_only',
+      witnesses: [],
+      referee_agreed: true,
+    },
+  ],
+  concerns: [
+    {
+      concern: 'Check the attribution.',
+      status: 'not_checkable',
+      note: 'Please check the cited source.',
+    },
+  ],
 };
 
 export const refereeAdvice: Advice = {
@@ -103,7 +135,7 @@ export const formalProbe: FormalProbe = {
   ],
 };
 
-export const refereeRound: RefereeRound = {
+export const refereeRound = {
   number: 1,
   version: 1,
   claims_revision: submission.claims_revision,
@@ -113,6 +145,12 @@ export const refereeRound: RefereeRound = {
     model: 'ChatGPT Pro',
     attempts: 1,
     state: { state: 'done', result: refereeReport, at: '2026-10-08T10:00:00Z' },
+  },
+  audit: {
+    engine: 'codex-cli',
+    model: 'gpt-6',
+    attempts: 1,
+    state: { state: 'done', result: refereeAudit, at: '2026-10-08T10:30:00Z' },
   },
   advice: {
     engine: 'Codex',
@@ -132,7 +170,7 @@ export const refereeRound: RefereeRound = {
     attempts: 1,
     state: { state: 'done', result: letterDraft, at: '2026-10-08T11:30:00Z' },
   },
-};
+} satisfies RefereeRound;
 
 export function refereeFile(extra: Partial<RefereeFile> = {}): RefereeFile {
   return { id: submission.id, rounds: [refereeRound], letters: [], revision: 1, ...extra };
@@ -144,6 +182,7 @@ export const queuedRound: RefereeRound = {
     ...refereeRound.referee,
     state: { state: 'running', queue_position: 7, since: refereeRound.started_at },
   },
+  audit: { attempts: 0, state: { state: 'pending' } },
   advice: { attempts: 0, state: { state: 'pending' } },
   formal: { attempts: 0, state: { state: 'pending' } },
   letter: { attempts: 0, state: { state: 'pending' } },

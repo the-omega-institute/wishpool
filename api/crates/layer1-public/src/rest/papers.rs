@@ -31,6 +31,10 @@ pub(super) fn routes() -> Router<Arc<App>> {
         .route("/submissions/{id}", get(get_submission))
         .route("/submissions/{id}/claims", post(confirm_claims))
         .route(
+            "/submissions/{id}/lean-statement/response",
+            post(respond_lean_statement),
+        )
+        .route(
             "/submissions/{id}/versions",
             post(upload_version).layer(upload_limit),
         )
@@ -40,6 +44,7 @@ pub(super) fn routes() -> Router<Arc<App>> {
         .route("/submissions/{id}/analysis", get(analysis))
         .route("/submissions/{id}/files/{kind}", get(file))
         .route("/papers", get(list_papers))
+        .route("/conjectures", get(list_conjectures))
         .route("/papers/{id}", get(paper))
 }
 
@@ -95,7 +100,10 @@ async fn submit(
     })?;
     let new: NewPaper = serde_json::from_str(&metadata)
         .map_err(|e| Problem(CoreError::Invalid(format!("metadata: {e}"))))?;
-    let source = form.source.ok_or_else(missing_source)?;
+    let source = form.source.unwrap_or(Upload {
+        filename: String::new(),
+        bytes: vec![],
+    });
     Ok((
         StatusCode::CREATED,
         Json(app.submit_paper(&caller, new, source).await?),
@@ -288,4 +296,39 @@ async fn list_papers(
 
 async fn paper(State(app): AppState, Path(id): Path<String>) -> ApiResult<impl IntoResponse> {
     Ok(Json(app.paper(&RecordId(id)).await?))
+}
+
+async fn list_conjectures(
+    State(app): AppState,
+    Query(q): Query<PageQuery>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(app.list_conjectures(q.limit, q.before).await?))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeanStatementBody {
+    digest: String,
+    confirm: bool,
+    #[serde(default)]
+    comment: String,
+}
+async fn respond_lean_statement(
+    State(app): AppState,
+    AuthenticatedCaller(caller): AuthenticatedCaller,
+    crate::auth::RequestAuthentication(authentication): crate::auth::RequestAuthentication,
+    Path(id): Path<String>,
+    Body(body): Body<LeanStatementBody>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(
+        app.respond_lean_statement(
+            &caller,
+            authentication,
+            &SubmissionId(id),
+            &body.digest,
+            body.confirm,
+            body.comment,
+        )
+        .await?,
+    ))
 }

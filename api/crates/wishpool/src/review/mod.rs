@@ -106,32 +106,16 @@ fn is_same_paper(work: &wishpool_review::openalex::Work, paper: &SearchedPaper<'
 
 pub const MAX_ATTEMPTS: u32 = 3;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeasedJob {
-    pub submission: SubmissionId,
-    pub kind: JobKind,
-    pub attempts: u32,
-    /// Fences completion against a lease that has since been re-issued.
-    pub lease: String,
-}
-
-#[async_trait]
-pub trait JobLease: Send + Sync {
-    /// Lease the oldest available job.
-    async fn claim(&self) -> CoreResult<Option<LeasedJob>>;
-    async fn complete(&self, job: &LeasedJob) -> CoreResult<()>;
-    /// Release a waiting job without recording a failure or consuming an attempt.
-    async fn defer(&self, job: &LeasedJob, delay: std::time::Duration) -> CoreResult<()>;
-    /// Return the job for a later retry, or park it as failed after
-    /// [`MAX_ATTEMPTS`].
-    async fn retry(&self, job: &LeasedJob, error: &str) -> CoreResult<()>;
-}
+// Keep the old module paths available to the binary and its tests while the
+// port itself lives with the other Layer 2 ports.
+pub use wishpool_core::ports::{JobLease, LeasedJob};
 
 /// The stored form of a job kind: `compile` or `stage:<stage>`.
 pub fn kind_key(kind: JobKind) -> String {
     match kind {
         JobKind::Compile => "compile".to_owned(),
         JobKind::Referee => "referee".to_owned(),
+        JobKind::LeanStatement => "lean_statement".to_owned(),
         JobKind::Stage(stage) => format!(
             "stage:{}",
             serde_json::to_value(stage)
@@ -143,6 +127,9 @@ pub fn kind_key(kind: JobKind) -> String {
 }
 
 pub fn parse_kind_key(key: &str) -> Option<JobKind> {
+    if key == "lean_statement" {
+        return Some(JobKind::LeanStatement);
+    }
     if key == "referee" {
         return Some(JobKind::Referee);
     }
@@ -156,53 +143,155 @@ pub fn parse_kind_key(key: &str) -> Option<JobKind> {
     Some(JobKind::Stage(stage))
 }
 
-/// Memory-mode job source over the core memory stores.
+/// Memory-mode job source over the core memory stores. Retains live and waiting
+/// jobs so renewal, expiry and stale-token fencing match the durable store.
 pub struct MemoryJobs {
     pub stores: std::sync::Arc<wishpool_core::memory::MemoryStores>,
-    deferred: tokio::sync::Mutex<Vec<(tokio::time::Instant, LeasedJob)>>,
+    jobs: tokio::sync::Mutex<std::collections::BTreeMap<String, MemoryJob>>,
+}
+
+const MEMORY_LEASE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+struct MemoryJob {
+    job: LeasedJob,
+    state: MemoryJobState,
+}
+
+enum MemoryJobState {
+    Queued(tokio::time::Instant),
+    Leased(tokio::time::Instant),
+    Failed,
+}
+
+impl MemoryJob {
+    fn owns(&self, job: &LeasedJob) -> bool {
+        self.job.lease == job.lease
+            && matches!(self.state, MemoryJobState::Leased(until) if until > tokio::time::Instant::now())
+    }
+}
+
+fn memory_job_key(submission: &SubmissionId, kind: JobKind) -> String {
+    format!("{submission}:{}", kind_key(kind))
 }
 
 impl MemoryJobs {
     pub fn new(stores: std::sync::Arc<wishpool_core::memory::MemoryStores>) -> Self {
         Self {
             stores,
-            deferred: Default::default(),
+            jobs: Default::default(),
         }
+    }
+
+    #[cfg(test)]
+    async fn current(&self, submission: &SubmissionId, kind: JobKind) -> Option<LeasedJob> {
+        self.jobs
+            .lock()
+            .await
+            .get(&memory_job_key(submission, kind))
+            .filter(|entry| entry.owns(&entry.job))
+            .map(|entry| entry.job.clone())
     }
 }
 
 #[async_trait]
 impl JobLease for MemoryJobs {
     async fn claim(&self) -> CoreResult<Option<LeasedJob>> {
-        let mut deferred = self.deferred.lock().await;
-        if let Some(index) = deferred
-            .iter()
-            .position(|(at, _)| *at <= tokio::time::Instant::now())
-        {
-            return Ok(Some(deferred.remove(index).1));
+        let now = tokio::time::Instant::now();
+        let mut jobs = self.jobs.lock().await;
+        // Admission still goes through the Layer 2 queue. As in Mongo, an
+        // enqueue preserves in-flight work and resets other jobs for replay.
+        while let Some(job) = self.stores.take_job().await {
+            let key = memory_job_key(&job.submission, job.kind);
+            if jobs
+                .get(&key)
+                .is_some_and(|entry| matches!(entry.state, MemoryJobState::Leased(_)))
+            {
+                continue;
+            }
+            jobs.insert(
+                key,
+                MemoryJob {
+                    job: LeasedJob {
+                        submission: job.submission,
+                        kind: job.kind,
+                        attempts: 0,
+                        lease: String::new(),
+                    },
+                    state: MemoryJobState::Queued(now),
+                },
+            );
         }
-        Ok(self.stores.take_job().await.map(|job| LeasedJob {
-            submission: job.submission,
-            kind: job.kind,
-            attempts: 1,
-            lease: String::new(),
-        }))
+        let available = jobs
+            .iter()
+            .filter_map(|(key, entry)| match entry.state {
+                MemoryJobState::Queued(at) | MemoryJobState::Leased(at) if at <= now => {
+                    Some((key.clone(), at))
+                }
+                _ => None,
+            })
+            .min_by_key(|(_, at)| *at)
+            .map(|(key, _)| key);
+        let Some(key) = available else {
+            return Ok(None);
+        };
+        let entry = jobs.get_mut(&key).expect("available job exists");
+        entry.job.attempts += 1;
+        entry.job.lease = crate::auth::random_token();
+        entry.state = MemoryJobState::Leased(now + MEMORY_LEASE);
+        Ok(Some(entry.job.clone()))
     }
 
-    async fn complete(&self, _job: &LeasedJob) -> CoreResult<()> {
+    async fn renew(&self, job: &LeasedJob) -> CoreResult<bool> {
+        let mut jobs = self.jobs.lock().await;
+        let Some(entry) = jobs.get_mut(&memory_job_key(&job.submission, job.kind)) else {
+            return Ok(false);
+        };
+        if !entry.owns(job) {
+            return Ok(false);
+        }
+        entry.state = MemoryJobState::Leased(tokio::time::Instant::now() + MEMORY_LEASE);
+        Ok(true)
+    }
+
+    async fn complete(&self, job: &LeasedJob) -> CoreResult<()> {
+        let mut jobs = self.jobs.lock().await;
+        let key = memory_job_key(&job.submission, job.kind);
+        if jobs.get(&key).is_some_and(|entry| entry.owns(job)) {
+            jobs.remove(&key);
+        }
         Ok(())
     }
 
     async fn defer(&self, job: &LeasedJob, delay: std::time::Duration) -> CoreResult<()> {
-        self.deferred
-            .lock()
-            .await
-            .push((tokio::time::Instant::now() + delay, job.clone()));
+        let mut jobs = self.jobs.lock().await;
+        if let Some(entry) = jobs
+            .get_mut(&memory_job_key(&job.submission, job.kind))
+            .filter(|entry| entry.owns(job))
+        {
+            entry.state = MemoryJobState::Queued(tokio::time::Instant::now() + delay);
+            entry.job.attempts -= 1;
+            entry.job.lease.clear();
+        }
         Ok(())
     }
 
     async fn retry(&self, job: &LeasedJob, error: &str) -> CoreResult<()> {
-        tracing::warn!(submission = %job.submission, kind = kind_key(job.kind), error, "memory-mode job dropped after failure");
+        let mut jobs = self.jobs.lock().await;
+        if let Some(entry) = jobs
+            .get_mut(&memory_job_key(&job.submission, job.kind))
+            .filter(|entry| entry.owns(job))
+        {
+            entry.state = if job.attempts >= MAX_ATTEMPTS {
+                MemoryJobState::Failed
+            } else {
+                MemoryJobState::Queued(
+                    tokio::time::Instant::now()
+                        + std::time::Duration::from_secs(30 * u64::from(job.attempts)),
+                )
+            };
+            entry.job.lease.clear();
+            tracing::warn!(submission = %job.submission, kind = kind_key(job.kind), error, "memory-mode job failed");
+        }
         Ok(())
     }
 }
@@ -324,7 +413,7 @@ mod defer_tests {
     use std::{sync::Arc, time::Duration};
     use wishpool_core::{memory::MemoryStores, ports::ReviewQueue};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn memory_deferral_preserves_attempts_and_releases_worker() {
         let stores = Arc::new(MemoryStores::default());
         let jobs = MemoryJobs::new(stores.clone());
@@ -343,7 +432,57 @@ mod defer_tests {
             jobs.claim().await.unwrap().unwrap().submission.as_str(),
             "other"
         );
-        jobs.defer(&job, Duration::ZERO).await.unwrap();
+        tokio::time::advance(Duration::from_secs(60)).await;
         assert_eq!(jobs.claim().await.unwrap().unwrap().attempts, job.attempts);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn memory_renewal_extends_lease_and_fences_expired_workers() {
+        let stores = Arc::new(MemoryStores::default());
+        let jobs = MemoryJobs::new(stores.clone());
+        stores
+            .enqueue(&"paper".into(), JobKind::Referee)
+            .await
+            .unwrap();
+        let first = jobs.claim().await.unwrap().unwrap();
+        tokio::time::advance(Duration::from_secs(25 * 60)).await;
+        assert!(jobs.renew(&first).await.unwrap());
+        tokio::time::advance(Duration::from_secs(10 * 60)).await;
+        assert!(jobs.claim().await.unwrap().is_none());
+        tokio::time::advance(Duration::from_secs(21 * 60)).await;
+        assert!(
+            !jobs.renew(&first).await.unwrap(),
+            "an expired token cannot revive its lease"
+        );
+        let second = jobs.claim().await.unwrap().unwrap();
+        assert_eq!(second.attempts, 2);
+        assert_ne!(first.lease, second.lease);
+        assert!(!jobs.renew(&first).await.unwrap());
+        jobs.complete(&first).await.unwrap();
+        jobs.defer(&first, Duration::ZERO).await.unwrap();
+        jobs.retry(&first, "stale").await.unwrap();
+        assert!(jobs.renew(&second).await.unwrap());
+        assert!(jobs.claim().await.unwrap().is_none());
+        jobs.complete(&second).await.unwrap();
+        assert!(!jobs.renew(&second).await.unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn memory_retries_keep_existing_job_attempt_limit() {
+        let stores = Arc::new(MemoryStores::default());
+        let jobs = MemoryJobs::new(stores.clone());
+        stores
+            .enqueue(&"paper".into(), JobKind::Referee)
+            .await
+            .unwrap();
+        for attempt in 1..=MAX_ATTEMPTS {
+            let job = jobs.claim().await.unwrap().unwrap();
+            assert_eq!(job.attempts, attempt);
+            jobs.retry(&job, "transport timeout").await.unwrap();
+            assert!(!jobs.renew(&job).await.unwrap());
+            assert!(jobs.claim().await.unwrap().is_none());
+            tokio::time::advance(Duration::from_secs(30 * u64::from(attempt))).await;
+        }
+        assert!(jobs.claim().await.unwrap().is_none());
     }
 }

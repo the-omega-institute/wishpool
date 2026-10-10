@@ -65,9 +65,27 @@ pub enum RejectReason {
     BindOnly,
     /// The paper states no proved main result.
     NoMainResult,
+    Conjecture {
+        detail: String,
+    },
     OutOfScope {
         detail: String,
     },
+}
+
+impl RejectReason {
+    pub fn author_text(&self) -> String {
+        match self {
+            Self::KnownResult { claim, prior } => {
+                format!("Statement {claim} already follows from {}.", prior.locator)
+            }
+            Self::BindOnly => "No checked main result carries new mathematical content.".into(),
+            Self::NoMainResult => "The paper has no proved main result.".into(),
+            Self::Hygiene { detail }
+            | Self::OutOfScope { detail }
+            | Self::Conjecture { detail } => detail.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

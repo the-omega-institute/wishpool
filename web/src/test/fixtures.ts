@@ -193,6 +193,8 @@ export const reports: StageReport[] = [
 ];
 
 export const submission: Submission = {
+  kind: 'paper',
+  lean_statements: [],
   id: 'sub-1',
   submitter: author.id,
   title: 'On sums of integers',
@@ -317,6 +319,7 @@ export const analysis: PaperAnalysis = {
 };
 
 export const paperSummary: PaperSummary = {
+  kind: 'paper',
   record: 'WP-2026-0001',
   submission: 'sub-acc',
   title: 'On sums of integers',
@@ -332,16 +335,14 @@ export const paperSummary: PaperSummary = {
 
 export const publicPaper: PublicPaper = {
   summary: paperSummary,
-  ai_disclosure: { level: 'assisted', statement: 'A model checked the algebra.' },
-  versions: [
-    { number: 1, uploaded_at: '2026-10-01T12:00:00Z', has_pdf: true, note: 'Initial upload' },
-  ],
+  versions: [{ number: 1, uploaded_at: '2026-10-01T12:00:00Z', has_pdf: true }],
   claims: [
     {
       id: 'C1',
       kind: 'theorem',
       role: 'main',
       label: 'Theorem 1.1',
+      depends_on: [],
       statement: 'For every $n \\ge 1$ we have $\\sum_{k=1}^n k = n(n+1)/2$.',
       lean: {
         repository: 'https://github.com/ada/sums-lean',
@@ -354,12 +355,13 @@ export const publicPaper: PublicPaper = {
       kind: 'conjecture',
       role: 'supporting',
       label: 'Conjecture 4.1',
+      depends_on: [],
       statement: 'There are infinitely many twin primes.',
     },
   ],
   formalization_repository: 'https://github.com/ada/sums-lean',
   macros: {},
-  conjectures: [],
+  new_content: [],
 };
 
 export const task: Task = {

@@ -65,12 +65,13 @@ export function Header() {
             label="Papers"
             active={k === 'papers' || k === 'paper'}
           />
+          <NavLink to={{ kind: 'conjectures' }} label="Conjectures" active={k === 'conjectures'} />
           <NavLink to={{ kind: 'policy' }} label="Policy" active={k === 'policy'} />
           <NavLink to={{ kind: 'submit' }} label="Submit" active={k === 'submit'} />
           {person ? (
             <NavLink
               to={{ kind: 'submissions' }}
-              label="My papers"
+              label="My work"
               active={k === 'submissions' || (k === 'submission' && !staff)}
             />
           ) : null}

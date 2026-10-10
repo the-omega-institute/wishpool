@@ -38,6 +38,49 @@ const ENV_REWRITE: { [env: string]: string } = {
 
 type Segment = { kind: 'text'; text: string } | { kind: 'math'; display: boolean; tex: string };
 
+/** Read a complete math span without splitting any surrounding text-command argument. */
+function readMath(
+  src: string,
+  start: number,
+): { segment: Extract<Segment, { kind: 'math' }>; end: number } | null {
+  const rest = src.slice(start);
+  const delims: [string, string, boolean][] = [
+    ['$$', '$$', true],
+    ['\\[', '\\]', true],
+    ['\\(', '\\)', false],
+    ['$', '$', false],
+  ];
+  const delim = delims.find(([open]) => rest.startsWith(open));
+  if (delim) {
+    const [open, close, display] = delim;
+    const end = findClose(src, start + open.length, close);
+    if (end >= 0) {
+      return {
+        segment: { kind: 'math', display, tex: src.slice(start + open.length, end) },
+        end: end + close.length,
+      };
+    }
+  }
+  const env = /^\\begin\{([A-Za-z*]+)\}/.exec(rest);
+  if (env && env[1] !== undefined && DISPLAY_ENVS.has(env[1])) {
+    const name = env[1];
+    const closeTag = `\\end{${name}}`;
+    const end = src.indexOf(closeTag, start + env[0].length);
+    if (end >= 0) {
+      const body = src.slice(start + env[0].length, end);
+      const tex =
+        name === 'equation' || name === 'equation*' || name === 'displaymath' || name === 'math'
+          ? body
+          : `\\begin{${ENV_REWRITE[name] ?? name}}${body}\\end{${ENV_REWRITE[name] ?? name}}`;
+      return {
+        segment: { kind: 'math', display: name !== 'math', tex },
+        end: end + closeTag.length,
+      };
+    }
+  }
+  return null;
+}
+
 /** Drop `%` comments (an unescaped `%` to the end of the line). */
 export function stripComments(src: string): string {
   return src
@@ -89,47 +132,12 @@ export function splitMath(src: string): Segment[] {
       i += 2;
       continue;
     }
-    const delims: [string, string, boolean][] = [
-      ['$$', '$$', true],
-      ['\\[', '\\]', true],
-      ['\\(', '\\)', false],
-      ['$', '$', false],
-    ];
-    const delim = delims.find(([open]) => rest.startsWith(open));
-    if (delim) {
-      const [open, close, display] = delim;
-      const end = findClose(src, i + open.length, close);
-      if (end >= 0) {
-        flush();
-        out.push({ kind: 'math', display, tex: src.slice(i + open.length, end) });
-        i = end + close.length;
-        continue;
-      }
-    }
-    const env = /^\\begin\{([A-Za-z*]+)\}/.exec(rest);
-    if (env && env[1] !== undefined && DISPLAY_ENVS.has(env[1])) {
-      const name = env[1];
-      const closeTag = `\\end{${name}}`;
-      const end = src.indexOf(closeTag, i + env[0].length);
-      if (end >= 0) {
-        flush();
-        const body = src.slice(i + env[0].length, end);
-        let tex: string;
-        if (
-          name === 'equation' ||
-          name === 'equation*' ||
-          name === 'displaymath' ||
-          name === 'math'
-        ) {
-          tex = body;
-        } else {
-          const target = ENV_REWRITE[name] ?? name;
-          tex = `\\begin{${target}}${body}\\end{${target}}`;
-        }
-        out.push({ kind: 'math', display: name !== 'math', tex });
-        i = end + closeTag.length;
-        continue;
-      }
+    const math = readMath(src, i);
+    if (math) {
+      flush();
+      out.push(math.segment);
+      i = math.end;
+      continue;
     }
     text += src[i];
     i += 1;
@@ -182,12 +190,19 @@ const WRAPPERS: { [command: string]: [string, string] } = {
   underline: ['', ''],
 };
 
-/** Rewrite one text segment (no math in it) to Markdown. */
-function textToMarkdown(src: string): string {
+/** Parse text-command groups before rendering the math spans inside them. */
+function fragmentToMarkdown(src: string): string {
   let out = '';
   let i = 0;
   while (i < src.length) {
     const c = src[i] as string;
+    const math = c === '$' || c === '\\' ? readMath(src, i) : null;
+    if (math) {
+      const { display, tex } = math.segment;
+      out += display ? `\n\n$$\n${cleanMath(tex)}\n$$\n\n` : `$${cleanMath(tex)}$`;
+      i = math.end;
+      continue;
+    }
     if (c === '\\') {
       const cmd = /^\\([A-Za-z]+)\*?\s*/.exec(src.slice(i));
       if (cmd && cmd[1] !== undefined) {
@@ -220,7 +235,7 @@ function textToMarkdown(src: string): string {
         if (wrapper) {
           const arg = readArg();
           if (arg !== null) {
-            out += `${wrapper[0]}${textToMarkdown(arg)}${wrapper[1]}`;
+            out += `${wrapper[0]}${fragmentToMarkdown(arg)}${wrapper[1]}`;
             i = j;
             continue;
           }
@@ -228,7 +243,9 @@ function textToMarkdown(src: string): string {
         if (name === 'texttt' || name === 'url') {
           const arg = readArg();
           if (arg !== null) {
-            out += `\`${arg}\``;
+            // Markdown code spans cannot contain rendered math or emphasis.
+            // Unwrap styled/mathematical texttt arguments so both still render.
+            out += name === 'texttt' && /[\\$]/.test(arg) ? fragmentToMarkdown(arg) : `\`${arg}\``;
             i = j;
             continue;
           }
@@ -238,8 +255,8 @@ function textToMarkdown(src: string): string {
           const label = url === null ? null : readArg();
           if (url !== null && label !== null) {
             out += /^https?:\/\//.test(url)
-              ? `[${textToMarkdown(label)}](${url})`
-              : textToMarkdown(label);
+              ? `[${fragmentToMarkdown(label)}](${url})`
+              : fragmentToMarkdown(label);
             i = j;
             continue;
           }
@@ -369,13 +386,7 @@ function textToMarkdown(src: string): string {
 
 /** Rewrite a LaTeX statement into Markdown with `$…$` / `$$…$$` math for KaTeX. */
 export function latexToMarkdown(src: string): string {
-  const segments = splitMath(stripComments(src));
-  let out = '';
-  for (const s of segments) {
-    if (s.kind === 'text') out += textToMarkdown(s.text);
-    else if (s.display) out += `\n\n$$\n${cleanMath(s.tex)}\n$$\n\n`;
-    else out += `$${cleanMath(s.tex)}$`;
-  }
+  const out = fragmentToMarkdown(stripComments(src));
   return out
     .split('\n')
     .map((line) =>

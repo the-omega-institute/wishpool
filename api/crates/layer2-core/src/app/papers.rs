@@ -133,7 +133,7 @@ impl App {
         &self,
         caller: &Caller,
         mut new: NewPaper,
-        upload: Upload,
+        mut upload: Upload,
     ) -> CoreResult<Submission> {
         new.normalise_doi();
         new.validate()?;
@@ -144,10 +144,45 @@ impl App {
                 self.policy.max_active_per_author
             )));
         }
+        if let Some(typed) = &new.typed_conjecture {
+            if !upload.bytes.is_empty() {
+                return Err(CoreError::invalid(
+                    "choose typed input or a LaTeX upload, not both",
+                ));
+            }
+            upload = Upload {
+                filename: "conjecture.tex".into(),
+                bytes: typed.source(&new.authors)?,
+            };
+        }
         let read = self.read(&upload)?;
-        let title = read
-            .title
-            .clone()
+        let mut extracted = claims_from(&read);
+        if new.kind == SubmissionKind::Conjecture {
+            for claim in &mut extracted {
+                if claim.kind.is_open() {
+                    claim.role = ClaimRole::Main;
+                }
+            }
+            if !extracted.iter().any(|c| c.kind.is_open()) {
+                return Err(CoreError::invalid(
+                    "a conjecture source must contain a conjecture or question",
+                ));
+            }
+            if let Some(typed) = &new.typed_conjecture {
+                if extracted.len() != 1 || extracted[0].kind != ClaimKind::Conjecture {
+                    return Err(CoreError::invalid(
+                        "typed input must contain exactly one conjecture",
+                    ));
+                }
+                // Preserve the typed text exactly, including TeX comments/braces.
+                extracted[0].statement = typed.statement.clone();
+            }
+        }
+        let title = new
+            .typed_conjecture
+            .as_ref()
+            .map(|typed| typed.title.clone())
+            .or_else(|| read.title.clone())
             .ok_or_else(|| CoreError::invalid("the source has no \\title"))?;
         let authors = if new.authors.is_empty() {
             read.authors
@@ -170,6 +205,8 @@ impl App {
         let now = self.ports.clock.now();
         let version = self.new_version(1, &upload, &read, String::new()).await?;
         let submission = Submission {
+            kind: new.kind,
+            lean_statements: vec![],
             id: SubmissionId(new_uuid()),
             submitter: caller.person.clone(),
             title,
@@ -179,16 +216,21 @@ impl App {
             msc: new.msc,
             doi: new.doi,
             versions: vec![version],
-            extracted: claims_from(&read),
+            extracted,
             claims: vec![],
             claims_revision: 0,
             reports: vec![],
             status: SubmissionStatus::Draft,
             decision: None,
             open_to_contributors: new.open_to_contributors,
-            analysis_visibility: Visibility::Undecided,
+            analysis_visibility: if new.make_public_after_acceptance {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            },
             formalization: FormalizationPlan::default(),
             conjectures: vec![],
+            published_progress: None,
             created_at: now,
             updated_at: now,
             revision: 0,
@@ -272,9 +314,16 @@ impl App {
             }
         }
         validate_claims(&claims)?;
-        if !claims.iter().any(|c| c.is_main_result()) {
+        let has_main = claims.iter().any(|c| {
+            if submission.kind == SubmissionKind::Conjecture {
+                c.role == ClaimRole::Main && c.kind.is_open()
+            } else {
+                c.is_main_result()
+            }
+        });
+        if !has_main {
             return Err(CoreError::invalid(
-                "mark at least one proved statement as a main result",
+                "mark at least one eligible statement as main (an open conjecture/question for conjectures, a proved result for papers and notes)",
             ));
         }
         let now = self.ports.clock.now();
@@ -291,6 +340,9 @@ impl App {
             claims_revision: submission.claims_revision,
             filed_at: now,
         });
+        if submission.claims_revision != before {
+            submission.lean_statements.clear();
+        }
         submission.status = SubmissionStatus::InReview;
         let endorsements = self.ports.endorsements.for_submission(id).await?;
         submission.decision = Some(self.policy.decide(&submission, &endorsements));
@@ -319,14 +371,55 @@ impl App {
         Self::require_submitter(caller, &submission)?;
         if !matches!(
             submission.status,
-            SubmissionStatus::Draft | SubmissionStatus::InReview | SubmissionStatus::NotAccepted
+            SubmissionStatus::Draft
+                | SubmissionStatus::InReview
+                | SubmissionStatus::NotAccepted
+                | SubmissionStatus::Accepted { .. }
         ) {
             return Err(CoreError::conflict(format!(
                 "the paper is {}",
                 submission.status.name()
             )));
         }
-        if submission.status == SubmissionStatus::NotAccepted {
+        if let SubmissionStatus::Accepted { record } = &submission.status {
+            let record = self
+                .ports
+                .records
+                .get(record)
+                .await?
+                .ok_or_else(|| CoreError::conflict("the publication record is missing"))?;
+            let publication = record
+                .publication
+                .as_deref()
+                .or_else(|| {
+                    submission
+                        .published_progress
+                        .as_ref()?
+                        .publication
+                        .as_deref()
+                })
+                .unwrap_or(&submission);
+            if submission.claims_revision == publication.claims_revision
+                && submission.current_version().map(|v| v.number)
+                    == publication.current_version().map(|v| v.number)
+                && let Some(version) = publication.current_version()
+            {
+                submission.published_progress = Some(PublishedProgress {
+                    version: version.number,
+                    claims_revision: submission.claims_revision,
+                    formalization: submission.formalization.clone(),
+                    conjectures: submission.conjectures.clone(),
+                    publication: record
+                        .publication
+                        .is_none()
+                        .then(|| Box::new(publication.clone())),
+                });
+            }
+        }
+        if matches!(
+            submission.status,
+            SubmissionStatus::NotAccepted | SubmissionStatus::Accepted { .. }
+        ) {
             let active = self.ports.submissions.active_count(&caller.person).await?;
             if active as usize >= self.policy.max_active_per_author {
                 return Err(CoreError::conflict(
@@ -341,6 +434,14 @@ impl App {
             .await?;
         submission.versions.push(version);
         submission.extracted = claims_from(&read);
+        if submission.kind == SubmissionKind::Conjecture {
+            for claim in &mut submission.extracted {
+                if claim.kind.is_open() {
+                    claim.role = ClaimRole::Main;
+                }
+            }
+        }
+        submission.lean_statements.clear();
         if let Some(title) = read.title.clone() {
             submission.title = title;
         }
@@ -349,7 +450,11 @@ impl App {
         }
         submission.status = SubmissionStatus::Draft;
         submission.decision = None;
+        submission.formalization = FormalizationPlan::default();
+        submission.conjectures.clear();
         self.save(&mut submission).await?;
+        self.close_tasks(id, "the author uploaded a new version")
+            .await?;
         self.ports.queue.enqueue(id, JobKind::Compile).await?;
         Ok(submission)
     }
@@ -562,13 +667,50 @@ impl App {
     ) -> CoreResult<PaperFile> {
         let submission = self.load(id).await?;
         let viewer = caller.is_some_and(|c| Self::can_view(c, &submission));
-        let public = matches!(submission.status, SubmissionStatus::Accepted { .. });
+        let publication = if viewer {
+            None
+        } else {
+            self.ports.records.for_submission(id).await?
+        };
+        let published_inputs = publication
+            .as_ref()
+            .and_then(|r| r.publication.as_deref())
+            .or_else(|| {
+                if viewer {
+                    None
+                } else {
+                    submission
+                        .published_progress
+                        .as_ref()?
+                        .publication
+                        .as_deref()
+                }
+            });
+        let public_version = published_inputs
+            .and_then(Submission::current_version)
+            .map(|v| v.number);
+        let public = submission.analysis_visibility == Visibility::Public
+            && (public_version.is_some()
+                || matches!(submission.status, SubmissionStatus::Accepted { .. }));
+        if !viewer
+            && version
+                .zip(public_version)
+                .is_some_and(|(requested, published)| requested > published)
+        {
+            return Err(CoreError::not_found(
+                "version",
+                version.unwrap().to_string(),
+            ));
+        }
         if !(viewer || (pdf && public)) {
             return Err(CoreError::not_found("paper", id.as_str()));
         }
+        let inputs = published_inputs.unwrap_or(&submission);
         let entry = match version {
-            Some(n) => submission.versions.iter().find(|v| v.number == n),
-            None => submission.versions.last(),
+            Some(n) => inputs.versions.iter().find(|v| v.number == n),
+            None => public_version
+                .and_then(|n| inputs.versions.iter().find(|v| v.number == n))
+                .or_else(|| inputs.versions.last()),
         }
         .ok_or_else(|| {
             CoreError::not_found(

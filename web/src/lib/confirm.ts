@@ -81,7 +81,10 @@ function hasCycle(rows: readonly ConfirmRow[]): string | null {
  * extracted statement, excluded ones included with `excluded: true`.
  * Checks what the server will check, so the author sees it before sending.
  */
-export function buildConfirmations(rows: readonly ConfirmRow[]): Parsed<ClaimConfirmation[]> {
+export function buildConfirmations(
+  rows: readonly ConfirmRow[],
+  conjecture = false,
+): Parsed<ClaimConfirmation[]> {
   const kept = rows.filter((r) => !r.excluded);
   if (kept.length === 0) return fail('Keep at least one statement.');
   const keptIds = new Set(kept.map((r) => r.id));
@@ -95,7 +98,7 @@ export function buildConfirmations(rows: readonly ConfirmRow[]): Parsed<ClaimCon
   }
   const cyclic = hasCycle(kept);
   if (cyclic !== null) return fail(`The dependencies form a cycle through ${cyclic}.`);
-  if (!kept.some(isMainResult)) {
+  if (!kept.some((r) => (conjecture ? r.role === 'main' && isOpenKind(r.kind) : isMainResult(r)))) {
     return fail(
       'Mark at least one proved statement (not a conjecture or question) as a main result.',
     );

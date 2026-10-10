@@ -114,7 +114,11 @@ pub struct Config {
     pub oracle: Option<OracleConfig>,
     pub oracle_poll_secs: u64,
     pub referee_account: PersonId,
+    pub auditor_account: PersonId,
     pub advisor: Option<AdvisorConfig>,
+    /// Deadline for the Codex audit itself. Advice and letters use the
+    /// shorter `advisor_timeout_secs` deadline.
+    pub audit_timeout_secs: u64,
     pub advisor_timeout_secs: u64,
     pub advisor_work_dir: String,
     /// A Lean project with Mathlib built; with the Codex advisor, rounds
@@ -253,7 +257,7 @@ impl Config {
 
         // Every listed pool receives the request; the first answer wins.
         let oracle_pools: Vec<String> = get("WISHPOOL_ORACLE_POOL")
-            .unwrap_or_else(|| "chrono-chatgpt-pro-500-pool,company-chatgpt-pro".into())
+            .unwrap_or_else(|| "chrono-chatgpt-pro-pool".into())
             .split(',')
             .map(|p| p.trim().to_string())
             .filter(|p| !p.is_empty())
@@ -267,9 +271,9 @@ impl Config {
         let oracle = match get("WISHPOOL_ORACLE").as_deref() {
             None => None,
             Some("http") => Some(OracleConfig::Http {
-                base_url: get("WISHPOOL_ORACLE_BASE_URL")
-                    .or_else(|| get("CHRONO_NYXID_BASE_URL"))
-                    .unwrap_or_else(|| "https://nyx.chrono-ai.fun".into()),
+                base_url: get("WISHPOOL_ORACLE_BASE_URL").unwrap_or_else(|| {
+                    "https://nyx-api.chrono-ai.fun/api/v1/proxy/s/oracle".into()
+                }),
                 token: OracleToken(required("WISHPOOL_ORACLE_TOKEN")?),
                 pools: oracle_pools,
                 model: oracle_model,
@@ -314,12 +318,16 @@ impl Config {
         };
         let oracle_poll_secs = seconds("WISHPOOL_ORACLE_POLL_SECS", 60)?;
         let advisor_timeout_secs = seconds("WISHPOOL_ADVISOR_TIMEOUT_SECS", 1200)?;
-        // Leave room for environment discovery and checks within the 25-minute formal step.
+        if advisor_timeout_secs > 3600 {
+            bail!("WISHPOOL_ADVISOR_TIMEOUT_SECS must be at most 3600 seconds");
+        }
+        let audit_timeout_secs = seconds("WISHPOOL_AUDIT_TIMEOUT_SECS", 3600)?;
+        if audit_timeout_secs > 7200 {
+            bail!("WISHPOOL_AUDIT_TIMEOUT_SECS must be at most 7200 seconds");
+        }
         let formal_timeout_secs = seconds("WISHPOOL_FORMAL_TIMEOUT_SECS", 1200)?;
-        if formal_timeout_secs > 1200 {
-            bail!(
-                "WISHPOOL_FORMAL_TIMEOUT_SECS must be at most 1200 to leave time for environment discovery and Lean checks within the 25-minute formal step"
-            );
+        if formal_timeout_secs > 3600 {
+            bail!("WISHPOOL_FORMAL_TIMEOUT_SECS must be at most 3600 seconds");
         }
         let lean_workspace = get("WISHPOOL_LEAN_WORKSPACE");
         if lean_workspace.is_some() && !matches!(advisor, Some(AdvisorConfig::Codex { .. })) {
@@ -333,6 +341,12 @@ impl Config {
             PersonId(get("WISHPOOL_REFEREE_ACCOUNT").unwrap_or_else(|| "wishpool:referee".into()));
         if oracle.is_some() && review_account == referee_account {
             bail!("WISHPOOL_REFEREE_ACCOUNT must differ from WISHPOOL_REVIEW_ACCOUNT");
+        }
+
+        let auditor_account =
+            PersonId(get("WISHPOOL_AUDITOR_ACCOUNT").unwrap_or_else(|| "wishpool:auditor".into()));
+        if auditor_account == referee_account || auditor_account == review_account {
+            bail!("WISHPOOL_AUDITOR_ACCOUNT must differ from referee and review accounts");
         }
 
         let hosted = match get("WISHPOOL_HOSTED_DONATIONS").as_deref() {
@@ -380,7 +394,9 @@ impl Config {
             oracle,
             oracle_poll_secs,
             referee_account,
+            auditor_account,
             advisor,
+            audit_timeout_secs,
             advisor_timeout_secs,
             advisor_work_dir: get("WISHPOOL_ADVISOR_WORK_DIR")
                 .unwrap_or_else(|| "/tmp/wishpool-advisor".into()),
@@ -506,14 +522,16 @@ mod referee_tests {
         assert!(disabled.oracle.is_none() && disabled.advisor.is_none());
         assert_eq!(disabled.oracle_poll_secs, 60);
         assert_eq!(disabled.advisor_timeout_secs, 1200);
+        assert_eq!(disabled.audit_timeout_secs, 3600);
         assert_eq!(disabled.advisor_work_dir, "/tmp/wishpool-advisor");
         assert!(disabled.lean_workspace.is_none());
         assert_eq!(disabled.formal_timeout_secs, 1200);
         assert!(local(&[("WISHPOOL_LEAN_WORKSPACE", "/lean")]).is_err());
         assert_eq!(disabled.referee_account.as_str(), "wishpool:referee");
+        assert_eq!(disabled.auditor_account.as_str(), "wishpool:auditor");
         let c = local(&[("WISHPOOL_ORACLE", "cli"), ("WISHPOOL_ADVISOR", "codex")]).unwrap();
         assert!(
-            matches!(c.oracle, Some(OracleConfig::Cli { program, pools, model }) if program == "nyxid" && pools == ["chrono-chatgpt-pro-500-pool", "company-chatgpt-pro"] && model == "chatgpt-6-pro")
+            matches!(c.oracle, Some(OracleConfig::Cli { program, pools, model }) if program == "nyxid" && pools == ["chrono-chatgpt-pro-pool"] && model == "chatgpt-6-pro")
         );
         assert!(
             matches!(c.advisor, Some(AdvisorConfig::Codex { program, model: None }) if program == "codex")
@@ -529,6 +547,7 @@ mod referee_tests {
             ("WISHPOOL_CODEX_BIN", "/local/codex"),
             ("WISHPOOL_CODEX_MODEL", "m"),
             ("WISHPOOL_ADVISOR_TIMEOUT_SECS", "42"),
+            ("WISHPOOL_AUDIT_TIMEOUT_SECS", "3601"),
             ("WISHPOOL_ADVISOR_WORK_DIR", "/tmp/custom"),
             ("WISHPOOL_LEAN_WORKSPACE", "/lean"),
             ("WISHPOOL_FORMAL_TIMEOUT_SECS", "99"),
@@ -536,6 +555,7 @@ mod referee_tests {
         .unwrap();
         assert_eq!(c.oracle_poll_secs, 12);
         assert_eq!(c.advisor_timeout_secs, 42);
+        assert_eq!(c.audit_timeout_secs, 3601);
         assert_eq!(c.referee_account.as_str(), "referee");
         assert_eq!(c.advisor_work_dir, "/tmp/custom");
         assert_eq!(c.lean_workspace.as_deref(), Some("/lean"));
@@ -549,20 +569,23 @@ mod referee_tests {
     }
 
     #[test]
-    fn formal_timeout_leaves_room_for_checks_within_the_lease() {
-        assert_eq!(
-            local(&[("WISHPOOL_FORMAL_TIMEOUT_SECS", "1200")])
-                .unwrap()
-                .formal_timeout_secs,
-            1200
-        );
-        for value in ["1201", "1500", "1800", "18446744073709551615"] {
-            let error = local(&[("WISHPOOL_FORMAL_TIMEOUT_SECS", value)]).unwrap_err();
-            assert!(error.to_string().contains("must be at most 1200"));
+    fn timeout_caps_allow_heartbeat_extended_steps() {
+        for (key, maximum) in [
+            ("WISHPOOL_ADVISOR_TIMEOUT_SECS", "3600"),
+            ("WISHPOOL_AUDIT_TIMEOUT_SECS", "7200"),
+            ("WISHPOOL_FORMAL_TIMEOUT_SECS", "3600"),
+        ] {
+            assert!(
+                local(&[(key, maximum)]).is_ok(),
+                "{key} accepts its maximum"
+            );
+            for value in ["0", "not-a-number", "18446744073709551615"] {
+                assert!(local(&[(key, value)]).is_err(), "{key} rejects {value}");
+            }
         }
-        for value in ["0", "not-a-number"] {
-            assert!(local(&[("WISHPOOL_FORMAL_TIMEOUT_SECS", value)]).is_err());
-        }
+        assert!(local(&[("WISHPOOL_ADVISOR_TIMEOUT_SECS", "3601")]).is_err());
+        assert!(local(&[("WISHPOOL_AUDIT_TIMEOUT_SECS", "7201")]).is_err());
+        assert!(local(&[("WISHPOOL_FORMAL_TIMEOUT_SECS", "3601")]).is_err());
     }
 
     #[test]
@@ -576,7 +599,7 @@ mod referee_tests {
         ])
         .unwrap();
         assert!(
-            matches!(&c.oracle, Some(OracleConfig::Http { base_url, .. }) if base_url == "https://oracle.example")
+            matches!(&c.oracle, Some(OracleConfig::Http { base_url, pools, model, .. }) if base_url == "https://nyx-api.chrono-ai.fun/api/v1/proxy/s/oracle" && pools == &["chrono-chatgpt-pro-pool"] && model == "chatgpt-6-pro")
         );
         assert!(!format!("{:?}", c.oracle).contains(&token));
         let c = local(&[
@@ -656,6 +679,29 @@ mod referee_tests {
                     "missing infra key {part}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_config_tests {
+    use super::*;
+    #[test]
+    fn audit_identity_is_separate_and_advisor_timeout_is_capped() {
+        let base = [
+            ("WISHPOOL_PUBLIC_URL", "http://127.0.0.1:5173"),
+            ("WISHPOOL_BIND", "127.0.0.1:8080"),
+            ("WISHPOOL_STORAGE", "memory"),
+            ("WISHPOOL_AUTH_MODE", "dev"),
+        ];
+        for (key, value) in [
+            ("WISHPOOL_AUDITOR_ACCOUNT", "wishpool:referee"),
+            ("WISHPOOL_AUDITOR_ACCOUNT", "wishpool:review-engine"),
+            ("WISHPOOL_ADVISOR_TIMEOUT_SECS", "3601"),
+        ] {
+            let values: std::collections::BTreeMap<_, _> =
+                base.into_iter().chain([(key, value)]).collect();
+            assert!(Config::from_lookup(|key| values.get(key).map(|v| v.to_string())).is_err());
         }
     }
 }

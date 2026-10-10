@@ -34,6 +34,10 @@ type StorageParts = (
     Option<MongoStore>,
 );
 
+// Two 30-second environment commands and at most two 120-second Lean checks.
+// Audit uses the same margin for workspace preparation and result parsing.
+const REVIEW_STEP_MARGIN_SECS: u64 = 5 * 60;
+
 pub const REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
 pub struct Composition {
@@ -210,12 +214,16 @@ impl Composition {
                 }
                 _ => None,
             };
+        let auditor_account = app
+            .ensure_service_account(&config.auditor_account, "Wishpool auditor", Role::Reviewer)
+            .await?;
         let advisor: Option<Arc<dyn wishpool_review::advisor::Advisor>> = match &config.advisor {
             Some(AdvisorConfig::Codex { program, model }) => {
                 Some(Arc::new(wishpool_review::advisor::CodexCli {
                     program: program.into(),
                     model: model.clone(),
                     timeout: Duration::from_secs(config.advisor_timeout_secs),
+                    audit_timeout: Duration::from_secs(config.audit_timeout_secs),
                 }))
             }
             Some(AdvisorConfig::Chat { model }) => {
@@ -244,12 +252,17 @@ impl Composition {
             openalex,
             reviewer,
             referee_account,
+            auditor_account,
             referee_model,
             oracle,
             advisor,
             formalizer,
             oracle_poll: Duration::from_secs(config.oracle_poll_secs),
             advisor_work_dir: config.advisor_work_dir.clone().into(),
+            audit_budget: Duration::from_secs(config.audit_timeout_secs + REVIEW_STEP_MARGIN_SECS),
+            formal_budget: Duration::from_secs(
+                config.formal_timeout_secs + REVIEW_STEP_MARGIN_SECS,
+            ),
         };
 
         let router = http_router(

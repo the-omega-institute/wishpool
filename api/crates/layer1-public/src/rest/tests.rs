@@ -471,6 +471,13 @@ async fn referee_routes_project_visibility_roles_and_letter_validation() {
     app.update_referee_round(&reviewer, &id, 1, RoundUpdate::Referee(referee))
         .await
         .unwrap();
+    let mut audit = Step::pending();
+    audit.state = StepState::Skipped {
+        reason: "failed referee".into(),
+    };
+    app.update_referee_round(&reviewer, &id, 1, RoundUpdate::Audit(audit))
+        .await
+        .unwrap();
     let mut advice = Step::pending();
     advice.state = StepState::Skipped {
         reason: "failed referee".into(),
@@ -478,18 +485,18 @@ async fn referee_routes_project_visibility_roles_and_letter_validation() {
     app.update_referee_round(&reviewer, &id, 1, RoundUpdate::Advice(advice))
         .await
         .unwrap();
-    let mut formal = Step::pending();
-    formal.state = StepState::Skipped {
-        reason: "failed referee".into(),
-    };
-    app.update_referee_round(&reviewer, &id, 1, RoundUpdate::Formal(formal))
-        .await
-        .unwrap();
     let mut letter = Step::pending();
     letter.state = StepState::Skipped {
         reason: "failed referee".into(),
     };
     app.update_referee_round(&reviewer, &id, 1, RoundUpdate::Letter(letter))
+        .await
+        .unwrap();
+    let mut formal = Step::pending();
+    formal.state = StepState::Skipped {
+        reason: "failed referee".into(),
+    };
+    app.update_referee_round(&reviewer, &id, 1, RoundUpdate::Formal(formal))
         .await
         .unwrap();
     let (status, file, _) = call(
@@ -503,7 +510,9 @@ async fn referee_routes_project_visibility_roles_and_letter_validation() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(file["rounds"].as_array().unwrap().len(), 2);
     let (_, view, _) = call(&router, "GET", &base, Some("author"), None).await;
-    assert_eq!(view["rounds"], serde_json::json!([]));
+    assert_eq!(view["rounds"].as_array().unwrap().len(), 2);
+    assert!(view["rounds"][0].get("advice").is_none());
+    assert!(view["rounds"][0].get("letter").is_none());
     assert_eq!(view["letters"].as_array().unwrap().len(), 1);
     assert_eq!(app.referee(&editor, &id).await.unwrap().rounds.len(), 2);
 }

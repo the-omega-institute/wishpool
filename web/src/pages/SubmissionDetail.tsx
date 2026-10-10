@@ -1,8 +1,9 @@
-import { useCallback } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { pdfHref, sourceFileHref } from '../api/client';
 import { useApi } from '../api/context';
 import { usePolicy } from '../api/policy';
 import { useAsync } from '../api/useAsync';
+import { useReferee } from '../api/useReferee';
 import type { Decision, PolicyDocument, RejectReason, Submission } from '../api/types';
 import { hasRole, useSession } from '../auth/session';
 import { AnalysisView, ConjectureList } from '../components/Analysis';
@@ -11,18 +12,27 @@ import { BasisBadge, SubmissionStatusBadge } from '../components/badges';
 import { StatementList } from '../components/claims';
 import { LatexText, MacrosProvider } from '../components/Markdown';
 import { StageTimeline } from '../components/StageTimeline';
+import { StatementSummary } from '../components/StatementSummary';
+import { PaperStanding } from '../components/PaperStanding';
 import { RefereeWorkspace } from '../components/referee';
-import { Async, Badge, DateText, ErrorNotice, ExternalLink, Fold, Loading } from '../components/ui';
+import { Async, Badge, DateText, ExternalLink, Fold, Loading } from '../components/ui';
 import {
   ContributorsToggle,
   FormalizationForAuthor,
   NewVersionForm,
   VisibilityChoice,
+  LeanStatementCard,
   WithdrawPanel,
 } from '../components/workspace/AuthorPanels';
 import { ConfirmStatements } from '../components/workspace/ConfirmStatements';
 import { EditorTools } from '../components/workspace/EditorTools';
-import { AI_USE_LABELS, decisionHeadline, formatBytes, rejectReasonText } from '../lib/labels';
+import {
+  AI_USE_LABELS,
+  decisionHeadline,
+  formatBytes,
+  rejectReasonText,
+  SUBMISSION_KIND_LABELS,
+} from '../lib/labels';
 import { sourceHref } from '../lib/links';
 import { currentMacros } from '../lib/macros';
 import { stageName } from '../lib/stages';
@@ -63,6 +73,47 @@ export function Workspace({
   const isStaff = hasRole(person, 'editor', 'reviewer', 'admin');
   const state = s.status.state;
   const reviewed = state !== 'draft' && s.claims.length > 0;
+  const referee = useReferee(s, isStaff, isStaff || isAuthor);
+  const reviewRevision = referee.value?.revision;
+  useEffect(() => {
+    if (reviewRevision === undefined) return;
+    const controller = new AbortController();
+    void api
+      .getSubmission(s.id, { signal: controller.signal })
+      .then((current) => {
+        if (!controller.signal.aborted && current.revision > s.revision) onChange(current);
+      })
+      .catch(() => {
+        /* The existing paper and referee fetches handle visible errors. */
+      });
+    return () => controller.abort();
+  }, [api, s.id, s.revision, reviewRevision, onChange]);
+  useEffect(() => {
+    if (s.kind !== 'conjecture' || s.status.state !== 'accepted' || !isAuthor) return;
+    const controller = new AbortController();
+    const refresh = () => {
+      void api
+        .getSubmission(s.id, { signal: controller.signal })
+        .then((updated) => {
+          if (!controller.signal.aborted && updated.revision > s.revision) onChange(updated);
+        })
+        .catch(() => {
+          /* The existing view remains available during a temporary failure. */
+        });
+    };
+    const timer = window.setInterval(refresh, 30_000);
+    window.addEventListener('focus', refresh);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refresh);
+    };
+  }, [api, s.id, s.kind, s.status.state, s.revision, isAuthor, onChange]);
+  const [revising, setRevising] = useState(false);
+  const showRevisionForm =
+    revising &&
+    (state === 'in_review' || state === 'accepted' || state === 'not_accepted') &&
+    isAuthor;
 
   // Keyed on the revision, so every change reloads the preview and the analysis.
   const revision = s.revision;
@@ -84,6 +135,9 @@ export function Workspace({
   const analysis = useAsync(reviewed ? loadAnalysis : null);
   const preview = decision.value ?? s.decision ?? null;
   const current = s.versions[s.versions.length - 1];
+  const currentReview = [...(referee.value?.rounds ?? [])]
+    .reverse()
+    .find((r) => r.version === current?.number && r.claims_revision === s.claims_revision);
 
   return (
     <MacrosProvider macros={currentMacros(s.versions)}>
@@ -92,6 +146,7 @@ export function Workspace({
           <h1>{s.title || 'Untitled paper'}</h1>
           <AuthorLine authors={s.authors} />
           <p className="entry-meta">
+            <span>{SUBMISSION_KIND_LABELS[s.kind]}</span>
             <SubmissionStatusBadge status={s.status} />
             <span>
               Version {current?.number ?? 1} · <DateText iso={s.created_at} />
@@ -122,6 +177,42 @@ export function Workspace({
           </div>
         </header>
 
+        {isAuthor || isStaff ? (
+          <PaperStanding
+            submission={s}
+            round={currentReview}
+            onRevise={isAuthor && !showRevisionForm ? () => setRevising(true) : undefined}
+          />
+        ) : null}
+        {showRevisionForm ? (
+          <div id="standing-revision-form">
+            <NewVersionForm
+              submission={s}
+              onChange={(updated) => {
+                setRevising(false);
+                onChange(updated);
+              }}
+            />
+          </div>
+        ) : null}
+
+        {state === 'accepted' && s.kind === 'conjecture' && isAuthor ? (
+          <LeanStatementCard submission={s} onChange={onChange} />
+        ) : null}
+        {reviewed && (isAuthor || isStaff) ? (
+          <StatementSummary submission={s} round={currentReview} />
+        ) : null}
+        {isStaff || isAuthor ? (
+          <RefereeWorkspace
+            key={`${s.id}-${isStaff}`}
+            submission={s}
+            isStaff={isStaff}
+            isEditor={isEditor}
+            resource={referee}
+            onChange={onChange}
+          />
+        ) : null}
+
         {state === 'draft' ? <DraftNotice submission={s} /> : null}
         {state === 'draft' && isAuthor ? (
           <section aria-labelledby="confirm-h">
@@ -134,13 +225,9 @@ export function Workspace({
           </section>
         ) : null}
 
-        {state === 'not_accepted' ? (
-          <NotAccepted submission={s} decision={preview} isAuthor={isAuthor} onChange={onChange} />
-        ) : null}
-
         {state === 'accepted' && isAuthor ? (
           <section aria-labelledby="accepted-h">
-            <h2 id="accepted-h">Accepted</h2>
+            <h2 id="accepted-h">After acceptance</h2>
             <p>
               Record <code>{s.status.state === 'accepted' ? s.status.record : ''}</code>
               {s.decision?.decision === 'accept' ? (
@@ -151,39 +238,23 @@ export function Workspace({
               ) : null}
             </p>
             <VisibilityChoice submission={s} onChange={onChange} />
-            <h3>Formalization in Lean</h3>
-            <FormalizationForAuthor submission={s} onChange={onChange} />
-          </section>
-        ) : null}
-
-        {state === 'accepted' || state === 'not_accepted' ? (
-          <section aria-labelledby="decision-h">
-            <h2 id="decision-h">Decision</h2>
-            {decision.state.status === 'error' ? (
-              <ErrorNotice error={decision.state.error} onRetry={decision.reload} />
+            {s.kind !== 'conjecture' ? (
+              <>
+                <h3>Formalization in Lean</h3>
+                <FormalizationForAuthor submission={s} onChange={onChange} />
+              </>
             ) : null}
-            {preview ? <DecisionView decision={preview} policy={policy} /> : <Loading />}
           </section>
-        ) : null}
-
-        {isStaff || isAuthor ? (
-          <RefereeWorkspace
-            key={`${s.id}-${isStaff}`}
-            submission={s}
-            isStaff={isStaff}
-            isEditor={isEditor}
-            onChange={onChange}
-          />
         ) : null}
 
         <div className="folds">
-          {reviewed ? (
+          {reviewed && isStaff ? (
             <Fold id="statements-h" title="Statements" hint={s.claims.length}>
               <StatementList claims={s.claims} scope="ws" />
             </Fold>
           ) : null}
 
-          {reviewed ? (
+          {reviewed && isStaff ? (
             <Fold id="analysis-h" title="Analysis">
               <Async state={analysis.state} onRetry={analysis.reload}>
                 {(a) => <AnalysisView analysis={a} claims={s.claims} scope="ws" />}
@@ -197,12 +268,14 @@ export function Workspace({
             </Fold>
           ) : null}
 
-          <Fold id="stages-h" title="Publication decision">
-            {state === 'in_review' && isStaff && preview ? (
-              <DecisionView decision={preview} policy={policy} />
-            ) : null}
-            <StageTimeline submission={s} policy={policy} decision={preview} />
-          </Fold>
+          {isStaff ? (
+            <Fold id="stages-h" title="Publication decision">
+              {state === 'in_review' && isStaff && preview ? (
+                <DecisionView decision={preview} policy={policy} />
+              ) : null}
+              <StageTimeline submission={s} policy={policy} decision={preview} />
+            </Fold>
+          ) : null}
 
           <Fold id="abstract-h" title="Abstract">
             {s.abstract_text ? (
@@ -223,7 +296,7 @@ export function Workspace({
               {state !== 'withdrawn' && state !== 'not_accepted' ? (
                 <ContributorsToggle submission={s} onChange={onChange} />
               ) : null}
-              {state === 'draft' || state === 'in_review' ? (
+              {state === 'draft' || (state === 'in_review' && !showRevisionForm) ? (
                 <NewVersionForm submission={s} onChange={onChange} />
               ) : null}
               {state === 'draft' || state === 'in_review' ? (
@@ -312,41 +385,6 @@ export function ReasonList({ reasons }: { reasons: readonly RejectReason[] }) {
         <li key={i}>{rejectReasonText(r)}</li>
       ))}
     </ul>
-  );
-}
-
-function NotAccepted({
-  submission,
-  decision,
-  isAuthor,
-  onChange,
-}: {
-  submission: Submission;
-  decision: Decision | null;
-  isAuthor: boolean;
-  onChange: (s: Submission) => void;
-}) {
-  const reasons =
-    submission.decision?.decision === 'not_accepted'
-      ? submission.decision.reasons
-      : decision?.decision === 'not_accepted'
-        ? decision.reasons
-        : [];
-  return (
-    <section aria-labelledby="not-accepted-h">
-      <h2 id="not-accepted-h">Not accepted</h2>
-      {reasons.length > 0 ? (
-        <>
-          <h3>Reasons</h3>
-          <ReasonList reasons={reasons} />
-        </>
-      ) : null}
-      {isAuthor ? (
-        <>
-          <NewVersionForm submission={submission} onChange={onChange} />
-        </>
-      ) : null}
-    </section>
   );
 }
 

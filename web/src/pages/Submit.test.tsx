@@ -9,7 +9,7 @@ import { SubmitPage } from './Submit';
 describe('SubmitPage', () => {
   it('asks anonymous visitors to sign in', async () => {
     renderWithApp(<SubmitPage />, fakeApi());
-    expect(await screen.findByText('Sign in to submit a paper.')).toBeInTheDocument();
+    expect(await screen.findByText('Sign in to submit your work.')).toBeInTheDocument();
   });
 
   it('uploads the source with the metadata and opens the draft', async () => {
@@ -37,6 +37,8 @@ describe('SubmitPage', () => {
 
     expect(createSubmission).toHaveBeenCalledWith(
       {
+        kind: 'paper',
+        make_public_after_acceptance: true,
         ai_disclosure: { level: 'substantial', statement: 'A model drafted Lemma 2.' },
         msc: ['11B83', '05D10'],
         doi: '10.48550/arXiv.2609.33421',
@@ -84,6 +86,56 @@ describe('SubmitPage', () => {
     await user.click(screen.getByRole('button', { name: 'Upload and read statements' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'no main file: the archive has no .tex file with \\documentclass',
+    );
+  });
+  it('uses the same upload for a short note with the publication checkbox off', async () => {
+    const createSubmission = vi.fn(async () => draft);
+    renderWithApp(<SubmitPage />, fakeApi({ createSubmission }, author));
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('radio', { name: 'Short note' }));
+    const publication = screen.getByRole('checkbox', { name: 'Make public after acceptance' });
+    expect(publication).toBeChecked();
+    await user.click(publication);
+    const source = new File(['source'], 'note.tex', { type: 'application/x-tex' });
+    await user.upload(screen.getByLabelText('LaTeX source'), source);
+    await user.type(screen.getByLabelText('AI disclosure statement'), 'No AI was used.');
+    await user.click(screen.getByRole('button', { name: 'Upload and read statements' }));
+    expect(createSubmission).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'note', make_public_after_acceptance: false }),
+      source,
+    );
+  });
+
+  it('submits typed conjectures with TeX preview through the same endpoint without a file', async () => {
+    const createSubmission = vi.fn(async () => draft);
+    renderWithApp(<SubmitPage />, fakeApi({ createSubmission }, author));
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('radio', { name: 'Conjecture' }));
+    await user.click(screen.getByRole('radio', { name: 'Type it' }));
+    expect(screen.queryByLabelText('LaTeX source')).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText('Title'), 'An open bound');
+    await user.type(screen.getByLabelText('Statement'), 'Every $n > 1$ has the property.');
+    await user.type(screen.getByLabelText('Background (optional)'), 'Let $n$ be a natural number.');
+    await user.type(screen.getByLabelText('Origin (optional)'), 'my own');
+    await user.type(screen.getByLabelText('AI disclosure statement'), 'No AI was used.');
+    const preview = screen.getByLabelText('Statement preview');
+    expect(preview.querySelector('.katex')).not.toBeNull();
+    expect(screen.getByRole('checkbox', { name: 'Make public after acceptance' })).toBeChecked();
+    expect(screen.getByText('Reviews and letters are only shown to you.')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Upload and read statements' }));
+    expect(createSubmission).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: 'conjecture',
+        make_public_after_acceptance: true,
+        typed_conjecture: {
+          title: 'An open bound',
+          statement: 'Every $n > 1$ has the property.',
+          background: 'Let $n$ be a natural number.',
+          origin: 'my own',
+        },
+        authors: [{ name: author.display_name, person: author.id }],
+      }),
+      undefined,
     );
   });
 });

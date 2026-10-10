@@ -4,13 +4,18 @@ import { BASIS_DESCRIPTIONS, BASIS_LABELS, rejectReasonText } from '../lib/label
 import { STAGES, THRESHOLD_TEXT, stageInfo, stageName } from '../lib/stages';
 import type { AdmissionBasis, RejectReason } from '../api/types';
 
-const BASES: AdmissionBasis[] = ['escape_witness', 'open_problem_settlement'];
+const BASES: AdmissionBasis[] = ['escape_witness', 'open_problem_settlement', 'open_conjecture'];
 
 const REASONS: RejectReason[] = [
   { reason: 'hygiene', detail: 'the source does not compile or AI use is not disclosed' },
   { reason: 'known_result', claim: 'C1', prior: { kind: 'doi', locator: '10.…' } },
   { reason: 'bind_only' },
   { reason: 'no_main_result' },
+  {
+    reason: 'conjecture',
+    detail:
+      'The conjecture needs a well-posed, open statement whose proof would carry new mathematical content.',
+  },
   { reason: 'out_of_scope', detail: 'the paper is not a mathematics paper' },
 ];
 
@@ -22,9 +27,9 @@ export function PolicyPage() {
         <div>
           <h1>Review policy</h1>
           <p className="lede">
-            Every submitted paper passes through four stages. The decision is a published function
-            of the stage reports; the same function gives the author a preview while the paper is in
-            review.
+            Papers, short notes and conjectures use the same four review stages. The decision is a
+            published function of the stage reports; the same function gives the author a preview
+            while the work is in review.
           </p>
         </div>
       </header>
@@ -53,8 +58,8 @@ export function PolicyPage() {
                 })}
               </dl>
               <p className="small">
-                An author may have at most {policy.policy.max_active_per_author} papers in draft or
-                review at once.
+                An author may have at most {policy.policy.max_active_per_author} submissions in
+                draft or review at once.
               </p>
             </section>
           </>
@@ -63,7 +68,11 @@ export function PolicyPage() {
 
       <section aria-labelledby="threshold-h">
         <h2 id="threshold-h">Threshold</h2>
-        <p>{THRESHOLD_TEXT}</p>
+        <p>{THRESHOLD_TEXT} Short notes use the same threshold.</p>
+        <p>
+          A conjecture is displayed when at least one main statement is audited as well posed, open,
+          and mathematically new if proved.
+        </p>
         <dl className="definitions">
           {BASES.map((b) => (
             <div key={b}>
@@ -108,14 +117,22 @@ export function PolicyPage() {
           </li>
           <li>
             When the author allows volunteer contributors, signed-in contributors can read each
-            statement, its dependencies, and the paper’s title and abstract while the paper is in
+            statement, its dependencies, and the paper’s title and abstract while the work is in
             review.
           </li>
           <li>
-            An accepted paper’s statements, PDF and Lean badges are public. Its per-statement
-            analysis and conjecture follow-ups are public only when the author chooses so.
+            “Make public after acceptance” is checked by default for every kind. The public page
+            shows statements, dependencies, new intermediate lemmas and verified Lean proofs.
+            Authors can change the setting later; private records show only title, authors, kind and
+            record id. Reviews, correctness labels, comments, reports, advice and letters stay
+            private.
           </li>
         </ul>
+        <p>
+          Accepted conjectures receive an elaborated Lean statement after the letter. The author
+          confirms its exact text or asks for a correction. This checks the statement’s meaning and
+          well-formedness; it does not verify a proof. Attack attempts follow in Phase B.
+        </p>
       </section>
     </div>
   );

@@ -3,6 +3,7 @@ import type { TaskKind } from '../api/types';
 export type Route =
   | { kind: 'home' }
   | { kind: 'papers' }
+  | { kind: 'conjectures' }
   | { kind: 'paper'; record: string }
   | { kind: 'policy' }
   | { kind: 'submit' }
@@ -47,6 +48,8 @@ export function parseRoute(pathname: string, search = ''): Route {
 
   if (segments.length === 1) {
     switch (first) {
+      case 'conjectures':
+        return { kind: 'conjectures' };
       case 'papers':
         return { kind: 'papers' };
       case 'policy':
@@ -94,6 +97,8 @@ export function routePath(route: Route): string {
   switch (route.kind) {
     case 'home':
       return '/';
+    case 'conjectures':
+      return '/conjectures';
     case 'papers':
       return '/papers';
     case 'paper':

@@ -11,8 +11,13 @@ use crate::{
 /// submission at read time, so formalizations added later appear on it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
+    #[serde(default)]
+    pub kind: super::SubmissionKind,
     /// `WP-<year>-<4-digit sequence>`.
     pub id: RecordId,
+    /// Immutable publication input; legacy inputs are preserved on the submission when revised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<Box<super::Submission>>,
     pub submission: SubmissionId,
     pub title: String,
     pub authors: Vec<Author>,

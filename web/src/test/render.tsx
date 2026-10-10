@@ -35,6 +35,8 @@ export function fakeApi(overrides: Partial<ApiClient> = {}, person?: Person): Ap
     getAnalysis: vi.fn(notFound),
     previewDecision: vi.fn(notFound),
     referee: vi.fn(async (id: string) => ({ id, rounds: [], letters: [], revision: 0 })),
+    respondLeanStatement: vi.fn(notFound),
+    listConjectures: vi.fn(empty),
     respondFormalization: vi.fn(notFound),
     fileReport: vi.fn(notFound),
     judgeClaim: vi.fn(notFound),

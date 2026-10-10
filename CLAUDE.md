@@ -5,26 +5,43 @@ repository. Rules here are binding.
 
 ## 1. What wishpool is
 
-A venue where mathematicians submit their own papers as LaTeX source. The
-venue reads every statement of the paper, analyses which statements carry new
-mathematical content (escape analysis), publishes the papers that pass the
-threshold with a public record, and, with the author's consent, formalizes
-the valuable statements in Lean.
+A venue where mathematicians submit their own papers, short notes and
+conjectures through one entry and one review pipeline. The venue reads their
+statements, audits the referee's mathematical reading, and gives accepted work
+one shared `WP-<year>-NNNN` record sequence. Short notes follow exactly the paper
+pipeline; only their labels differ.
 
-- **Papers**: the author uploads a `.tex`, `.zip` or `.tar.gz` source. The
-  venue reads the title, authors, abstract and every theorem-like
-  environment, compiles the PDF with TeX Live, and the author confirms the
-  statements (kind, main result or supporting, dependencies).
-- **Analysis**: per statement, whether the literature already states or
-  implies it, and whether its proof carries an escape witness (a new
-  intermediate proposition that prior results do not give by instantiation,
-  projection or normalisation) or is bind-only.
-- **Threshold and records**: accepted papers receive `WP-<year>-NNNN` and a
-  public page. The author decides whether the analysis is public. Papers that
-  do not pass keep a private report and may be revised.
-- **After acceptance**: editors propose statements to formalize; the author
-  approves each; verified Lean proofs appear on the public page. Conjectures
-  the paper poses are followed up; results go to the author first.
+- **Input**: papers and notes upload `.tex`, `.zip` or `.tar.gz` sources.
+  Conjectures use the same endpoint with either LaTeX source or a typed title,
+  statement (at most 20,000 characters), optional background (50,000) and origin.
+  Typed input becomes a minimal stored `.tex`, using the same reader, blob store,
+  PDF build and author confirmation. Its single conjecture is a main claim.
+- **Statements**: the author confirms kind, main or supporting role and
+  dependencies. Papers/notes require a proved main result; conjectures require a
+  main conjecture or question. Stored documents without `kind` load as `paper`.
+- **Analysis**: for papers/notes, whether prior work states or implies a result,
+  and whether its proof carries a new intermediate proposition (an escape
+  witness) or follows by binding alone. Conjectures are checked for well-posedness,
+  open/known status, and whether a proof would carry new mathematical content.
+  Named works are reported names, never verified bibliographic claims.
+- **Public layers**: the upload checkbox “Make public after acceptance” defaults
+  to checked for all kinds. Publication happens at the decision, before advice,
+  letter or Lean. The author may later change visibility through the existing
+  route. Public details contain title, authors, abstract, DOI and record id;
+  statements with dependencies; witness lemmas of audited-correct main content
+  results; and verified Lean artifacts. Lean ✓ means a verifier-passed proof.
+  Correctness labels, comments, rationale, audit summaries, referee reports,
+  letters and advice stay private to authors/staff. Private or legacy undecided
+  records expose title, authors, kind and record id only.
+- **After acceptance**: papers/notes receive the existing private post-letter
+  Lean probe; publishing proofs still requires author approval. Accepted
+  conjectures receive a Lean target and plain-language reading after the letter.
+  The binary elaborates the Lean statement; `sorry` is allowed only as the final
+  proof of `theorem wishpool_target`. It stores exact text, SHA-256 digest and
+  toolchain. Only the submitting author in a cookie session may confirm the
+  digest or reject it with a correction that feeds regeneration. A new version
+  voids confirmation. Only an author-confirmed statement can be attacked;
+  standalone conjecture attack attempts are Phase B, outside this implementation.
 - **Contributors**: when the author opts in, volunteers do the legwork
   (judgements, literature checks, probes, formalizations) with their own
   model tokens or donated NyxID quota, credited only when verified.
@@ -35,14 +52,18 @@ Review stages:
 |---|---|---|
 | S0 | Source: the source is read, the PDF compiles, AI use is disclosed | worker (TeX Live) |
 | S1 | Statements and their dependency graph | **the author** |
-| S2 | Literature: no main result is already stated or directly implied | **human** (machine leads are proposals) |
-| S3 | Escape: bind-only vs content, escape witnesses | **human** (machine and contributor judgements are proposals; an editor adopts them) |
+| S2 | Literature: no main result is already stated or directly implied | **Codex auditor** (checks the GPT Pro report against the source) |
+| S3 | Escape: bind-only vs content, escape witnesses | **Codex auditor** (source-based correctness, shape and witnesses) |
 
 Threshold (`api/crates/layer2-core/src/policy.rs`, the only authority):
 accept on **escape_witness** (a main result is judged content and is not
 known) or **open_problem_settlement** (a main result settles a named, sourced
-open problem the literature had not settled). Every non-acceptance carries a
-published reason.
+open problem the literature had not settled). Conjectures are accepted for
+**open_conjecture** iff at least one main open claim is audited well-posed,
+`open`, and `content` (a proof would carry new mathematical content). Known true,
+known false, special cases of known results, unclear status and bind-only readings
+do not meet that rule. Existing human-stage and endorsement gates apply to every
+kind. Every non-acceptance carries an author-facing reason.
 
 Escape rates are reported only as exact readings on an explicitly built finite
 arena. Never compute, estimate or display a percentage for a statement whose
@@ -87,19 +108,30 @@ sdk/contribute/    the contributors' CLI and MCP server.
 - Contributors see a statement, its dependencies, and the paper's title and
   abstract only while the author keeps `open_to_contributors` on. Turning it
   off closes the paper's open tasks.
-- The analysis of an accepted paper is public only after the author chooses
-  `public`. Formalization of a statement starts only after the author
-  approves it.
+- Accepted mathematical details are public when the upload checkbox selected
+  `public`, and may be made private later. Reviews and letters remain private
+  under either setting. Formalization of a proved statement starts only after
+  the author approves it. The private post-letter Lean probe exposes outcomes, never proof
+  files, to the authors; publishing files still requires their agreement.
+- Submitter and linked co-authors may read their private audit, the GPT Pro
+  report and projected Lean outcomes through the referee view. Advice and probe
+  files remain staff-only; public acceptance does not expose that private view.
 - Only the author confirms statements (S1). A new version returns the paper
   to draft; a changed statement set voids S2/S3 reports, judgements and tasks
   of the old set by revision, never by deletion.
 
 ## 5. Judgements and credit
 
-- Escape judgements are judgements with provenance. Never present them as
-  machine-checked. An editor's judgement confirms; two machine judgements
-  from different model families and accounts that agree corroborate;
-  disagreement is a dispute for an editor. S3 is filed by an editor.
+- Escape judgements retain provenance; never present them as Lean-checked.
+  GPT Pro referees and Codex audits its report against the source. Layer 2
+  files machine S2/S3 from that audit and automatically applies `Policy::decide`.
+  Only a proved main result audited `correct` can carry escape witnesses or
+  ground a named open-problem settlement. Standalone conjecture admission uses
+  the audited well-posed/open/content reading, with no proof-correctness claim. Recommendations are feedback, never decisions.
+  The default human requirement is `{Claims}`; deployments may require human
+  S2/S3 reports again. Editors are optional. Independent contributor judgements
+  still corroborate by the existing different-family/account rule; editors may
+  confirm them or resolve disputes.
 - A judgement contribution counts when it is corroborated or confirmed;
   literature checks and probes when an editor accepts them; a formalization
   when an editor records the checked Lean proof (repository, full commit,
@@ -165,31 +197,60 @@ from `develop`. No force pushes to either.
 ## 11. Referee rounds and feedback
 
 - S1 confirmation queues a referee round on the exact paper version and
-  statement revision. Settled steps are immutable; editors restart by creating
-  a new round after the current round settles. Layer 2 owns ordering, fencing,
-  letter validation and all view rules.
-- Referee recommendations are advice, never decisions. S2/S3 human adoption and
-  `Policy::decide` remain the only publication flow. Referee concerns, citations
-  and computational claims are reported findings, never verified evidence.
-- Referee statement readings are machine judgements under the separate referee
-  account (default `wishpool:referee`, engine `nyxid-oracle`), eligible for the
-  existing independent-account, different-model-family corroboration rule.
-- Advice runs only for `accept` or `minor_revision`, distinguishes evidence-backed
-  reported checks from proposals, and proposes Lean 4 + Mathlib formalization
-  only for proved statements. A sketch does not verify a theorem. Actual
-  formalization still needs acceptance and the author's approval.
-- A round may run a private, staff-only formalization probe on proposed
-  statements. The binary itself compiles each Lean file and checks its axioms;
-  the prover's account is never the result. A compiled probe is not a recorded
-  formalization, and publishing it needs the author's agreement.
-- Letters are drafts until an editor sends them in-app. Only staff see rounds;
-  the submitter and linked co-authors see only sent letters, including subject,
-  body and the optional longer mathematical note. No automatic send or email.
+  statement revision. Layer 2 owns ordering, input fencing, immutable settled
+  steps, report filing, decision application, letter validation and view rules.
+- The pipeline is GPT Pro referee → Codex audit → automatic escape-analysis
+  decision → advice → automatically delivered letter → accepted-only Lean probe.
+  Publication is immediate when the selected visibility is public. Paper/note
+  probes and conjecture statement elaboration follow the delivered letter.
+  No step requires a human editor. Editors/admins may intervene, restart settled
+  reviews while the paper is in review, or send additional letters.
+- For conjectures, the referee supplies well-posedness reasons, open/known/unclear
+  status, reported work names, content/bind-only escape reasons and sharpening
+  suggestions. Codex checks missing symbols/quantifiers and small cases offline;
+  known-result matches need offline evidence in available source/report material.
+  External knowledge is not checkable and becomes unclear, never verified.
+- The audit checks source, report JSON and full text, computing where useful.
+  It covers every confirmed statement with correctness, a one-sentence comment,
+  proof shape/witnesses where applicable, and agreement with the referee.
+  External facts unavailable offline are `not_checkable`, never confirmed.
+  `known` names only works named in the paper or report; never invent citations.
+- Layer 2 appends audit-derived S2 (known prior works) and S3 (main-result escape
+  assessments) under the statement revision fence. Gap/error/not-checked main
+  results have no escape witnesses and cannot ground acceptance. Publication is
+  decided only by `Policy::decide`, never either model's recommendation.
+  Report and decision replay is idempotent, including recovery after record
+  insertion. Accepted records and their publication inputs remain immutable.
+- Advice runs after the applied decision for every audited paper and feeds
+  improvement suggestions to the letter. Formalization candidates are used only
+  after acceptance. A sketch does not verify a theorem.
+- A completed letter step atomically delivers the letter in-app, with its round,
+  audited assessment, the auditor as sender, and `edited=false`. It states the
+  applied decision and record/reasons first, then audited feedback, confirmed
+  changes, "please check" for unavailable facts, and improvement suggestions.
+  It contains no Lean results. Manual additional letters remain available.
+- Lean runs only after a delivered letter and acceptance, using advice's proved
+  candidates. The binary compiles each file and checks axioms. Authors see
+  statement, outcome and theorem name afterwards; no second letter is needed.
+  A compiled probe is not a recorded formalization; publishing files needs the
+  author's agreement.
+- Staff receive full review history. Submitter and linked co-authors receive
+  reports, audits, sent letters and projected Lean outcomes through the existing
+  referee GET; advice, drafts, provider metadata and Lean files remain private.
+  Anyone else receives `not_found`, including readers of an accepted paper.
+- Referee readings remain machine judgements under `wishpool:referee` by default
+  (engine `nyxid-oracle`). Audit reports and automatic letters use the separate
+  `wishpool:auditor` account by default (engine `codex-cli`). All model output is
+  untrusted and sanitised in the binary; never invent witnesses or citations.
 - A referee request goes to every configured Oracle pool; the first completed
-  answer is the report.
+  answer is the report. The default pool is `chrono-chatgpt-pro-pool` on the
+  standalone Oracle broker, reached through NyxID's proxy service `oracle`
+  (`nyxid proxy request oracle api/v1/oracle/...` for the local CLI).
 - The NyxID Oracle task and submission identity are durable; the worker releases
-  its lease between polls without spending retries. Transport completion is not
-  mathematical verification. Model output is sanitised in the binary.
+  its lease between polls without spending retries and renews a running job's
+  30-minute lease about every five minutes. A lost lease fences the pending
+  result. Transport completion is not mathematical verification. Model output
+  is sanitised in the binary.
 - Oracle CLI and Codex CLI backends are local-only and refused on non-loopback
   binds. Their children inherit only `PATH` and operator `HOME`, never deployment
   secrets. Codex operates on a fresh source copy with a separate scratch area,

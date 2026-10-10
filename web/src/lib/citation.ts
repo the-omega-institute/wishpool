@@ -10,7 +10,7 @@ export function paperCitation(paper: PaperSummary, origin: string): string {
   const doiHref = paper.doi ? sourceHref({ kind: 'doi', locator: paper.doi }) : null;
   return [
     `${authors}. ${title}.`,
-    `Wishpool record ${paper.record}, accepted ${formatDate(paper.accepted_at)}.`,
+    `Wishpool record ${paper.record}${paper.accepted_at ? `, accepted ${formatDate(paper.accepted_at)}` : ''}.`,
     paper.doi ? `doi:${paper.doi}${doiHref ? ` (${doiHref})` : ''}.` : null,
     `${origin}/papers/${encodeURIComponent(paper.record)}`,
   ]

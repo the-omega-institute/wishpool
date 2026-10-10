@@ -14,7 +14,7 @@ use std::sync::Arc;
 use axum::Router;
 use wishpool_core::app::App;
 
-pub use auth::AuthenticatedCaller;
+pub use auth::{AuthenticatedCaller, RequestAuthentication};
 pub use problems::{Problem, problem_response};
 
 /// The `/api/v1` router.

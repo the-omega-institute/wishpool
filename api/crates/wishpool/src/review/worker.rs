@@ -15,6 +15,7 @@ use crate::latex::{self, Compile};
 
 const IDLE_POLL: Duration = Duration::from_secs(3);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+const LEASE_HEARTBEAT: Duration = Duration::from_secs(5 * 60);
 /// Main results searched per paper.
 const MAX_SEARCHED: usize = 6;
 
@@ -26,12 +27,15 @@ pub struct Worker {
     pub openalex: Arc<OpenAlex>,
     pub reviewer: Caller,
     pub referee_account: Caller,
+    pub auditor_account: Caller,
     pub referee_model: String,
     pub oracle: Option<Arc<dyn wishpool_review::oracle::Oracle>>,
     pub advisor: Option<Arc<dyn wishpool_review::advisor::Advisor>>,
     pub formalizer: Option<Arc<dyn wishpool_review::lean::Formalizer>>,
     pub oracle_poll: Duration,
     pub advisor_work_dir: std::path::PathBuf,
+    pub audit_budget: Duration,
+    pub formal_budget: Duration,
 }
 
 /// Whether a failure is worth retrying.
@@ -39,6 +43,7 @@ pub struct Worker {
 pub(super) enum Failure {
     Transient(String),
     Permanent(String),
+    LeaseLost,
 }
 
 impl From<CoreError> for Failure {
@@ -91,9 +96,31 @@ impl Worker {
         tracing::info!("paper worker stopped");
     }
 
-    async fn handle(&self, job: LeasedJob) {
+    pub(super) async fn handle(&self, job: LeasedJob) {
         let span = tracing::info_span!("paper_job", submission = %job.submission, kind = kind_key(job.kind), attempt = job.attempts);
-        let result = self.process(&job).instrument(span).await;
+        // The process future is cancelled before it can persist a result when
+        // renewal loses ownership (or cannot establish it). No detached
+        // heartbeat remains after a job completes or defers.
+        let result = async {
+            if !self.jobs.renew(&job).await? {
+                return Err(Failure::LeaseLost);
+            }
+            let process = self.process(&job);
+            tokio::pin!(process);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::time::sleep(LEASE_HEARTBEAT) => {
+                        if !self.jobs.renew(&job).await? {
+                            break Err(Failure::LeaseLost);
+                        }
+                    }
+                    result = &mut process => break result,
+                }
+            }
+        }
+        .instrument(span)
+        .await;
         let settled = match result {
             Ok(true) => Ok(()),
             Ok(false) => self.jobs.complete(&job).await,
@@ -105,6 +132,10 @@ impl Worker {
                 tracing::warn!(reason, "job will be retried");
                 self.jobs.retry(&job, &reason).await
             }
+            Err(Failure::LeaseLost) => {
+                tracing::warn!("job lease lost; pending result discarded");
+                Ok(())
+            }
         };
         if let Err(error) = settled {
             tracing::error!(%error, "could not settle job; its lease will expire and it will be retried");
@@ -112,6 +143,9 @@ impl Worker {
     }
 
     async fn process(&self, job: &LeasedJob) -> Result<bool, Failure> {
+        if job.kind == JobKind::LeanStatement {
+            return self.lean_statement_job(job).await;
+        }
         if job.kind == JobKind::Referee {
             return self.referee_job(job).await;
         }
@@ -121,14 +155,24 @@ impl Worker {
             Err(error) => return Err(error.into()),
         };
         match job.kind {
-            JobKind::Referee => unreachable!("referee handled above"),
-            JobKind::Compile => self.compile(&submission).await,
-            JobKind::Stage(Stage::Literature) => self.literature(&submission).await,
-            JobKind::Stage(Stage::Escape) => self.escape(&submission).await,
+            JobKind::LeanStatement | JobKind::Referee => unreachable!("referee handled above"),
+            JobKind::Compile => self.compile(job, &submission).await,
+            JobKind::Stage(Stage::Literature) => self.literature(job, &submission).await,
+            JobKind::Stage(Stage::Escape) => self.escape(job, &submission).await,
             // The compile job files S0; the author confirms S1.
             JobKind::Stage(Stage::Hygiene | Stage::Claims) => Ok(()),
         }?;
         Ok(false)
+    }
+
+    /// Recheck ownership immediately before writing a result, including a
+    /// lease lost between periodic heartbeat ticks.
+    pub(super) async fn ensure_lease(&self, job: &LeasedJob) -> Result<(), Failure> {
+        if self.jobs.renew(job).await? {
+            Ok(())
+        } else {
+            Err(Failure::LeaseLost)
+        }
     }
 
     async fn source(&self, submission: &Submission) -> Result<(Vec<u8>, String), Failure> {
@@ -147,7 +191,7 @@ impl Worker {
         Ok((file.bytes, version.filename.clone()))
     }
 
-    async fn compile(&self, submission: &Submission) -> Result<(), Failure> {
+    async fn compile(&self, job: &LeasedJob, submission: &Submission) -> Result<(), Failure> {
         if submission.status == SubmissionStatus::Withdrawn {
             return Ok(());
         }
@@ -163,13 +207,14 @@ impl Worker {
         if let Err(message) = &outcome {
             tracing::info!(version = number, message = %message.lines().last().unwrap_or_default(), "source did not compile");
         }
+        self.ensure_lease(job).await?;
         self.app
             .record_compilation(&self.reviewer, &submission.id, number, outcome)
             .await?;
         Ok(())
     }
 
-    async fn literature(&self, submission: &Submission) -> Result<(), Failure> {
+    async fn literature(&self, job: &LeasedJob, submission: &Submission) -> Result<(), Failure> {
         let Some(model) = &self.model else {
             return Ok(());
         };
@@ -200,6 +245,7 @@ impl Worker {
             found.push(leads);
         }
         let draft = mapping::literature(&found, model.model());
+        self.ensure_lease(job).await?;
         self.app
             .file_report(
                 &self.reviewer,
@@ -219,7 +265,7 @@ impl Worker {
         }
     }
 
-    async fn escape(&self, submission: &Submission) -> Result<(), Failure> {
+    async fn escape(&self, job: &LeasedJob, submission: &Submission) -> Result<(), Failure> {
         let Some(model) = &self.model else {
             return Ok(());
         };
@@ -251,6 +297,7 @@ impl Worker {
             tracing::info!(skipped = skipped.join(", "), "escape proposals dropped");
         }
         for (claim, output) in kept {
+            self.ensure_lease(job).await?;
             self.app
                 .file_machine_judgement(
                     &self.reviewer,

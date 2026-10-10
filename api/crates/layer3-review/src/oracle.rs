@@ -1,4 +1,4 @@
-//! Durable external tasks through the NyxID Oracle HTTP API or local CLI.
+//! Durable external tasks through the standalone Oracle broker via NyxID's proxy.
 
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
@@ -31,6 +31,7 @@ pub enum OracleStatus {
     Running,
     Completed {
         text: String,
+        model: Option<String>,
     },
     Failed {
         reason: String,
@@ -102,13 +103,13 @@ async fn race_poll(oracle: &dyn Pools, handle: &str) -> ReviewResult<OracleStatu
     let mut first_error = None;
     for task in &tasks {
         match oracle.poll_one(task).await {
-            Ok(OracleStatus::Completed { text }) => {
+            Ok(completed @ OracleStatus::Completed { .. }) => {
                 for other in tasks.iter().filter(|t| *t != task) {
                     if let Err(error) = oracle.cancel_one(other).await {
                         tracing::warn!(task = other, %error, "losing oracle task was not cancelled");
                     }
                 }
-                return Ok(OracleStatus::Completed { text });
+                return Ok(completed);
             }
             Ok(status) => statuses.push(status),
             Err(error) => {
@@ -143,7 +144,7 @@ async fn race_poll(oracle: &dyn Pools, handle: &str) -> ReviewResult<OracleStatu
         .unwrap_or(OracleStatus::Cancelled))
 }
 
-/// Both CLI JSON branches print the server envelope unchanged.
+/// The HTTP API and proxy CLI return the same broker task object.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct TaskJson {
     #[serde(default)]
@@ -158,10 +159,69 @@ pub struct TaskJson {
     failure_reason: Option<String>,
     #[serde(default)]
     failure_detail: Option<String>,
+    #[serde(default)]
+    observed_model_switcher: Option<String>,
+    #[serde(default)]
+    observed_model_effort: Option<String>,
 }
 
 pub fn parse_task(text: &str) -> ReviewResult<TaskJson> {
-    serde_json::from_str(text).map_err(|e| ReviewError::Output(format!("oracle task: {e}")))
+    parse_response(text, None)
+}
+
+fn parse_response(text: &str, status: Option<u16>) -> ReviewResult<TaskJson> {
+    let value = serde_json::from_str::<serde_json::Value>(text);
+    if status.is_some_and(|s| !(200..300).contains(&s))
+        || value.as_ref().is_ok_and(|v| v.get("error").is_some())
+    {
+        // Only retain a short code, never the body or message (which may echo
+        // credentials, prompts or attachments).
+        let code = value
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("error"))
+            .and_then(|v| v.as_str())
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() <= 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+            .unwrap_or("oracle_request_failed");
+        return Err(match status {
+            Some(status)
+                if !(200..300).contains(&status)
+                    && status != 429
+                    && !(500..600).contains(&status) =>
+            {
+                ReviewError::Provider {
+                    status,
+                    body: code.into(),
+                }
+            }
+            _ => ReviewError::Transport(format!("oracle request failed ({status:?}): {code}")),
+        });
+    }
+    let value = value.map_err(|_| ReviewError::Output("oracle task JSON is invalid".into()))?;
+    serde_json::from_value(value)
+        .map_err(|_| ReviewError::Output("oracle task fields are invalid".into()))
+}
+
+fn observed_model(switcher: Option<String>, effort: Option<String>) -> Option<String> {
+    let label = |value: String| {
+        let value = value.trim();
+        (!value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)))
+        .then(|| value.to_string())
+    };
+    let model = switcher.and_then(label)?;
+    Some(match effort.and_then(label) {
+        Some(effort) => format!("{model} · {effort}"),
+        None => model,
+    })
 }
 
 impl TaskJson {
@@ -187,6 +247,7 @@ impl TaskJson {
                 text: self.response.ok_or_else(|| {
                     ReviewError::Output("completed oracle task has no response text".into())
                 })?,
+                model: observed_model(self.observed_model_switcher, self.observed_model_effort),
             },
             "failed" => OracleStatus::Failed {
                 reason: self.failure_reason.unwrap_or_else(|| "unknown".into()),
@@ -220,6 +281,16 @@ fn validate(request: &OracleRequest) -> ReviewResult<()> {
     Ok(())
 }
 
+fn request_body(request: &OracleRequest) -> serde_json::Value {
+    let mut body =
+        json!({ "prompt": request.prompt, "client_ref": request.client_ref, "tag": request.tag });
+    if let Some((name, bytes)) = &request.pdf {
+        body["pdf_name"] = json!(name);
+        body["pdf_base64"] = json!(STANDARD.encode(bytes));
+    }
+    body
+}
+
 pub struct OracleHttp {
     pub base_url: String,
     pub token: String,
@@ -241,6 +312,7 @@ impl OracleHttp {
             .extend(path);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
+            .user_agent(concat!("wishpool/", env!("CARGO_PKG_VERSION")))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| ReviewError::Transport(e.to_string()))?;
@@ -258,14 +330,7 @@ impl OracleHttp {
             .text()
             .await
             .map_err(|e| ReviewError::Transport(e.to_string()))?;
-        if !(200..300).contains(&status) {
-            // Do not persist provider response bodies, which can echo credentials.
-            return Err(ReviewError::Provider {
-                status,
-                body: "oracle request failed".into(),
-            });
-        }
-        parse_task(&text)
+        parse_response(&text, Some(status))
     }
 }
 
@@ -295,12 +360,7 @@ impl Pools for OracleHttp {
         pool: &str,
         request: &OracleRequest,
     ) -> ReviewResult<OracleSubmitted> {
-        let mut body = json!({ "prompt": request.prompt, "client_ref": request.client_ref, "tag": request.tag });
-        if let Some((name, bytes)) = &request.pdf {
-            body["pdf_name"] = json!(name);
-            body["pdf_base64"] = json!(STANDARD.encode(bytes));
-        }
-        self.request(&["pools", pool, "tasks"], Some(body))
+        self.request(&["pools", pool, "tasks"], Some(request_body(request)))
             .await?
             .submitted()
     }
@@ -309,10 +369,17 @@ impl Pools for OracleHttp {
         self.request(&["tasks", task], None).await?.status()
     }
 
-    /// The HTTP cancel route is not part of the contract this adapter was
-    /// verified against; the losing task runs to completion.
-    async fn cancel_one(&self, _task: &str) -> ReviewResult<()> {
-        Ok(())
+    async fn cancel_one(&self, task: &str) -> ReviewResult<()> {
+        match self
+            .request(&["tasks", task, "cancel"], Some(json!({})))
+            .await
+        {
+            Ok(_)
+            | Err(ReviewError::Provider {
+                status: 404 | 409, ..
+            }) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -351,7 +418,63 @@ async fn run(mut command: Command) -> ReviewResult<TaskJson> {
             output.status
         )));
     }
-    parse_task(std::str::from_utf8(&output.stdout).map_err(|e| ReviewError::Output(e.to_string()))?)
+    // The proxy CLI exits successfully even on HTTP failures.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let status = stderr.lines().find_map(|line| {
+        let (_, rest) = line.split_once("HTTP ")?;
+        rest.split_whitespace()
+            .next()?
+            .parse::<u16>()
+            .ok()
+            .filter(|s| (100..600).contains(s))
+    });
+    parse_response(
+        std::str::from_utf8(&output.stdout)
+            .map_err(|_| ReviewError::Output("oracle CLI output is not UTF-8".into()))?,
+        status,
+    )
+}
+
+impl OracleCli {
+    async fn request(&self, path: &str, body: Option<serde_json::Value>) -> ReviewResult<TaskJson> {
+        let mut command = local_command(&self.program);
+        command.args(["proxy", "request", "oracle", path]);
+        // Keep the directory alive until the child exits, including failures.
+        let _work = if let Some(body) = body {
+            std::fs::create_dir_all(&self.work_dir)
+                .map_err(|e| ReviewError::Transport(e.to_string()))?;
+            let mut directories = tempfile::Builder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                directories.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            let work = directories
+                .tempdir_in(&self.work_dir)
+                .map_err(|e| ReviewError::Transport(e.to_string()))?;
+            let path = work.path().join("request.json");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options
+                .open(&path)
+                .map_err(|e| ReviewError::Transport(e.to_string()))?;
+            serde_json::to_writer(file, &body)
+                .map_err(|e| ReviewError::Transport(e.to_string()))?;
+            command
+                .args(["--method", "POST", "--data"])
+                .arg(format!("@{}", path.display()));
+            Some(work)
+        } else {
+            None
+        };
+        command.args(["--output", "json"]);
+        run(command).await
+    }
 }
 
 #[async_trait]
@@ -380,42 +503,34 @@ impl Pools for OracleCli {
         pool: &str,
         request: &OracleRequest,
     ) -> ReviewResult<OracleSubmitted> {
-        std::fs::create_dir_all(&self.work_dir)
-            .map_err(|e| ReviewError::Transport(e.to_string()))?;
-        let work = tempfile::tempdir_in(&self.work_dir)
-            .map_err(|e| ReviewError::Transport(e.to_string()))?;
-        let prompt = work.path().join("prompt.md");
-        std::fs::write(&prompt, &request.prompt)
-            .map_err(|e| ReviewError::Transport(e.to_string()))?;
-        let mut command = local_command(&self.program);
-        command.args(["oracle", "ask", pool, "--file"]).arg(prompt);
-        if let Some((_, bytes)) = &request.pdf {
-            let pdf = work.path().join("paper.pdf");
-            std::fs::write(&pdf, bytes).map_err(|e| ReviewError::Transport(e.to_string()))?;
-            command.arg("--pdf").arg(pdf);
-        }
-        command.args([
-            "--client-ref",
-            &request.client_ref,
-            "--tag",
-            &request.tag,
-            "--no-wait",
-            "--output",
-            "json",
-        ]);
-        run(command).await?.submitted()
+        self.request(
+            &format!("api/v1/oracle/pools/{pool}/tasks"),
+            Some(request_body(request)),
+        )
+        .await?
+        .submitted()
     }
 
     async fn poll_one(&self, task: &str) -> ReviewResult<OracleStatus> {
-        let mut command = local_command(&self.program);
-        command.args(["oracle", "result", task, "--output", "json"]);
-        run(command).await?.status()
+        self.request(&format!("api/v1/oracle/tasks/{task}"), None)
+            .await?
+            .status()
     }
 
     async fn cancel_one(&self, task: &str) -> ReviewResult<()> {
-        let mut command = local_command(&self.program);
-        command.args(["oracle", "cancel", task, "--output", "json"]);
-        run(command).await.map(|_| ())
+        match self
+            .request(
+                &format!("api/v1/oracle/tasks/{task}/cancel"),
+                Some(json!({})),
+            )
+            .await
+        {
+            Ok(_)
+            | Err(ReviewError::Provider {
+                status: 404 | 409, ..
+            }) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }
 

@@ -4,15 +4,14 @@ import { useApi } from '../api/context';
 import { useAsync } from '../api/useAsync';
 import { usePaged } from '../api/usePaged';
 import type { PaperSummary, PublicPaper } from '../api/types';
-import { AnalysisView, ConjectureList } from '../components/Analysis';
 import { AuthorLine } from '../components/AuthorLine';
 import { BasisBadge } from '../components/badges';
-import { StatementList } from '../components/claims';
+import { PublicStatements, statementName } from '../components/StatementSummary';
 import { LatexText, MacrosProvider } from '../components/Markdown';
 import { Pager } from '../components/Pager';
 import { Async, Badge, DateText, ExternalLink, MscList } from '../components/ui';
 import { paperCitation } from '../lib/citation';
-import { AI_USE_DESCRIPTIONS, AI_USE_LABELS, formatAuthors } from '../lib/labels';
+import { CLAIM_KIND_LABELS, SUBMISSION_KIND_LABELS, formatAuthors } from '../lib/labels';
 import { safeHttpUrl, sourceHref } from '../lib/links';
 import { Link } from '../routing/router';
 
@@ -25,21 +24,27 @@ export function PaperEntry({ paper }: { paper: PaperSummary }) {
       <p className="entry-meta">
         <span>{formatAuthors(paper.authors)}</span>
         <span>
-          · <code>{paper.record}</code>
+          · <code>{paper.record}</code> · {SUBMISSION_KIND_LABELS[paper.kind]}
         </span>
         <span>
-          · accepted <DateText iso={paper.accepted_at} />
+          {paper.accepted_at ? (
+            <>
+              · accepted <DateText iso={paper.accepted_at} />
+            </>
+          ) : null}
         </span>
       </p>
       <p className="entry-meta">
-        <BasisBadge basis={paper.basis} />
-        <span>
-          {paper.main_results} main result{paper.main_results === 1 ? '' : 's'}
-        </span>
-        {paper.lean_verified > 0 ? (
+        {paper.basis ? <BasisBadge basis={paper.basis} /> : null}
+        {paper.main_results !== undefined ? (
+          <span>
+            {paper.main_results} main result{paper.main_results === 1 ? '' : 's'}
+          </span>
+        ) : null}
+        {(paper.lean_verified ?? 0) > 0 ? (
           <Badge tone="good">{paper.lean_verified} Lean verified</Badge>
         ) : null}
-        <MscList codes={paper.msc} />
+        <MscList codes={paper.msc ?? []} />
       </p>
     </article>
   );
@@ -59,8 +64,7 @@ export function PapersPage() {
         <div>
           <h1>Accepted papers</h1>
           <p className="lede">
-            Papers that met the publication threshold: a main result carries new content and is not
-            stated or directly implied by prior work, or a main result settles a named open problem.{' '}
+            Papers and notes with new mathematical content, and conjectures accepted for display.{' '}
             <Link to={{ kind: 'policy' }}>Review policy</Link>
           </p>
         </div>
@@ -103,24 +107,27 @@ export function PaperPage({ record }: { record: string }) {
 
 export function PaperView({ paper }: { paper: PublicPaper }) {
   const s = paper.summary;
-  const latest = paper.versions[paper.versions.length - 1];
+  const latest = paper.versions?.at(-1);
+  const claims = paper.claims ?? [];
   const repo = paper.formalization_repository ? safeHttpUrl(paper.formalization_repository) : null;
   const doiHref = s.doi ? sourceHref({ kind: 'doi', locator: s.doi }) : null;
   return (
-    <MacrosProvider macros={paper.macros}>
+    <MacrosProvider macros={paper.macros ?? {}}>
       <article className="paper">
         <header className="record-head">
           <p className="eyebrow">
-            Record <code className="record-id">{s.record}</code>
+            Record <code className="record-id">{s.record}</code> · {SUBMISSION_KIND_LABELS[s.kind]}
           </p>
           <h1>{s.title}</h1>
           <AuthorLine authors={s.authors} />
           <p className="entry-meta">
-            <BasisBadge basis={s.basis} />
-            <span>
-              Accepted <DateText iso={s.accepted_at} />
-            </span>
-            <MscList codes={s.msc} />
+            {s.accepted_at ? (
+              <span>
+                {s.kind === 'conjecture' ? 'Displayed' : 'Accepted'}{' '}
+                <DateText iso={s.accepted_at} />
+              </span>
+            ) : null}
+            <MscList codes={s.msc ?? []} />
             {s.doi ? (
               <span>
                 · {doiHref ? <ExternalLink href={doiHref}>doi:{s.doi}</ExternalLink> : s.doi}
@@ -128,7 +135,7 @@ export function PaperView({ paper }: { paper: PublicPaper }) {
             ) : null}
           </p>
           <div className="button-row">
-            {latest?.has_pdf ? (
+            {latest?.has_pdf && s.submission ? (
               <a className="button" href={pdfHref(s.submission, latest.number)}>
                 PDF (version {latest.number})
               </a>
@@ -137,72 +144,63 @@ export function PaperView({ paper }: { paper: PublicPaper }) {
           </div>
         </header>
 
-        <section aria-labelledby="abstract-h">
-          <h2 id="abstract-h">Abstract</h2>
-          <LatexText source={s.abstract_text} className="abstract" />
-        </section>
-
-        <section aria-labelledby="ai-h">
-          <h2 id="ai-h">AI use</h2>
-          <p>
-            <Badge tone="neutral" title={AI_USE_DESCRIPTIONS[paper.ai_disclosure.level]}>
-              {AI_USE_LABELS[paper.ai_disclosure.level]}
-            </Badge>{' '}
-            {paper.ai_disclosure.statement}
-          </p>
-        </section>
-
-        {paper.versions.length > 0 ? (
-          <section aria-labelledby="versions-h">
-            <h2 id="versions-h">Versions</h2>
-            <ul className="version-list">
-              {[...paper.versions].reverse().map((v) => (
-                <li key={v.number}>
-                  <strong>Version {v.number}</strong> · <DateText iso={v.uploaded_at} />
-                  {v.has_pdf ? (
-                    <>
-                      {' '}
-                      · <a href={pdfHref(s.submission, v.number)}>PDF</a>
-                    </>
-                  ) : (
-                    <span className="muted"> · no PDF</span>
-                  )}
-                  {v.note ? <span className="muted"> — {v.note}</span> : null}
-                </li>
-              ))}
+        {s.abstract_text ? (
+          <section aria-labelledby="abstract-h">
+            <h2 id="abstract-h">Abstract</h2>
+            <LatexText source={s.abstract_text} className="abstract" />
+          </section>
+        ) : null}
+        {paper.new_content?.length ? (
+          <section aria-labelledby="new-content-h" className="new-content">
+            <h2 id="new-content-h">
+              {s.kind === 'note' ? 'New in this note' : 'New in this paper'}
+            </h2>
+            <ul className="new-content-list">
+              {paper.new_content.map((w) => {
+                const claim = claims.find((c) => c.id === w.claim);
+                return (
+                  <li key={w.claim}>
+                    <p className="new-content-claim">
+                      <span className="statement-kind">
+                        {claim ? CLAIM_KIND_LABELS[claim.kind] : 'Statement'}{' '}
+                        <span className="statement-id">{w.claim}</span>
+                      </span>{' '}
+                      {claim ? (
+                        <LatexText
+                          source={statementName(claim) ?? claim.statement}
+                          className="statement-preview"
+                        />
+                      ) : null}
+                    </p>
+                    <ul className="new-content-lemmas">
+                      {w.lemmas.map((lemma, i) => (
+                        <li key={i}>
+                          <LatexText source={lemma} />
+                        </li>
+                      ))}
+                    </ul>
+                  </li>
+                );
+              })}
             </ul>
           </section>
         ) : null}
-
-        <section aria-labelledby="statements-h">
-          <h2 id="statements-h">Statements</h2>
-          <StatementList claims={paper.claims} scope="public" />
-        </section>
-
-        {paper.analysis ? (
-          <>
-            <section aria-labelledby="analysis-h">
-              <h2 id="analysis-h">Analysis</h2>
-              <p className="muted small">
-                Published by the author. Literature (S2) and escape analysis (S3) per statement;
-                judgements carry their standing.
-              </p>
-              <AnalysisView analysis={paper.analysis} claims={paper.claims} scope="public" />
-            </section>
-            <section aria-labelledby="conjectures-h">
-              <h2 id="conjectures-h">Conjecture follow-ups</h2>
-              <ConjectureList
-                conjectures={paper.conjectures}
-                claims={paper.claims}
-                scope="public"
-              />
-            </section>
-          </>
+        {claims.length > 0 ? (
+          <section aria-labelledby="statements-h" className="statements">
+            <h2 id="statements-h">Statements</h2>
+            <PublicStatements claims={claims} />
+          </section>
         ) : (
-          <p className="muted analysis-private">
-            The authors keep the per-statement analysis private.
-          </p>
+          <p className="muted">The author keeps the mathematical details private.</p>
         )}
+        {paper.lean_statements?.map((target) => (
+          <section key={target.digest} aria-label="Author-confirmed Lean statement">
+            <h2>Author-confirmed Lean statement</h2>
+            <pre className="lean-source">
+              <code>{target.lean}</code>
+            </pre>
+          </section>
+        ))}
 
         <Citation paper={s} />
       </article>

@@ -206,6 +206,10 @@ impl EscapeRateReading {
 /// The escape judgement of one claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscapeAssessment {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conjecture: Option<super::ConjectureReading>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correctness: Option<super::referee::Correctness>,
     pub claim: ClaimId,
     pub shape: ProofShape,
     /// New propositions on the live proof path that prior results do not
@@ -221,10 +225,12 @@ impl EscapeAssessment {
     pub fn validate(&self) -> CoreResult<()> {
         require_text("rationale", &self.rationale, 10_000)?;
         match self.shape {
-            ProofShape::Content if self.witnesses.is_empty() => Err(CoreError::invalid(format!(
-                "content claim {} must name at least one escape witness",
-                self.claim
-            ))),
+            ProofShape::Content if self.witnesses.is_empty() && self.conjecture.is_none() => {
+                Err(CoreError::invalid(format!(
+                    "content claim {} must name at least one escape witness",
+                    self.claim
+                )))
+            }
             ProofShape::BindOnly if !self.witnesses.is_empty() => Err(CoreError::invalid(format!(
                 "bind-only claim {} cannot list escape witnesses",
                 self.claim
@@ -238,7 +244,10 @@ impl EscapeAssessment {
     }
 
     pub fn has_escape_content(&self) -> bool {
-        self.shape == ProofShape::Content && !self.witnesses.is_empty()
+        self.correctness
+            .is_none_or(|c| c == super::referee::Correctness::Correct)
+            && self.shape == ProofShape::Content
+            && !self.witnesses.is_empty()
     }
 }
 
