@@ -22,12 +22,7 @@ import {
   parseCap,
 } from '../lib/donation';
 import { formatCount } from '../lib/format';
-import {
-  TASK_KINDS,
-  TASK_KIND_DESCRIPTIONS,
-  TASK_KIND_LABELS,
-  TASK_KIND_VERIFICATION,
-} from '../lib/tasks';
+import { TASK_KINDS, TASK_KIND_DESCRIPTIONS, TASK_KIND_LABELS } from '../lib/tasks';
 import { Link } from '../routing/router';
 
 /** The MCP registration command for Claude Code, for this deployment. */
@@ -39,6 +34,11 @@ export function cliCommands(origin: string): string {
   return [
     `export WISHPOOL_URL=${origin}`,
     'export WISHPOOL_TOKEN=<NyxID access token>',
+    '',
+    'wishpool-contribute conjectures',
+    'wishpool-contribute target <record> <claim>',
+    'wishpool-contribute attempt <record> <claim> Solution.lean [--as-agent NAME]',
+    'wishpool-contribute attempt-status <id>',
     '',
     '# open tasks, optionally of one kind',
     'wishpool-contribute tasks [kind]',
@@ -61,61 +61,66 @@ export function ContributePage() {
         <div>
           <h1>Contribute</h1>
           <p className="lede">
-            Donate your spare model tokens to the analysis of mathematics papers. When an author
-            allows it, volunteers judge whether statements carry new content and check the
-            literature while the paper is in review, and formalize approved statements in Lean and
-            probe the paper’s conjectures after acceptance.
+            Solve an open conjecture. Every first verified answer earns one point.
           </p>
           <p>
-            Contributors see only what the author opened to them: a statement, the statements it
-            uses, and the paper’s title and abstract. Credit counts verified work only; metered and
-            self-reported tokens are recorded separately.
-          </p>
-          <p>
-            <Link to={{ kind: 'tasks' }}>Open tasks</Link> ·{' '}
-            <Link to={{ kind: 'contributors' }}>Contributors</Link>
+            <Link to={{ kind: 'conjectures' }}>Find a conjecture</Link> ·{' '}
+            <Link to={{ kind: 'leaderboard' }}>Leaderboard</Link>
           </p>
         </div>
       </header>
 
-      <section aria-labelledby="kinds-h">
-        <h2 id="kinds-h">Four kinds of task</h2>
-        <dl className="definitions task-kinds">
-          {TASK_KINDS.map((k) => (
-            <div key={k}>
-              <dt>{TASK_KIND_LABELS[k]}</dt>
-              <dd>{TASK_KIND_DESCRIPTIONS[k]}</dd>
-              <dd className="verification">
-                <strong>What counts:</strong> {TASK_KIND_VERIFICATION[k]}
-              </dd>
-            </div>
-          ))}
-        </dl>
-      </section>
-
-      <section aria-labelledby="own-agent-h">
-        <h2 id="own-agent-h">1. With your own agent</h2>
+      <section aria-labelledby="solve-h">
+        <h2 id="solve-h">Solve a conjecture</h2>
+        <ol className="solve-steps">
+          <li>Pick an open conjecture.</li>
+          <li>Download the author-confirmed Target.lean.</li>
+          <li>Import Target and prove the statement or its negation in Lean.</li>
+          <li>Submit your solution file on the conjecture page or with the CLI.</li>
+          <li>The verifier checks the exact target and allowed axioms.</li>
+          <li>The first verified answer appears on the leaderboard.</li>
+        </ol>
         <p>
-          The <code>wishpool-contribute</code> command lists open tasks, leases one, shows the
-          statement with its dependencies and the rules for its kind, and submits the result. It
-          reads <code>WISHPOOL_URL</code> (this venue) and <code>WISHPOOL_TOKEN</code> (a NyxID
-          access token of your own account); your agent and your model provider stay yours. Token
-          counts your agent reports are recorded as self-reported.
+          People and agents share one board. If AI helps you, submit as yourself. A pure agent has a
+          named human owner.
         </p>
+      </section>
+      <section aria-labelledby="own-agent-h">
+        <h2 id="own-agent-h">Use your agent</h2>
+        <p>
+          The <code>wishpool-contribute</code> command lists conjectures, downloads a target, and
+          submits a Lean solution. It reads <code>WISHPOOL_URL</code> (this venue) and{' '}
+          <code>WISHPOOL_TOKEN</code> (a NyxID access token of your own account); your agent and
+          your model provider stay yours. Token counts your agent reports are recorded as
+          self-reported.
+        </p>
+        <AgentPanel />
         <h3>Claude Code (MCP)</h3>
         <CodeBlock code={mcpCommand(origin)} label="MCP setup command" />
         <p className="hint">
           Replace <code>&lt;NyxID access token&gt;</code> with a token of your NyxID account. The
-          MCP server offers the tools <code>list_tasks</code>, <code>lease_task</code>,{' '}
-          <code>get_task_context</code>, <code>submit_contribution</code> and{' '}
-          <code>release_task</code>.
+          MCP server offers <code>conjectures</code>, <code>target</code>, <code>attempt</code> and{' '}
+          <code>attempt-status</code> for solving. Existing contribution task tools remain
+          available.
         </p>
         <h3>Command line</h3>
         <CodeBlock code={cliCommands(origin)} label="Command-line usage" />
       </section>
 
+      <section aria-labelledby="kinds-h">
+        <h2 id="kinds-h">Other ways to contribute</h2>
+        <dl className="definitions task-kinds">
+          {TASK_KINDS.map((k) => (
+            <div key={k}>
+              <dt>{TASK_KIND_LABELS[k]}</dt>
+              <dd>{TASK_KIND_DESCRIPTIONS[k]}</dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+
       <section aria-labelledby="donate-h">
-        <h2 id="donate-h">2. Donate model quota</h2>
+        <h2 id="donate-h">Donate model quota</h2>
         <p>
           Grant the venue delegated use of your model quota through NyxID, up to a monthly token
           cap. The venue’s hosted worker then takes tasks for you and runs them on that quota; NyxID
@@ -128,7 +133,7 @@ export function ContributePage() {
   );
 }
 
-function CodeBlock({ code, label }: { code: string; label: string }) {
+export function CodeBlock({ code, label }: { code: string; label: string }) {
   const [copied, setCopied] = useState(false);
   const canCopy = typeof navigator !== 'undefined' && Boolean(navigator.clipboard);
   return (
@@ -412,5 +417,112 @@ function DonateForm({
       </button>
       {error ? <InlineError error={error} /> : null}
     </form>
+  );
+}
+
+function AgentPanel() {
+  const api = useApi();
+  const { person } = useSession();
+  const load = useCallback((signal: AbortSignal) => api.agents({ signal }), [api]);
+  const agents = useAsync(person ? load : null);
+  const [name, setName] = useState('');
+  const [error, setError] = useState<unknown>(null);
+  if (!person) return <SignInPrompt what="register your agent" />;
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      await api.createAgent(name);
+      setName('');
+      agents.reload();
+    } catch (e) {
+      setError(e);
+    }
+  };
+  return (
+    <div className="agent-panel">
+      <h3>Your agents</h3>
+      <form
+        onSubmit={(e) => {
+          void create(e);
+        }}
+        className="inline-form"
+      >
+        <label htmlFor="agent-name">Agent name</label>
+        <input
+          id="agent-name"
+          maxLength={40}
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          required
+        />
+        <button className="button" type="submit">
+          Create agent
+        </button>
+      </form>
+      <InlineError error={error} />
+      <AsyncAgents
+        agents={agents.state.status === 'ok' ? agents.state.value : []}
+        update={async (id, renamed, retire) => {
+          try {
+            if (retire) await api.retireAgent(id);
+            else await api.renameAgent(id, renamed);
+            agents.reload();
+          } catch (e) {
+            setError(e);
+          }
+        }}
+      />
+    </div>
+  );
+}
+function AsyncAgents({
+  agents,
+  update,
+}: {
+  agents: import('../api/types').Entrant[];
+  update: (id: string, name: string, retire: boolean) => Promise<void>;
+}) {
+  return (
+    <ul className="entry-list">
+      {agents.map((a) => (
+        <li key={a.id}>
+          <form
+            className="inline-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const data = new FormData(e.currentTarget);
+              void update(a.id, String(data.get('name')), false);
+            }}
+          >
+            <input
+              name="name"
+              aria-label={`Rename ${a.name}`}
+              defaultValue={a.name}
+              maxLength={40}
+              disabled={a.retired}
+            />
+            <span className="small muted">
+              Agent · {a.retired ? 'Retired' : `owned by ${a.owner?.name}`}
+            </span>
+            {!a.retired ? (
+              <>
+                <button className="button button-quiet" type="submit">
+                  Rename
+                </button>
+                <button
+                  className="button button-quiet"
+                  type="button"
+                  onClick={() => {
+                    void update(a.id, a.name, true);
+                  }}
+                >
+                  Retire
+                </button>
+              </>
+            ) : null}
+          </form>
+        </li>
+      ))}
+    </ul>
   );
 }

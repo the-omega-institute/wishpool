@@ -132,6 +132,8 @@ pub enum JobKind {
     Compile,
     Referee,
     LeanStatement,
+    OpenProblems,
+    VerifyAttempt,
 }
 
 /// A job together with the opaque lease token that fences its worker.
@@ -243,6 +245,8 @@ pub trait GrantStore: Send + Sync {
 
 /// Everything Layer 2 needs, bundled for composition.
 pub struct Ports {
+    pub solving: Arc<dyn SolvingStore>,
+    pub verifier: Arc<dyn Verifier>,
     pub clock: Arc<dyn Clock>,
     pub people: Arc<dyn PersonStore>,
     pub submissions: Arc<dyn SubmissionStore>,
@@ -256,4 +260,34 @@ pub struct Ports {
     pub judgements: Arc<dyn JudgementStore>,
     pub grants: Arc<dyn GrantStore>,
     pub referees: Arc<dyn RefereeStore>,
+}
+
+#[async_trait]
+pub trait SolvingStore: Send + Sync {
+    async fn get(&self, id: &str) -> CoreResult<Option<crate::model::SolveFile>>;
+    async fn all(&self) -> CoreResult<Vec<crate::model::SolveFile>>;
+    async fn insert(&self, file: &crate::model::SolveFile) -> CoreResult<()>;
+    async fn replace(&self, file: &crate::model::SolveFile, expected: u64) -> CoreResult<()>;
+    async fn agents(&self) -> CoreResult<Vec<crate::model::Entrant>>;
+    async fn insert_agent(&self, agent: &crate::model::Entrant) -> CoreResult<()>;
+    async fn replace_agent(&self, agent: &crate::model::Entrant, expected: u64) -> CoreResult<()>;
+}
+#[async_trait]
+pub trait Verifier: Send + Sync {
+    async fn verify(
+        &self,
+        request: &crate::model::VerificationRequest,
+    ) -> CoreResult<crate::model::VerificationReceipt>;
+}
+pub struct UnavailableVerifier;
+#[async_trait]
+impl Verifier for UnavailableVerifier {
+    async fn verify(
+        &self,
+        _: &crate::model::VerificationRequest,
+    ) -> CoreResult<crate::model::VerificationReceipt> {
+        Err(crate::CoreError::Unavailable(
+            "verifier is not configured".into(),
+        ))
+    }
 }

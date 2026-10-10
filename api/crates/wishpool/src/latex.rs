@@ -227,6 +227,7 @@ mod tests {
                 &author,
                 &paper.id,
                 vec![ClaimConfirmation {
+                    depends_on_conjectures: vec![],
                     id: "C1".into(),
                     kind: ClaimKind::Conjecture,
                     role: ClaimRole::Main,

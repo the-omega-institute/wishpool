@@ -9,6 +9,7 @@
 //! the same rules as any other reviewer.
 
 pub(crate) mod mapping;
+mod open_problems;
 mod referee;
 mod worker;
 
@@ -115,6 +116,8 @@ pub fn kind_key(kind: JobKind) -> String {
     match kind {
         JobKind::Compile => "compile".to_owned(),
         JobKind::Referee => "referee".to_owned(),
+        JobKind::OpenProblems => "open_problems".to_owned(),
+        JobKind::VerifyAttempt => "verify_attempt".to_owned(),
         JobKind::LeanStatement => "lean_statement".to_owned(),
         JobKind::Stage(stage) => format!(
             "stage:{}",
@@ -127,6 +130,12 @@ pub fn kind_key(kind: JobKind) -> String {
 }
 
 pub fn parse_kind_key(key: &str) -> Option<JobKind> {
+    if key == "open_problems" {
+        return Some(JobKind::OpenProblems);
+    }
+    if key == "verify_attempt" {
+        return Some(JobKind::VerifyAttempt);
+    }
     if key == "lean_statement" {
         return Some(JobKind::LeanStatement);
     }

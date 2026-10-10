@@ -49,6 +49,34 @@ fn main() -> ExitCode {
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["conjectures"] => print(client.conjectures()),
+        ["target", record, claim] => match client.target(record, claim) {
+            Ok(value) => match value["target"]["lean"].as_str() {
+                Some(lean) => match std::fs::write("Target.lean", lean) {
+                    Ok(()) => {
+                        println!("Wrote Target.lean (digest {})", value["target"]["digest"]);
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                None => {
+                    eprintln!("the author has not confirmed a target");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        ["attempt-status", id] => print(client.attempt_status(id)),
+        ["attempt", record, claim, file] => submit_attempt(&client, record, claim, file, None),
+        ["attempt", record, claim, file, "--as-agent", name] => {
+            submit_attempt(&client, record, claim, file, Some(name))
+        }
         ["tasks"] => print(client.open_tasks(None, 50)),
         ["tasks", kind] => print(client.open_tasks(Some(kind), 50)),
         ["show", task] => print(client.context(task)),
@@ -73,9 +101,41 @@ fn main() -> ExitCode {
         },
         _ => {
             eprintln!(
-                "usage: wishpool-contribute tasks [kind] | show <task> | lease <task> | release <task> | submit <task> <result.json> | mcp"
+                "usage: wishpool-contribute conjectures | target <record> <claim> | attempt <record> <claim> <file> [--as-agent NAME] | attempt-status <id> | tasks [kind] | show <task> | lease <task> | release <task> | submit <task> <result.json> | mcp"
             );
             ExitCode::from(2)
+        }
+    }
+}
+
+fn submit_attempt(
+    client: &Client,
+    record: &str,
+    claim: &str,
+    file: &str,
+    agent: Option<&str>,
+) -> ExitCode {
+    let result = std::fs::read_to_string(file)
+        .map_err(|e| e.to_string())
+        .and_then(|s| {
+            if s.len() > 1_048_576 {
+                return Err("solution exceeds 1 MB".into());
+            }
+            client
+                .attempt(record, claim, &s, agent)
+                .map_err(|e| e.to_string())
+        });
+    match result {
+        Ok(value) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).unwrap_or_default()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -109,6 +169,10 @@ mod tests {
         assert_eq!(
             names,
             [
+                "conjectures",
+                "target",
+                "attempt",
+                "attempt-status",
                 "list_tasks",
                 "lease_task",
                 "get_task_context",

@@ -1,5 +1,11 @@
 import type {
   ConjectureSummary,
+  ConjectureDetail,
+  Entrant,
+  AttemptView,
+  LeaderboardRow,
+  EntrantProfile,
+  SolveNotification,
   ClaimConfirmation,
   Contribution,
   ContributionMode,
@@ -262,7 +268,32 @@ export interface ApiClient {
   restartReferee(id: string): Promise<RefereeFile>;
   sendFeedback(id: string, letter: SendFeedback): Promise<FeedbackLetter>;
 
-  listConjectures(page?: PageParams, options?: RequestOptions): Promise<Listing<ConjectureSummary>>;
+  listConjectures(
+    page?: PageParams & { status?: 'open' | 'solved' | 'disproved' },
+    options?: RequestOptions,
+  ): Promise<Listing<ConjectureSummary>>;
+
+  getConjecture(record: string, claim: string, options?: RequestOptions): Promise<ConjectureDetail>;
+  submitAttempt(
+    record: string,
+    claim: string,
+    solution: string,
+    as_agent?: string,
+    note?: string,
+  ): Promise<AttemptView>;
+  getAttempt(id: string, options?: RequestOptions): Promise<AttemptView>;
+  myAttempts(record: string, claim: string, options?: RequestOptions): Promise<AttemptView[]>;
+  leaderboard(
+    period?: 'all' | 'month',
+    entrants?: 'all' | 'people' | 'agents',
+    options?: RequestOptions,
+  ): Promise<LeaderboardRow[]>;
+  entrantProfile(id: string, options?: RequestOptions): Promise<EntrantProfile>;
+  agents(options?: RequestOptions): Promise<Entrant[]>;
+  createAgent(name: string): Promise<Entrant>;
+  renameAgent(id: string, name: string): Promise<Entrant>;
+  retireAgent(id: string): Promise<Entrant>;
+  notifications(options?: RequestOptions): Promise<SolveNotification[]>;
 
   // Public papers.
   listPapers(page?: PageParams, options?: RequestOptions): Promise<Listing<PaperSummary>>;
@@ -382,8 +413,32 @@ export function createApiClient(fetchImpl: FetchLike = (input, init) => fetch(in
     restartReferee: (id) => request('POST', sub(id, '/referee/restart')),
     sendFeedback: (id, letter) => request('POST', sub(id, '/referee/letters'), letter),
 
+    getConjecture: (r, c, o) =>
+      request('GET', api(`/conjectures/${seg(r)}/${seg(c)}`), undefined, o),
+    submitAttempt: (r, c, solution, as_agent, note = '') =>
+      request('POST', api(`/conjectures/${seg(r)}/${seg(c)}/attempts`), {
+        solution,
+        as_agent,
+        note,
+      }),
+    getAttempt: (id, o) => request('GET', api(`/attempts/${seg(id)}`), undefined, o),
+    myAttempts: (r, c, o) =>
+      request('GET', api(`/conjectures/${seg(r)}/${seg(c)}/attempts/mine`), undefined, o),
+    leaderboard: (period = 'all', entrants = 'all', o) =>
+      request('GET', api(`/leaderboard${buildQuery({ period, entrants })}`), undefined, o),
+    entrantProfile: (id, o) => request('GET', api(`/entrants/${seg(id)}`), undefined, o),
+    agents: (o) => request('GET', api('/me/agents'), undefined, o),
+    createAgent: (name) => request('POST', api('/me/agents'), { name }),
+    renameAgent: (id, name) => request('PATCH', api(`/me/agents/${seg(id)}`), { name }),
+    retireAgent: (id) => request('DELETE', api(`/me/agents/${seg(id)}`)),
+    notifications: (o) => request('GET', api('/me/notifications'), undefined, o),
     listConjectures: (p = {}, o) =>
-      request('GET', api(`/conjectures${buildQuery(page(p))}`), undefined, o),
+      request(
+        'GET',
+        api(`/conjectures${buildQuery({ ...page(p), status: p.status })}`),
+        undefined,
+        o,
+      ),
     listPapers: (p = {}, o) => request('GET', api(`/papers${buildQuery(page(p))}`), undefined, o),
     getPaper: (record, o) => request('GET', api(`/papers/${seg(record)}`), undefined, o),
 

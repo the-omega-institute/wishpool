@@ -65,6 +65,8 @@ pub fn display_name(identity: &VerifiedIdentity) -> String {
 
 #[derive(Default)]
 pub struct MemoryStores {
+    solving: Mutex<BTreeMap<String, SolveFile>>,
+    agents: Mutex<BTreeMap<String, Entrant>>,
     people: Mutex<BTreeMap<String, Person>>,
     submissions: Mutex<BTreeMap<String, Submission>>,
     endorsements: Mutex<Vec<Endorsement>>,
@@ -82,6 +84,8 @@ pub struct MemoryStores {
 impl MemoryStores {
     pub fn ports(self: &Arc<Self>, clock: Arc<dyn Clock>, reader: Arc<dyn PaperReader>) -> Ports {
         Ports {
+            solving: self.clone(),
+            verifier: Arc::new(UnavailableVerifier),
             clock,
             people: self.clone(),
             submissions: self.clone(),
@@ -569,5 +573,70 @@ impl GrantStore for MemoryStores {
             .filter(|g| g.status == GrantStatus::Active)
             .cloned()
             .collect())
+    }
+}
+
+#[async_trait]
+impl SolvingStore for MemoryStores {
+    async fn get(&self, id: &str) -> CoreResult<Option<SolveFile>> {
+        Ok(self.solving.lock().await.get(id).cloned())
+    }
+    async fn all(&self) -> CoreResult<Vec<SolveFile>> {
+        Ok(self.solving.lock().await.values().cloned().collect())
+    }
+    async fn insert(&self, file: &SolveFile) -> CoreResult<()> {
+        let mut files = self.solving.lock().await;
+        if files.contains_key(&file.id) {
+            return Err(CoreError::conflict("solve file exists"));
+        }
+        files.insert(file.id.clone(), file.clone());
+        Ok(())
+    }
+    async fn replace(&self, file: &SolveFile, expected: u64) -> CoreResult<()> {
+        let mut files = self.solving.lock().await;
+        let stored = files
+            .get_mut(&file.id)
+            .ok_or_else(|| CoreError::not_found("solve file", &file.id))?;
+        if stored.revision != expected {
+            return Err(CoreError::StaleRevision {
+                kind: "solve file",
+                id: file.id.clone(),
+            });
+        }
+        *stored = file.clone();
+        stored.revision = expected + 1;
+        Ok(())
+    }
+    async fn agents(&self) -> CoreResult<Vec<Entrant>> {
+        Ok(self.agents.lock().await.values().cloned().collect())
+    }
+    async fn insert_agent(&self, agent: &Entrant) -> CoreResult<()> {
+        let mut agents = self.agents.lock().await;
+        if agents.values().any(|a| a.name == agent.name) {
+            return Err(CoreError::conflict("agent name exists"));
+        }
+        agents.insert(agent.id.clone(), agent.clone());
+        Ok(())
+    }
+    async fn replace_agent(&self, agent: &Entrant, expected: u64) -> CoreResult<()> {
+        let mut agents = self.agents.lock().await;
+        if agents
+            .values()
+            .any(|a| a.id != agent.id && a.name == agent.name)
+        {
+            return Err(CoreError::conflict("agent name exists"));
+        }
+        let stored = agents
+            .get_mut(&agent.id)
+            .ok_or_else(|| CoreError::not_found("agent", &agent.id))?;
+        if stored.revision != expected {
+            return Err(CoreError::StaleRevision {
+                kind: "agent",
+                id: agent.id.clone(),
+            });
+        }
+        *stored = agent.clone();
+        stored.revision = expected + 1;
+        Ok(())
     }
 }

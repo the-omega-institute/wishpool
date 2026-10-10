@@ -6,6 +6,7 @@ members = [
     "crates/layer3-review",
     "crates/layer3-latex",
     "crates/wishpool",
+    "crates/verifier",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
+wishpool-verifier = { path = "crates/verifier" }
 wishpool-core = { path = "crates/layer2-core" }
 wishpool-public = { path = "crates/layer1-public" }
 wishpool-review = { path = "crates/layer3-review" }

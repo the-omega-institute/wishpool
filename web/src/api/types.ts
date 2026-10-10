@@ -246,6 +246,7 @@ export type Claim = {
   settles?: Settles;
 };
 export type ClaimConfirmation = {
+  depends_on_conjectures?: { record: string; claim: string }[];
   id: string;
   kind: ClaimKind;
   role: ClaimRole;
@@ -278,6 +279,12 @@ export type SubmissionStatus =
 export type AnalysisVisibility = 'undecided' | 'public' | 'private';
 
 export type Submission = {
+  conjecture_dependencies?: {
+    from: string;
+    target: { record: string; claim: string };
+    target_version: number;
+    target_claims_revision: number;
+  }[];
   kind: SubmissionKind;
   lean_statements: LeanStatementAttempt[];
   id: string;
@@ -476,6 +483,16 @@ export type LeanStatementAttempt = {
     | { state: 'rejected'; comment: string; at: string };
 };
 export type ConjectureSummary = {
+  kind?: SubmissionKind;
+  authors?: Author[];
+  accepted_at?: string;
+  new_results?: number;
+  lean_verified?: number;
+  claim: string;
+  source: string;
+  status: 'open' | 'solved' | 'disproved';
+  attempts: number;
+  solver: Entrant | null;
   record: string;
   title: string;
   statement: string;
@@ -496,6 +513,7 @@ export type PaperSummary = {
   basis?: AdmissionBasis;
   accepted_at?: string;
   main_results?: number;
+  new_results?: number;
   lean_verified?: number;
 };
 export type PublicClaim = {
@@ -611,3 +629,71 @@ export type DonationGrant = {
   revision: number;
 };
 export type DonationPatch = { monthly_cap?: number; status?: GrantStatus };
+
+export type Entrant = {
+  id: string;
+  name: string;
+  kind: 'person' | 'agent';
+  owner?: { id: string; name: string };
+  retired: boolean;
+  revision: number;
+};
+export type VerificationReceipt = {
+  verdict: 'proved' | 'disproved' | 'rejected';
+  reason: string;
+  target_digest: string;
+  solution_digest: string;
+  toolchain: string;
+  axioms: string[];
+  checked_at: string;
+  duration: number;
+};
+export type VerifiedAttempt = {
+  id: string;
+  entrant: Entrant;
+  receipt: VerificationReceipt;
+  solution: string;
+  also_verified: boolean;
+};
+export type AttemptView = {
+  id: string;
+  record: string;
+  claim: string;
+  entrant: Entrant;
+  state: 'queued' | 'proved' | 'disproved' | 'rejected' | 'superseded';
+  reason?: string | null;
+  receipt: VerificationReceipt | null;
+  solution: string;
+  note?: string;
+};
+export type ConjectureDetail = {
+  summary: ConjectureSummary;
+  macros: Record<string, string>;
+  target: { claim: string; lean: string; digest: string; toolchain: string } | null;
+  verified_attempts: VerifiedAttempt[];
+};
+export type LeaderboardRow = {
+  rank: number;
+  entrant: Entrant;
+  solved: number;
+  disproved: number;
+  score: number;
+  last_solve: string;
+};
+export type EntrantProfile = {
+  entrant: Entrant;
+  solutions: {
+    record: string;
+    claim: string;
+    title: string;
+    attempt: string;
+    receipt: VerificationReceipt;
+  }[];
+};
+export type SolveNotification = {
+  attempt: string;
+  record: string;
+  claim: string;
+  entrant: Entrant;
+  at: string;
+};

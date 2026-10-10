@@ -61,3 +61,8 @@ data:
   WISHPOOL_LEAN_WORKSPACE: ""
   # Codex: at most 3600 seconds; the step budget includes discovery/check margin.
   WISHPOOL_FORMAL_TIMEOUT_SECS: "1200"
+  # Isolated verifier; empty URL uses a local credential-free subprocess.
+  WISHPOOL_VERIFIER_URL: "http://wishpool-verifier:8081"
+  WISHPOOL_VERIFIER_PROGRAM: "wishpool-verifier"
+  WISHPOOL_VERIFIER_TIMEOUT_SECS: "1200"
+  WISHPOOL_ATTEMPTS_PER_DAY: "20"

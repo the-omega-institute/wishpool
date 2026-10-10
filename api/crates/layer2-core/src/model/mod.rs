@@ -13,6 +13,7 @@ mod person;
 mod record;
 pub mod referee;
 mod review;
+mod solving;
 mod task;
 
 pub use claim::*;
@@ -33,4 +34,5 @@ pub use referee::{
     RefereeView, RoundUpdate, Severity, Step, StepState,
 };
 pub use review::*;
+pub use solving::*;
 pub use task::*;

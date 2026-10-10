@@ -21,6 +21,7 @@ use crate::{auth::AuthenticatedCaller, problems::Problem};
 mod network;
 mod papers;
 mod review;
+mod solving;
 
 pub(crate) type AppState = State<Arc<App>>;
 pub(crate) type ApiResult<T> = Result<T, Problem>;
@@ -39,6 +40,7 @@ pub(crate) struct Query<T>(pub(crate) T);
 
 pub(crate) fn routes() -> Router<Arc<App>> {
     Router::new()
+        .merge(solving::routes())
         .merge(papers::routes())
         .merge(review::routes())
         .merge(network::routes())

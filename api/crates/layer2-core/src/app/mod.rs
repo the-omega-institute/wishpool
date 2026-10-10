@@ -9,6 +9,7 @@ mod people;
 mod records;
 mod referee;
 mod review;
+mod solving;
 mod tasks;
 
 use std::{collections::BTreeSet, sync::Arc};
@@ -31,6 +32,7 @@ pub const MAX_PAGE: u32 = 100;
 pub struct App {
     pub(crate) ports: Ports,
     pub(crate) policy: Policy,
+    pub(crate) attempts_per_day: usize,
     /// Subjects granted Admin on sign-in, from deployment configuration.
     pub(crate) bootstrap_admins: BTreeSet<PersonId>,
 }
@@ -40,7 +42,22 @@ impl App {
         Arc::new(Self {
             ports,
             policy,
+            attempts_per_day: 20,
             bootstrap_admins,
+        })
+    }
+
+    pub fn with_attempt_limit(
+        ports: Ports,
+        policy: Policy,
+        admins: BTreeSet<PersonId>,
+        limit: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            ports,
+            policy,
+            bootstrap_admins: admins,
+            attempts_per_day: limit.max(1),
         })
     }
 

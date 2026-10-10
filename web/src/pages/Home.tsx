@@ -4,6 +4,8 @@ import { useAsync } from '../api/useAsync';
 import { Async } from '../components/ui';
 import { Link } from '../routing/router';
 import { PaperEntry } from './Papers';
+import { ConjectureEntry } from './Conjectures';
+import { LeaderboardTable } from './Leaderboard';
 
 const FLOW = [
   ['Submit', 'A paper, a short note or a conjecture.'],
@@ -21,12 +23,22 @@ export function HomePage() {
     [api],
   );
   const papers = useAsync(loadPapers);
+  const loadConjectures = useCallback(
+    (signal: AbortSignal) => api.listConjectures({ limit: 5, status: 'open' }, { signal }),
+    [api],
+  );
+  const conjectures = useAsync(loadConjectures);
+  const loadBoard = useCallback(
+    (signal: AbortSignal) => api.leaderboard('all', 'all', { signal }),
+    [api],
+  );
+  const board = useAsync(loadBoard);
 
   return (
     <div className="page home">
       <section className="intro">
-        <h1>Bring your work. We help it go further.</h1>
-        <p className="lede">A mathematics venue that referees, formalizes and writes back.</p>
+        <h1>Open questions. Verified answers.</h1>
+        <p className="lede">Read new mathematics. Solve a conjecture. Prove it in Lean.</p>
         <div className="intro-actions">
           <Link to={{ kind: 'submit' }} className="button">
             Submit work
@@ -47,8 +59,39 @@ export function HomePage() {
         ))}
       </ol>
 
+      <section aria-labelledby="open-heading">
+        <h2 id="open-heading">Open conjectures</h2>
+        <Async state={conjectures.state} onRetry={conjectures.reload}>
+          {(listing) => {
+            const open = listing.items.filter((c) => c.status === 'open').slice(0, 5);
+            return open.length ? (
+              <ul className="entry-list">
+                {open.map((c) => (
+                  <li key={`${c.record}:${c.claim}`}>
+                    <ConjectureEntry conjecture={c} />
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="muted">
+                The next open question could be yours.{' '}
+                <Link to={{ kind: 'submit' }}>Submit a conjecture</Link>
+              </p>
+            );
+          }}
+        </Async>
+      </section>
+      <section aria-labelledby="board-heading">
+        <h2 id="board-heading">Leaderboard</h2>
+        <Async state={board.state} onRetry={board.reload}>
+          {(rows) => <LeaderboardTable rows={rows.slice(0, 5)} />}
+        </Async>
+        <p>
+          <Link to={{ kind: 'leaderboard' }}>View the leaderboard</Link>
+        </p>
+      </section>
       <section aria-labelledby="recent-heading" className="featured">
-        <h2 id="recent-heading">Recently displayed</h2>
+        <h2 id="recent-heading">Recently accepted</h2>
         <Async state={papers.state} onRetry={papers.reload}>
           {(listing) =>
             listing.items.length === 0 ? (

@@ -69,6 +69,28 @@ impl Client {
         self.send(self.http.delete(format!("{}{path}", self.base)))
     }
 
+    pub fn conjectures(&self) -> ApiResult<Value> {
+        self.get("/conjectures?limit=100")
+    }
+    pub fn target(&self, record: &str, claim: &str) -> ApiResult<Value> {
+        self.get(&format!("/conjectures/{record}/{claim}"))
+    }
+    pub fn attempt(
+        &self,
+        record: &str,
+        claim: &str,
+        solution: &str,
+        agent: Option<&str>,
+    ) -> ApiResult<Value> {
+        self.post(
+            &format!("/conjectures/{record}/{claim}/attempts"),
+            &json!({"solution": solution, "as_agent": agent}),
+        )
+    }
+    pub fn attempt_status(&self, id: &str) -> ApiResult<Value> {
+        self.get(&format!("/attempts/{id}"))
+    }
+
     pub fn open_tasks(&self, kind: Option<&str>, limit: u32) -> ApiResult<Value> {
         let mut path = format!("/tasks?status=open&limit={limit}");
         if let Some(kind) = kind {
@@ -100,5 +122,116 @@ impl Client {
 
     pub fn submit(&self, task: &str, contribution: &Value) -> ApiResult<Value> {
         self.post(&format!("/tasks/{task}/contributions"), contribution)
+    }
+}
+
+#[cfg(test)]
+mod solving_tests {
+    use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+    };
+
+    #[test]
+    fn solving_client_downloads_exact_target_and_submits_without_claiming_verification() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (method, path, body) in [
+                (
+                    "GET",
+                    "/api/v1/conjectures?limit=100",
+                    json!({"items": [], "next_before": null}),
+                ),
+                (
+                    "GET",
+                    "/api/v1/conjectures/WP-2026-0001/C1",
+                    json!({"target": {"lean":"import Mathlib\ndef wishpool_target_prop : Prop := True\n", "digest":"exact-digest"}}),
+                ),
+                (
+                    "POST",
+                    "/api/v1/conjectures/WP-2026-0001/C1/attempts",
+                    json!({"id":"a1", "state":"queued"}),
+                ),
+                (
+                    "GET",
+                    "/api/v1/attempts/a1",
+                    json!({"id":"a1", "state":"rejected", "receipt":{"reason":"Wrong target type"}}),
+                ),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let header_end = loop {
+                    let mut buf = [0; 4096];
+                    let count = stream.read(&mut buf).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buf[..count]);
+                    if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                };
+                let header = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+                assert!(header.starts_with(&format!("{method} {path} HTTP/1.1")));
+                assert!(
+                    header
+                        .to_lowercase()
+                        .contains("authorization: bearer test-token")
+                );
+                let length = header
+                    .lines()
+                    .find_map(|l| {
+                        l.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|n| n.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                while bytes.len() < header_end + length {
+                    let mut buf = [0; 4096];
+                    let count = stream.read(&mut buf).unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&buf[..count]);
+                }
+                if method == "POST" {
+                    let submitted: Value = serde_json::from_slice(&bytes[header_end..]).unwrap();
+                    assert_eq!(
+                        submitted,
+                        json!({"solution":"import Target\nproof", "as_agent":"Proof agent"})
+                    );
+                    assert!(submitted.get("receipt").is_none());
+                }
+                let text = body.to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}", text.len()).unwrap();
+            }
+        });
+        let client = Client::new(&origin, "test-token");
+        assert_eq!(client.conjectures().unwrap()["items"], json!([]));
+        let target = client.target("WP-2026-0001", "C1").unwrap();
+        assert_eq!(target["target"]["digest"], "exact-digest");
+        assert!(
+            target["target"]["lean"]
+                .as_str()
+                .unwrap()
+                .ends_with("True\n")
+        );
+        assert_eq!(
+            client
+                .attempt(
+                    "WP-2026-0001",
+                    "C1",
+                    "import Target\nproof",
+                    Some("Proof agent")
+                )
+                .unwrap()["state"],
+            "queued"
+        );
+        assert_eq!(
+            client.attempt_status("a1").unwrap()["receipt"]["reason"],
+            "Wrong target type"
+        );
+        server.join().unwrap();
     }
 }

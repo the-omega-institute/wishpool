@@ -5,13 +5,17 @@ import { useAsync } from '../api/useAsync';
 import { usePaged } from '../api/usePaged';
 import type { PaperSummary, PublicPaper } from '../api/types';
 import { AuthorLine } from '../components/AuthorLine';
-import { BasisBadge } from '../components/badges';
 import { PublicStatements, statementName } from '../components/StatementSummary';
 import { LatexText, MacrosProvider } from '../components/Markdown';
 import { Pager } from '../components/Pager';
 import { Async, Badge, DateText, ExternalLink, MscList } from '../components/ui';
 import { paperCitation } from '../lib/citation';
-import { CLAIM_KIND_LABELS, SUBMISSION_KIND_LABELS, formatAuthors } from '../lib/labels';
+import {
+  CLAIM_KIND_LABELS,
+  SUBMISSION_KIND_LABELS,
+  formatAuthors,
+  newResults,
+} from '../lib/labels';
 import { safeHttpUrl, sourceHref } from '../lib/links';
 import { Link } from '../routing/router';
 
@@ -35,15 +39,8 @@ export function PaperEntry({ paper }: { paper: PaperSummary }) {
         </span>
       </p>
       <p className="entry-meta">
-        {paper.basis ? <BasisBadge basis={paper.basis} /> : null}
-        {paper.main_results !== undefined ? (
-          <span>
-            {paper.main_results} main result{paper.main_results === 1 ? '' : 's'}
-          </span>
-        ) : null}
-        {(paper.lean_verified ?? 0) > 0 ? (
-          <Badge tone="good">{paper.lean_verified} Lean verified</Badge>
-        ) : null}
+        {paper.new_results ? <span>{newResults(paper.new_results)}</span> : null}
+        {paper.lean_verified ? <Badge tone="good">Lean ✓ {paper.lean_verified}</Badge> : null}
         <MscList codes={paper.msc ?? []} />
       </p>
     </article>

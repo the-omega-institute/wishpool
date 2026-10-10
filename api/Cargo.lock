@@ -3454,6 +3454,7 @@ dependencies = [
  "wishpool-latex",
  "wishpool-public",
  "wishpool-review",
+ "wishpool-verifier",
 ]
 
 [[package]]
@@ -3509,6 +3510,20 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "wishpool-verifier",
+]
+
+[[package]]
+name = "wishpool-verifier"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

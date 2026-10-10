@@ -437,6 +437,7 @@ async fn referee_routes_project_visibility_roles_and_letter_validation() {
         .extracted
         .iter()
         .map(|c| wishpool_core::model::ClaimConfirmation {
+            depends_on_conjectures: vec![],
             id: c.id.clone(),
             kind: c.kind,
             role: c.role,
@@ -515,4 +516,81 @@ async fn referee_routes_project_visibility_roles_and_letter_validation() {
     assert!(view["rounds"][0].get("letter").is_none());
     assert_eq!(view["letters"].as_array().unwrap().len(), 1);
     assert_eq!(app.referee(&editor, &id).await.unwrap().rounds.len(), 2);
+}
+
+#[tokio::test]
+async fn solving_routes_are_public_where_intended_and_agents_require_ownership() {
+    use serde_json::json;
+    let r = router();
+    let (status, body, _) = call(&r, "GET", "/leaderboard", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!([]));
+    let (status, _, _) = call(&r, "GET", "/leaderboard?period=week", None, None).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _, _) = call(
+        &r,
+        "POST",
+        "/me/agents",
+        None,
+        Some(json!({"name":"Agent"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, agent, _) = call(
+        &r,
+        "POST",
+        "/me/agents",
+        Some("owner"),
+        Some(json!({"name":"Agent"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(agent["owner"]["id"], "owner");
+    let id = agent["id"].as_str().unwrap();
+    let path = format!("/me/agents/{id}");
+    let (status, _, _) = call(
+        &r,
+        "PATCH",
+        &path,
+        Some("other"),
+        Some(json!({"name":"stolen"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, renamed, _) = call(
+        &r,
+        "PATCH",
+        &path,
+        Some("owner"),
+        Some(json!({"name":"Renamed"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed["name"], "Renamed");
+    let (status, profile, _) = call(&r, "GET", &format!("/entrants/{id}"), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(profile.get("email").is_none());
+    let (status, retired, _) = call(&r, "DELETE", &path, Some("owner"), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(retired["retired"], true);
+    let (status, _, _) = call(&r, "GET", "/attempts/unknown", None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = call(
+        &r,
+        "POST",
+        "/conjectures/WP-2026-0001/C1/attempts",
+        Some("owner"),
+        Some(json!({"solution":"proof","receipt":{"verdict":"proved"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, _, _) = call(
+        &r,
+        "POST",
+        "/submissions/unknown/open-problems/check",
+        Some("owner"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

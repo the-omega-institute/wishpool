@@ -12,6 +12,7 @@ name = "wishpool"
 path = "src/main.rs"
 
 [dependencies]
+wishpool-verifier = { workspace = true }
 aes-gcm = "0.10"
 wishpool-core = { workspace = true }
 wishpool-public = { workspace = true }

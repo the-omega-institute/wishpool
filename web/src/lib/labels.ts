@@ -296,3 +296,8 @@ export const SUBMISSION_KIND_LABELS = {
   note: 'Short note',
   conjecture: 'Conjecture',
 } as const;
+
+/** "1 new result", "3 new results". */
+export function newResults(n: number): string {
+  return `${n} new result${n === 1 ? '' : 's'}`;
+}

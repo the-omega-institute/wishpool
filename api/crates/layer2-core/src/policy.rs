@@ -65,6 +65,10 @@ impl Default for Policy {
 }
 
 impl Policy {
+    pub fn admits_open_problem(reading: &crate::model::ConjectureReading) -> bool {
+        reading.displayable()
+    }
+
     pub fn decide(&self, submission: &Submission, endorsements: &[Endorsement]) -> Decision {
         let pending = |awaiting: Stage, detail: String| Decision::Pending { awaiting, detail };
         if submission.status == SubmissionStatus::Draft {
@@ -205,9 +209,9 @@ impl Policy {
             _ => &[],
         };
         let passes = main.iter().any(|c| {
-            assessments
-                .iter()
-                .any(|a| a.claim == c.id && a.conjecture.as_ref().is_some_and(|r| r.displayable()))
+            assessments.iter().any(|a| {
+                a.claim == c.id && a.conjecture.as_ref().is_some_and(Self::admits_open_problem)
+            })
         });
         if passes {
             let independent = endorsements.iter().filter(|e| e.is_independent()).count();

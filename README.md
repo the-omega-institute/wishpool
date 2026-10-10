@@ -18,12 +18,17 @@ decision → immediate public display → private letter → Lean.
   dependencies, new-content witness lemmas and verified Lean proofs. Reviews,
   correctness labels, comments, reports, advice and letters stay author/staff-only.
   Private/undecided records expose only title, authors, kind and record id.
-- **Lean.** Paper/note proof publication needs author approval. After an accepted
-  conjecture's letter, the binary elaborates a target with one final `sorry`,
-  stores its exact text/digest/toolchain, and asks the author to confirm it in a
-  cookie-authenticated browser or request a corrected attempt. New versions void
-  confirmation. A target is a statement, not a verified proof. Only an
-  author-confirmed target can be attacked; attack attempts belong to Phase B.
+- **Solve.** Download an author-confirmed `Target.lean`, prove its proposition or
+  its negation in Lean, and submit the solution. A separate credential-free
+  verifier checks the imported constant and standard axioms. The first verified
+  answer wins one point on a single leaderboard for people and owned agents.
+  Later verified answers are listed too. Attempts remain private until verified.
+- **Lean.** Targets contain `def wishpool_target_prop : Prop := <statement>` and
+  confirmed definitions, with no proof holes. The submitting author confirms
+  the exact digest in a cookie session. New versions void that confirmation.
+  Accepted public papers' open problems enter the conjecture list only after
+  their own well-posed/open/content audit, with `from WP-…` and claim identity.
+  Paper/note proof-probe publication continues to require author agreement.
 - **Contributors.** When the author opts in, volunteers do the legwork with
   their own agents (`sdk/contribute`, CLI or MCP) or donated NyxID quota,
   credited only when verified. See [docs/CONTRIBUTE.md](docs/CONTRIBUTE.md).
@@ -170,6 +175,10 @@ editors/contributors may supply reports.
 | `WISHPOOL_ADVISOR_TIMEOUT_SECS` | `1200` | advice/letter Codex deadline; maximum 3600 seconds (the worker renews its lease) |
 | `WISHPOOL_AUDIT_TIMEOUT_SECS` | `3600` | Codex audit deadline; maximum 7200 seconds |
 | `WISHPOOL_LEAN_WORKSPACE` | unset | prepared Lean/Mathlib project for proof probes and conjecture targets; requires Codex |
+| `WISHPOOL_VERIFIER_PROGRAM` | `wishpool-verifier` | local verifier executable |
+| `WISHPOOL_VERIFIER_URL` | unset | isolated verifier service base; empty selects subprocess |
+| `WISHPOOL_VERIFIER_TIMEOUT_SECS` | `1200` | verification deadline, maximum 3600 seconds |
+| `WISHPOOL_ATTEMPTS_PER_DAY` | `20` | attempts per entrant per conjecture in the preceding 24 hours |
 | `WISHPOOL_FORMAL_TIMEOUT_SECS` | `1200` | formalization Codex deadline; maximum 3600 seconds, plus 300 seconds for discovery/checks |
 | `WISHPOOL_ADVISOR_WORK_DIR` | `/tmp/wishpool-advisor` | parent for temporary source, Oracle and advisor workspaces |
 | `WISHPOOL_ROLE` | `all` | `api` (HTTP only), `worker` (background work, one replica), `all` |
@@ -198,3 +207,33 @@ cd api && WISHPOOL_TEST_MONGODB_URI=mongodb://127.0.0.1:27017 \
 cd sdk/contribute && cargo test
 cd web && npm test
 ```
+
+## Solve with the CLI or MCP
+
+```bash
+wishpool-contribute conjectures
+wishpool-contribute target WP-2026-0001 C1     # writes Target.lean
+wishpool-contribute attempt WP-2026-0001 C1 Solution.lean
+wishpool-contribute attempt WP-2026-0001 C1 Solution.lean --as-agent NAME
+wishpool-contribute attempt-status ATTEMPT_ID
+```
+
+Use `POST /api/v1/me/agents {"name":"NAME"}` to register an owned agent, or
+manage agents on Contribute. MCP exposes `conjectures`, `target`, `attempt`, and
+`attempt-status` alongside the existing contribution tools. MCP's `target`
+returns the exact source and digest for the agent to save as `Target.lean`.
+
+Build the local checker with `cd api && cargo build -p wishpool-verifier`, put
+it on PATH (or set `WISHPOOL_VERIFIER_PROGRAM`), and set
+`WISHPOOL_LEAN_WORKSPACE` to a prepared project with pinned Lean and Mathlib.
+The verifier copies that project and never builds in the original. In production,
+`infra/verifier/` supplies a separate Deployment and a deny-all-egress policy.
+Its Dockerfile requires a digest-pinned `LEAN_IMAGE` containing the prepared
+project at `/opt/lean-workspace` and its installed toolchain under
+`/opt/verifier/.elan/toolchains`; no credentials are needed. Runtime compilation
+receives only PATH and a fresh HOME, using generated Lean setup files to resolve
+pinned artifacts. The service serializes checks to keep memory bounded.
+
+The optional real-Lean test uses `WISHPOOL_TEST_LEAN_WORKSPACE`; ordinary tests
+use fake verifiers and fake compiler executables. Review tests use fake Oracle
+and Codex backends. Mongo tests allocate their own databases.

@@ -609,6 +609,7 @@ async fn donated_quota_runs_a_hosted_judgement() {
             &author,
             &paper.id,
             vec![ClaimConfirmation {
+                depends_on_conjectures: vec![],
                 id: theorem.id.clone(),
                 kind: theorem.kind,
                 role: theorem.role,

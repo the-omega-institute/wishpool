@@ -28,7 +28,9 @@ export function ConfirmStatements({
 }) {
   const api = useApi();
   const extracted = submission.extracted;
-  const [rows, setRows] = useState<ConfirmRow[]>(() => initialRows(extracted, submission.claims));
+  const [rows, setRows] = useState<ConfirmRow[]>(() =>
+    initialRows(extracted, submission.claims, submission.conjecture_dependencies),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
 
@@ -200,6 +202,17 @@ function ConfirmRowView({
         </select>
       </td>
       <td className="confirm-deps" data-label="Uses">
+        <label className="small" htmlFor={id('conjecture-deps')}>
+          Public conjectures {row.id} uses
+        </label>
+        <input
+          id={id('conjecture-deps')}
+          placeholder="WP-2026-0001:C1"
+          value={row.conjectureInput ?? ''}
+          disabled={row.excluded}
+          onChange={(e) => onPatch({ conjectureInput: e.target.value })}
+        />
+        <p className="hint">Comma-separated record:claim references.</p>
         {others.length === 0 ? (
           <span className="muted small">—</span>
         ) : (

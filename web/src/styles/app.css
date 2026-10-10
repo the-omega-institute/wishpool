@@ -641,7 +641,7 @@ legend {
   padding: 0;
   margin: var(--space-5) 0 var(--space-7);
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: var(--space-4);
 }
 .flow li {
@@ -1994,4 +1994,113 @@ legend {
   padding-left: var(--space-3);
   border-left: 2px solid var(--accent, var(--rule));
   margin-top: var(--space-2);
+}
+
+/* Solving pages use the shared spacing and accent tokens. */
+.entry-title,
+.entry-title a {
+  text-decoration: none;
+}
+.entry-title:hover,
+.entry-title a:hover {
+  text-decoration: underline;
+}
+.entry-list > li {
+  padding: var(--space-4);
+  border: 1px solid var(--rule);
+  border-radius: 0.35rem;
+  margin-bottom: var(--space-3);
+  min-width: 0;
+}
+.filter-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+.filter-chip {
+  background: transparent;
+  color: var(--ink-soft);
+  border: 1px solid var(--rule);
+  border-radius: 2rem;
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  font: inherit;
+}
+.filter-chip[aria-pressed='true'] {
+  color: var(--accent);
+  border-color: currentColor;
+}
+.status-card {
+  padding: var(--space-5);
+  margin: var(--space-5) 0;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--accent);
+}
+.status-card h2 {
+  margin-top: 0;
+}
+.entrant-name {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+.leaderboard-table {
+  width: 100%;
+  table-layout: fixed;
+  min-width: 0;
+}
+.leaderboard-table th,
+.leaderboard-table td {
+  overflow-wrap: anywhere;
+  padding: var(--space-3) var(--space-2);
+}
+.leaderboard-table th:nth-child(2) {
+  width: 40%;
+}
+.page,
+.page section,
+.page article,
+.table-wrap,
+details,
+.code-block {
+  min-width: 0;
+  max-width: 100%;
+}
+.page pre {
+  max-width: 100%;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+input[type='file'] {
+  max-width: 100%;
+}
+.empty-state {
+  padding: var(--space-5) 0;
+}
+@media (max-width: 48rem) {
+  .flow {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-2);
+  }
+  .flow li {
+    display: grid;
+    grid-template-columns: 1.25rem 5rem minmax(0, 1fr);
+    gap: var(--space-2);
+    padding-top: var(--space-2);
+  }
+  .flow strong {
+    font-size: 1rem;
+  }
+  .leaderboard-table {
+    font-size: 0.8rem;
+  }
+  .leaderboard-table th,
+  .leaderboard-table td {
+    padding: var(--space-2) 0.2rem;
+  }
+  .status-card {
+    padding: var(--space-4);
+  }
 }

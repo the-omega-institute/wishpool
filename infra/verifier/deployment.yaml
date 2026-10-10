@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wishpool-verifier
+  namespace: wishpool
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wishpool-verifier
+  template:
+    metadata:
+      labels:
+        app: wishpool-verifier
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: verifier
+          image: wishpool-verifier:latest
+          ports:
+            - containerPort: 8081
+          env:
+            - name: HOME
+              value: /opt/verifier
+            - name: TMPDIR
+              value: /scratch
+            - name: WISHPOOL_LEAN_WORKSPACE
+              value: /opt/lean-workspace
+            - name: WISHPOOL_VERIFIER_BIND
+              value: "0.0.0.0:8081"
+            - name: WISHPOOL_VERIFIER_TIMEOUT_SECS
+              valueFrom:
+                configMapKeyRef:
+                  name: wishpool-api
+                  key: WISHPOOL_VERIFIER_TIMEOUT_SECS
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: scratch
+              mountPath: /scratch
+      volumes:
+        - name: scratch
+          emptyDir:
+            sizeLimit: 24Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wishpool-verifier
+  namespace: wishpool
+spec:
+  selector:
+    app: wishpool-verifier
+  ports:
+    - port: 8081
+      targetPort: 8081
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wishpool-verifier
+  namespace: wishpool
+spec:
+  podSelector:
+    matchLabels:
+      app: wishpool-verifier
+  policyTypes: [Ingress, Egress]
+  egress: []
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: wishpool-api
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: wishpool-worker
+      ports:
+        - protocol: TCP
+          port: 8081

@@ -1,4 +1,7 @@
 import { useEffect } from 'react';
+import { ConjecturePage } from './pages/Conjecture';
+import { LeaderboardPage, EntrantPage } from './pages/Leaderboard';
+import { Link } from './routing/router';
 import { Header } from './components/Header';
 import { ConjecturesPage } from './pages/Conjectures';
 import { ContributePage } from './pages/Contribute';
@@ -19,6 +22,12 @@ function titleFor(route: Route): string {
   switch (route.kind) {
     case 'home':
       return 'wishpool';
+    case 'leaderboard':
+      return 'Leaderboard';
+    case 'entrant':
+      return 'Solver';
+    case 'conjecture':
+      return route.record;
     case 'conjectures':
       return 'Conjectures';
     case 'papers':
@@ -54,6 +63,12 @@ function Page({ route }: { route: Route }) {
   switch (route.kind) {
     case 'home':
       return <HomePage />;
+    case 'leaderboard':
+      return <LeaderboardPage />;
+    case 'entrant':
+      return <EntrantPage id={route.id} />;
+    case 'conjecture':
+      return <ConjecturePage record={route.record} claim={route.claim} />;
     case 'conjectures':
       return <ConjecturesPage />;
     case 'papers':
@@ -107,7 +122,9 @@ export function App() {
         <Page route={route} />
       </main>
       <footer className="site-footer">
-        <p>wishpool</p>
+        <p>
+          wishpool · <Link to={{ kind: 'policy' }}>Policy</Link>
+        </p>
       </footer>
     </>
   );

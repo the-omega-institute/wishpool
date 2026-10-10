@@ -4,6 +4,9 @@ export type Route =
   | { kind: 'home' }
   | { kind: 'papers' }
   | { kind: 'conjectures' }
+  | { kind: 'conjecture'; record: string; claim: string }
+  | { kind: 'leaderboard' }
+  | { kind: 'entrant'; id: string }
   | { kind: 'paper'; record: string }
   | { kind: 'policy' }
   | { kind: 'submit' }
@@ -48,6 +51,8 @@ export function parseRoute(pathname: string, search = ''): Route {
 
   if (segments.length === 1) {
     switch (first) {
+      case 'leaderboard':
+        return { kind: 'leaderboard' };
       case 'conjectures':
         return { kind: 'conjectures' };
       case 'papers':
@@ -78,8 +83,12 @@ export function parseRoute(pathname: string, search = ''): Route {
     }
     return notFound;
   }
+  if (segments.length === 3 && first === 'conjectures')
+    return { kind: 'conjecture', record: second as string, claim: segments[2] as string };
   if (segments.length === 2 && second !== undefined) {
     switch (first) {
+      case 'entrants':
+        return { kind: 'entrant', id: second };
       case 'papers':
         return { kind: 'paper', record: second };
       case 'submissions':
@@ -97,6 +106,12 @@ export function routePath(route: Route): string {
   switch (route.kind) {
     case 'home':
       return '/';
+    case 'leaderboard':
+      return '/leaderboard';
+    case 'entrant':
+      return `/entrants/${seg(route.id)}`;
+    case 'conjecture':
+      return `/conjectures/${seg(route.record)}/${seg(route.claim)}`;
     case 'conjectures':
       return '/conjectures';
     case 'papers':

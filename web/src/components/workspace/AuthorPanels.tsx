@@ -354,7 +354,9 @@ export function LeanStatementCard({
 }) {
   const current = submission.versions.at(-1)?.number;
   const claims = submission.claims.filter(
-    (c) => c.role === 'main' && (c.kind === 'conjecture' || c.kind === 'question'),
+    (c) =>
+      (c.kind === 'conjecture' || c.kind === 'question') &&
+      (c.role === 'main' || submission.lean_statements.some((a) => a.claim === c.id)),
   );
   return (
     <section className="lean-statement-card" aria-label="Lean statement">

@@ -143,6 +143,16 @@ impl Worker {
     }
 
     async fn process(&self, job: &LeasedJob) -> Result<bool, Failure> {
+        if job.kind == JobKind::VerifyAttempt {
+            self.ensure_lease(job).await?;
+            self.app
+                .verify_attempt_leased(&self.reviewer, job, self.jobs.as_ref())
+                .await?;
+            return Ok(false);
+        }
+        if job.kind == JobKind::OpenProblems {
+            return self.open_problems_job(job).await;
+        }
         if job.kind == JobKind::LeanStatement {
             return self.lean_statement_job(job).await;
         }
@@ -155,7 +165,10 @@ impl Worker {
             Err(error) => return Err(error.into()),
         };
         match job.kind {
-            JobKind::LeanStatement | JobKind::Referee => unreachable!("referee handled above"),
+            JobKind::OpenProblems
+            | JobKind::VerifyAttempt
+            | JobKind::LeanStatement
+            | JobKind::Referee => unreachable!("referee handled above"),
             JobKind::Compile => self.compile(job, &submission).await,
             JobKind::Stage(Stage::Literature) => self.literature(job, &submission).await,
             JobKind::Stage(Stage::Escape) => self.escape(job, &submission).await,

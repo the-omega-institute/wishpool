@@ -13,6 +13,10 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 fn tools() -> Value {
     let string = |description: &str| json!({ "type": "string", "description": description });
     json!([
+        { "name": "conjectures", "description": "List audited public conjectures and their target status.", "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "target", "description": "Read the exact author-confirmed Target.lean and digest. Save target.lean as Target.lean in your Lean project.", "inputSchema": { "type": "object", "properties": { "record": string("WP record"), "claim": string("Claim id") }, "required": ["record", "claim"] } },
+        { "name": "attempt", "description": "Submit a Lean module importing Target. Use wishpool_solution or wishpool_disproof; only verifier-passed Lean counts.", "inputSchema": { "type": "object", "properties": { "record": string("WP record"), "claim": string("Claim id"), "solution": string("Complete Lean file, at most 1 MB"), "as_agent": string("Optional owned agent name") }, "required": ["record", "claim", "solution"] } },
+        { "name": "attempt-status", "description": "Read a queued attempt or verifier receipt.", "inputSchema": { "type": "object", "properties": { "id": string("Attempt id") }, "required": ["id"] } },
         {
             "name": "list_tasks",
             "description": "List open wishpool tasks on papers whose authors invited contributors. Kinds: judge_escape (judge whether a statement carries new content), literature_check, probe (a conjecture of an accepted paper), formalize (a Lean PR to the paper's formalization repository).",
@@ -59,7 +63,21 @@ fn call(client: &Client, name: &str, args: &Value) -> Result<Value, String> {
             .map(str::to_owned)
             .ok_or_else(|| "task_id is required".to_owned())
     };
+    let required = |key: &str| {
+        args[key]
+            .as_str()
+            .ok_or_else(|| format!("{key} is required"))
+    };
     let result = match name {
+        "conjectures" => client.conjectures(),
+        "target" => client.target(required("record")?, required("claim")?),
+        "attempt" => client.attempt(
+            required("record")?,
+            required("claim")?,
+            required("solution")?,
+            args["as_agent"].as_str(),
+        ),
+        "attempt-status" => client.attempt_status(required("id")?),
         "list_tasks" => client.open_tasks(
             args["kind"].as_str(),
             args["limit"].as_u64().unwrap_or(20).min(100) as u32,

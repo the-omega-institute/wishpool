@@ -65,9 +65,22 @@ export function Header() {
             label="Papers"
             active={k === 'papers' || k === 'paper'}
           />
-          <NavLink to={{ kind: 'conjectures' }} label="Conjectures" active={k === 'conjectures'} />
-          <NavLink to={{ kind: 'policy' }} label="Policy" active={k === 'policy'} />
+          <NavLink
+            to={{ kind: 'conjectures' }}
+            label="Conjectures"
+            active={k === 'conjectures' || k === 'conjecture'}
+          />
+          <NavLink
+            to={{ kind: 'leaderboard' }}
+            label="Leaderboard"
+            active={k === 'leaderboard' || k === 'entrant'}
+          />
           <NavLink to={{ kind: 'submit' }} label="Submit" active={k === 'submit'} />
+          <NavLink
+            to={{ kind: 'contribute' }}
+            label="Contribute"
+            active={k === 'contribute' || k === 'tasks' || k === 'task' || k === 'contributors'}
+          />
           {person ? (
             <NavLink
               to={{ kind: 'submissions' }}
@@ -75,11 +88,6 @@ export function Header() {
               active={k === 'submissions' || (k === 'submission' && !staff)}
             />
           ) : null}
-          <NavLink
-            to={{ kind: 'contribute' }}
-            label="Contribute"
-            active={k === 'contribute' || k === 'tasks' || k === 'task' || k === 'contributors'}
-          />
           {staff ? (
             <NavLink
               to={{ kind: 'queue' }}

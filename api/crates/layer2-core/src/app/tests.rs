@@ -141,6 +141,7 @@ impl World {
             .extracted
             .iter()
             .map(|c| ClaimConfirmation {
+                depends_on_conjectures: vec![],
                 id: c.id.clone(),
                 kind: c.kind,
                 role: c.role,
@@ -494,6 +495,7 @@ async fn authority_and_limits() {
     let editor_author = w.person("ea", &[Role::Editor]).await;
     let paper = w.submit(&author, "t", false).await;
     let confirm = vec![ClaimConfirmation {
+        depends_on_conjectures: vec![],
         id: "C1".into(),
         kind: ClaimKind::Theorem,
         role: ClaimRole::Main,
@@ -512,6 +514,7 @@ async fn authority_and_limits() {
     );
     // At least one proved main result.
     let no_main = vec![ClaimConfirmation {
+        depends_on_conjectures: vec![],
         role: ClaimRole::Supporting,
         ..confirm[0].clone()
     }];
@@ -522,6 +525,7 @@ async fn authority_and_limits() {
             .is_err()
     );
     let excluded = vec![ClaimConfirmation {
+        depends_on_conjectures: vec![],
         excluded: true,
         ..confirm[0].clone()
     }];
@@ -2117,7 +2121,7 @@ async fn lean_statement_confirmation_is_cookie_only_digest_bound_and_voided_on_r
             1,
             paper.claims_revision,
             &"C1".into(),
-            "theorem wishpool_target : True := by sorry".into(),
+            "import Mathlib\ndef wishpool_target_prop : Prop := True\n".into(),
             "Lean test".into(),
             "The conjecture says True.".into(),
             None,
@@ -2197,7 +2201,7 @@ async fn lean_statement_confirmation_is_cookie_only_digest_bound_and_voided_on_r
             1,
             paper.claims_revision,
             &"C1".into(),
-            "theorem wishpool_target : ∀ n : Nat, n = n := by sorry".into(),
+            "import Mathlib\ndef wishpool_target_prop : Prop := ∀ n : Nat, n = n\n".into(),
             "Lean test".into(),
             "Every natural number equals itself.".into(),
             Some(digest),
@@ -2296,6 +2300,7 @@ async fn public_projection_serialization_excludes_all_private_reviews_and_ration
         _ => panic!(),
     };
     let payload = w.app.paper(record).await.unwrap();
+    assert_eq!(payload.summary.new_results, 1);
     assert_eq!(payload.new_content.len(), 1);
     assert_eq!(payload.new_content[0].lemmas, ["The gap estimate"]);
     let text = serde_json::to_string(&payload).unwrap();
@@ -2427,3 +2432,5 @@ async fn conjecture_listing_pages_past_other_kinds_and_private_records_in_record
     assert_eq!(second.items[0].record, original_record.id);
     assert!(second.next_before.is_none());
 }
+
+mod solving;

@@ -10,6 +10,7 @@ mod blobs;
 mod domain;
 mod jobs;
 mod network;
+mod solving;
 
 use futures::TryStreamExt;
 use mongodb::{
@@ -107,6 +108,7 @@ impl MongoStore {
             .create_index(unique(doc! { "id": 1 }))
             .await?;
         network::ensure_indexes(self).await?;
+        solving::ensure_indexes(self).await?;
         Ok(())
     }
 

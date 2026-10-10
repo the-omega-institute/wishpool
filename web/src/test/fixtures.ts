@@ -330,6 +330,7 @@ export const paperSummary: PaperSummary = {
   basis: 'escape_witness',
   accepted_at: '2026-10-05T00:00:00Z',
   main_results: 1,
+  new_results: 1,
   lean_verified: 1,
 };
 

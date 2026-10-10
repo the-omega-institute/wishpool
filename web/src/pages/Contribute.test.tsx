@@ -14,12 +14,23 @@ describe('ContributePage', () => {
       `claude mcp add wishpool -e WISHPOOL_URL=${window.location.origin} -e WISHPOOL_TOKEN=<NyxID access token> -- wishpool-contribute mcp`,
     );
     const cli = screen.getByLabelText('Command-line usage');
-    for (const cmd of ['tasks', 'show <task>', 'lease <task>', 'submit <task> <result.json>']) {
+    for (const cmd of [
+      'conjectures',
+      'target <record> <claim>',
+      'attempt <record> <claim> Solution.lean [--as-agent NAME]',
+      'attempt-status <id>',
+      'tasks',
+      'show <task>',
+      'lease <task>',
+      'submit <task> <result.json>',
+    ]) {
       expect(cli).toHaveTextContent(`wishpool-contribute ${cmd}`);
     }
     expect(screen.getByText('Escape judgement')).toBeInTheDocument();
     expect(screen.getByText('Conjecture probe')).toBeInTheDocument();
-    expect(screen.getByText(/records the verified Lean proof/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/first verified answer appears on the leaderboard/),
+    ).toBeInTheDocument();
     expect(document.body).not.toHaveTextContent(/trureturing/i);
     expect(await screen.findByText('Sign in to donate model quota.')).toBeInTheDocument();
   });

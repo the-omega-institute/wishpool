@@ -36,12 +36,22 @@ pipeline; only their labels differ.
 - **After acceptance**: papers/notes receive the existing private post-letter
   Lean probe; publishing proofs still requires author approval. Accepted
   conjectures receive a Lean target and plain-language reading after the letter.
-  The binary elaborates the Lean statement; `sorry` is allowed only as the final
-  proof of `theorem wishpool_target`. It stores exact text, SHA-256 digest and
-  toolchain. Only the submitting author in a cookie session may confirm the
-  digest or reject it with a correction that feeds regeneration. A new version
-  voids confirmation. Only an author-confirmed statement can be attacked;
-  standalone conjecture attack attempts are Phase B, outside this implementation.
+  The binary elaborates `Target.lean`: `import Mathlib`, confirmed definitions,
+  and `def wishpool_target_prop : Prop := <statement>`. No proof hole is allowed.
+  It stores exact text, SHA-256 digest and pinned Lean/Mathlib revision. Only the
+  submitting author in a cookie session confirms the digest or rejects it with
+  a correction. A new version voids confirmation. Legacy theorem targets are
+  converted mechanically when possible, independently elaborated, and confirmed
+  again; other legacy targets are regenerated.
+- **Open problems from papers**: every author-confirmed conjecture/question in
+  an accepted public paper/note that the paper does not settle is a candidate.
+  A durable, version/claims-revision-fenced job runs a separate GPT Pro conjecture
+  referee and Codex source audit for each claim, using the same sanitizers and
+  Policy well-posed/open/content rule as submitted conjectures. Only passing
+  candidates enter `/conjectures`, with their source record and claim id. The
+  paper's submitting author confirms their exact Lean target. Private paper
+  problems never enter the list. New versions require a fresh check. An admin
+  may trigger checks for already-accepted papers; there is no automatic backfill.
 - **Contributors**: when the author opts in, volunteers do the legwork
   (judgements, literature checks, probes, formalizations) with their own
   model tokens or donated NyxID quota, credited only when verified.
@@ -85,6 +95,7 @@ api/crates/
                    formalization, contribution network, ports, services. No I/O.
   layer3-latex/    Layer 3: unpack, read and compile LaTeX sources.
   layer3-review/   Layer 3: models via the NyxID gateway, OpenAlex.
+  verifier/        stateless, credential-free Lean checker and binary.
   wishpool/        binary: composition, MongoDB (GridFS for files), NyxID
                    sign-in and delegated tokens, workers.
 sdk/contribute/    the contributors' CLI and MCP server.
@@ -255,3 +266,39 @@ from `develop`. No force pushes to either.
   binds. Their children inherit only `PATH` and operator `HOME`, never deployment
   secrets. Codex operates on a fresh source copy with a separate scratch area,
   sandbox network disabled and a deadline; source edits are forbidden.
+
+## 12. Solving and the leaderboard
+
+- Only a verifier-passed Lean proof or disproof of the author-confirmed target
+  counts. The API uses the Layer-3 `Verifier` port and never accepts a client's
+  or model's claim of success. Solutions import `Target` and declare exactly one
+  `wishpool_solution : wishpool_target_prop` or
+  `wishpool_disproof : ¬ wishpool_target_prop`; auxiliary lemmas and definitions
+  may precede it.
+- The verifier builds Target and Solution as separate modules in a fresh copy
+  of the pinned Lean workspace, then independently checks the imported constant
+  against `_root_.wishpool_target_prop` and prints its axioms. Only `propext`,
+  `Classical.choice`, and `Quot.sound` are allowed. Reject axioms, constants,
+  opaque/unsafe declarations, sorry/admit, implementation overrides, extern,
+  macros/notation/syntax/elaborators/initializers, weakened options, executable
+  commands, and imports other than Mathlib and Target.
+- The verifier is stateless and credential-free: cleared environment (PATH and
+  fresh HOME only during compilation), fresh work directory, bounded input and
+  output, and a deadline (default 1200 seconds, maximum 3600). Local workers use
+  a subprocess. Infrastructure uses a separate Deployment with no mounted
+  secrets or service-account token and a NetworkPolicy denying all egress.
+- Attempts are durable leased jobs, private to their owner/staff until verified,
+  limited per entrant and conjecture, and idempotent by entrant, target digest,
+  and solution digest. A revision-fenced write records the verifier receipt.
+  The earliest verifier timestamp wins; an attempt id breaks an exact timestamp
+  tie. Later checked attempts are public as “also verified” and earn no points.
+  The author receives an in-app notification. Public solutions and profiles
+  contain no private notes, referee reports, audit readings, or letters.
+- One leaderboard contains people and pure agents. Every agent is owned by a
+  signed-in person; AI assistance does not change a person's entrant kind.
+  Score is proved plus disproved conjectures, with no votes or stars. Filters
+  select all/people/agents and all time/current UTC month. Equal scores sort by
+  earlier last solve, then entrant id. Public profiles link winning solutions
+  and receipts. Store author-confirmed S1 dependency edges from other public
+  accepted works and their distinct-work downstream count for later weighting;
+  those counts do not affect today's score.

@@ -26,7 +26,7 @@ jobs:
           done
       - name: infra contains only the fixed file list
         run: |
-          expected="infra/api/Dockerfile infra/api/configmap.yaml infra/api/deployment.yaml infra/api/secret.yaml infra/api/service.yaml infra/web/Dockerfile infra/web/deployment.yaml infra/web/nginx.conf infra/web/service.yaml infra/worker/deployment.yaml infra/worker/pvc.yaml"
+          expected="infra/api/Dockerfile infra/api/configmap.yaml infra/api/deployment.yaml infra/api/secret.yaml infra/api/service.yaml infra/web/Dockerfile infra/web/deployment.yaml infra/web/nginx.conf infra/web/service.yaml infra/worker/deployment.yaml infra/worker/pvc.yaml infra/verifier/Dockerfile infra/verifier/deployment.yaml"
           actual=$(find infra -type f | sort | tr '\n' ' ')
           [ "$(echo $expected | tr ' ' '\n' | sort | tr '\n' ' ')" = "$actual" ] || { echo "::error::infra/ diverged: $actual"; exit 1; }
       - name: Layer dependency rule

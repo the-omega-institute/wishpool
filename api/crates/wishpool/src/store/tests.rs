@@ -60,6 +60,8 @@ fn uuid_like() -> String {
 
 fn submission(id: &str, submitter: &str, status: SubmissionStatus) -> Submission {
     Submission {
+        problem_check_requested: false,
+        conjecture_dependencies: vec![],
         kind: wishpool_core::model::SubmissionKind::Paper,
         lean_statements: vec![],
         id: SubmissionId(id.into()),
@@ -242,6 +244,8 @@ async fn paper_flow_against_mongo() {
     };
     let shared = Arc::new(db.store.clone());
     let ports = Ports {
+        solving: shared.clone(),
+        verifier: Arc::new(wishpool_core::ports::UnavailableVerifier),
         clock: Arc::new(SystemClock),
         people: shared.clone(),
         submissions: shared.clone(),
@@ -330,6 +334,7 @@ async fn paper_flow_against_mongo() {
         .extracted
         .iter()
         .map(|c| ClaimConfirmation {
+            depends_on_conjectures: vec![],
             id: c.id.clone(),
             kind: c.kind,
             role: c.role,
@@ -674,5 +679,75 @@ async fn job_renewal_extends_live_lease_and_never_revives_a_stale_token() {
     assert!(current.get("last_error").unwrap().as_null().is_some());
     JobLease::complete(s, &second).await.unwrap();
     assert!(!JobLease::renew(s, &second).await.unwrap());
+    db.drop().await;
+}
+
+#[tokio::test]
+async fn solving_aggregates_and_agent_names_are_unique_and_revision_fenced() {
+    let Some(db) = TestDb::open().await else {
+        return;
+    };
+    let store = &db.store;
+    let agent = Entrant {
+        id: "agent:one".into(),
+        name: "Solver".into(),
+        kind: EntrantKind::Agent,
+        owner: Some(Owner {
+            id: "owner".into(),
+            name: "Owner".into(),
+        }),
+        retired: false,
+        revision: 0,
+    };
+    let duplicate = Entrant {
+        id: "agent:two".into(),
+        ..agent.clone()
+    };
+    let (one, two) = tokio::join!(store.insert_agent(&agent), store.insert_agent(&duplicate));
+    assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+    let mut saved = store.agents().await.unwrap().pop().unwrap();
+    saved.name = "Renamed".into();
+    saved.revision = 1;
+    store.replace_agent(&saved, 0).await.unwrap();
+    assert!(matches!(
+        store.replace_agent(&saved, 0).await,
+        Err(CoreError::StaleRevision { .. })
+    ));
+    assert_eq!(store.agents().await.unwrap()[0].name, "Renamed");
+    let file = SolveFile {
+        id: "WP-2026-0001:C1:v1:c1".into(),
+        record: "WP-2026-0001".into(),
+        submission: "source".into(),
+        claim: "C1".into(),
+        version: 1,
+        claims_revision: 1,
+        revision: 0,
+        admitted: true,
+        failure: None,
+        review_round: 1,
+        task: None,
+        report: None,
+        audit: None,
+        attempts: vec![],
+        dependencies: vec![],
+        downstream: 0,
+    };
+    SolvingStore::insert(store, &file).await.unwrap();
+    assert!(SolvingStore::insert(store, &file).await.is_err());
+    let mut a = file.clone();
+    a.revision = 1;
+    a.downstream = 1;
+    let mut b = file.clone();
+    b.revision = 1;
+    b.downstream = 2;
+    let (one, two) = tokio::join!(
+        SolvingStore::replace(store, &a, 0),
+        SolvingStore::replace(store, &b, 0)
+    );
+    assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+    let stored = SolvingStore::get(store, &file.id).await.unwrap().unwrap();
+    assert_eq!(stored.revision, 1);
+    assert!([1, 2].contains(&stored.downstream));
+    assert_eq!(SolvingStore::all(store).await.unwrap().len(), 1);
     db.drop().await;
 }

@@ -196,7 +196,9 @@ export function Workspace({
           </div>
         ) : null}
 
-        {state === 'accepted' && s.kind === 'conjecture' && isAuthor ? (
+        {state === 'accepted' &&
+        (s.kind === 'conjecture' || s.lean_statements.length > 0) &&
+        isAuthor ? (
           <LeanStatementCard submission={s} onChange={onChange} />
         ) : null}
         {reviewed && (isAuthor || isStaff) ? (

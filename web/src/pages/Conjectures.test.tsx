@@ -8,12 +8,22 @@ describe('public conjectures', () => {
     const listConjectures = vi.fn(async () => ({
       items: [
         {
+          claim: 'C1',
+          source: 'submitted',
+          status: 'open' as const,
+          attempts: 0,
+          solver: null,
           record: 'WP-2026-0003',
           title: 'An open estimate',
           statement: 'For all $n > 1$ ...',
           lean_statement_status: 'confirmed' as const,
         },
         {
+          claim: 'C1',
+          source: 'submitted',
+          status: 'open' as const,
+          attempts: 0,
+          solver: null,
           record: 'WP-2026-0002',
           title: 'A new question',
           statement: 'Is $x$ finite?',
@@ -25,11 +35,14 @@ describe('public conjectures', () => {
     renderWithApp(<ConjecturesPage />, fakeApi({ listConjectures }));
     expect(await screen.findByRole('link', { name: 'An open estimate' })).toHaveAttribute(
       'href',
-      '/papers/WP-2026-0003',
+      '/conjectures/WP-2026-0003/C1',
     );
-    expect(screen.getByText('Lean statement confirmed by author')).toBeInTheDocument();
-    expect(screen.getByText('Lean statement awaiting author')).toBeInTheDocument();
+    expect(screen.getByText(/Target confirmed by author/)).toBeInTheDocument();
+    expect(screen.getByText(/Target awaiting author confirmation/)).toBeInTheDocument();
     expect(screen.queryByText('Lean verified')).not.toBeInTheDocument();
-    expect(listConjectures).toHaveBeenCalledWith({ before: null, limit: 25 }, expect.anything());
+    expect(listConjectures).toHaveBeenCalledWith(
+      { before: null, limit: 25, status: 'open' },
+      expect.anything(),
+    );
   });
 });

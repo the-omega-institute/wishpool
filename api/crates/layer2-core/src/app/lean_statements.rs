@@ -9,6 +9,36 @@ use crate::{
 use sha2::{Digest, Sha256};
 
 impl App {
+    /// Mechanical migration still requires confirmation of the new exact bytes.
+    pub async fn replace_legacy_target(
+        &self,
+        caller: &Caller,
+        id: &SubmissionId,
+        old_digest: &str,
+        converted: Option<(String, String)>,
+    ) -> CoreResult<()> {
+        caller.require(Role::Reviewer)?;
+        let mut s = self.submission(caller, id).await?;
+        let version = s.current_version().unwrap().number;
+        let revision = s.claims_revision;
+        let a = s
+            .lean_statements
+            .iter_mut()
+            .rev()
+            .find(|a| {
+                a.digest == old_digest && a.version == version && a.claims_revision == revision
+            })
+            .ok_or_else(|| CoreError::conflict("legacy target changed"))?;
+        if a.lean.contains("def wishpool_target_prop") {
+            return Ok(());
+        }
+        match converted {
+            Some((lean, toolchain)) => { a.digest = format!("{:x}", Sha256::digest(lean.as_bytes())); a.lean = lean; a.toolchain = toolchain; a.response = LeanStatementResponse::AwaitingAuthor; }
+            None => a.response = LeanStatementResponse::Rejected { comment: "Regenerate this legacy target as import Mathlib plus definitions and def wishpool_target_prop : Prop := <statement>.".into(), at: self.ports.clock.now() },
+        }
+        self.save(&mut s).await
+    }
+
     pub async fn queue_lean_statements(
         &self,
         caller: &Caller,
@@ -16,9 +46,18 @@ impl App {
     ) -> CoreResult<()> {
         caller.require(Role::Reviewer)?;
         let s = self.submission(caller, id).await?;
-        if s.kind != SubmissionKind::Conjecture
-            || !matches!(s.status, SubmissionStatus::Accepted { .. })
-        {
+        if !matches!(s.status, SubmissionStatus::Accepted { .. }) {
+            return Ok(());
+        }
+        if s.kind != SubmissionKind::Conjecture {
+            if self
+                .open_problem_files(caller, id)
+                .await?
+                .iter()
+                .any(|f| f.admitted)
+            {
+                return self.ports.queue.enqueue(id, JobKind::LeanStatement).await;
+            }
             return Ok(());
         }
         let file = self
@@ -56,22 +95,39 @@ impl App {
     ) -> CoreResult<Submission> {
         caller.require(Role::Reviewer)?;
         let mut s = self.submission(caller, id).await?;
-        if s.kind != SubmissionKind::Conjecture
-            || !matches!(s.status, SubmissionStatus::Accepted { .. })
+        if !matches!(s.status, SubmissionStatus::Accepted { .. })
             || s.current_version().map(|v| v.number) != Some(version)
             || s.claims_revision != claims_revision
         {
             return Err(CoreError::conflict("the conjecture inputs changed"));
         }
-        if !s
-            .claim(claim)
-            .is_some_and(|c| c.kind.is_open() && c.role == ClaimRole::Main)
-        {
+        if !s.claim(claim).is_some_and(|c| {
+            c.kind.is_open()
+                && (s.kind == SubmissionKind::Conjecture && c.role == ClaimRole::Main
+                    || !c.has_proof)
+        }) {
             return Err(CoreError::invalid(
                 "target must name a confirmed main conjecture",
             ));
         }
         crate::model::require_text("Lean statement", &lean, 200_000)?;
+        if !lean.starts_with("import Mathlib\n")
+            || !lean.contains("def wishpool_target_prop : Prop :=")
+        {
+            return Err(CoreError::invalid(
+                "target must be a Target.lean proposition module",
+            ));
+        }
+        if s.kind != SubmissionKind::Conjecture {
+            let SubmissionStatus::Accepted { record } = &s.status else {
+                unreachable!()
+            };
+            if !self.solve_file(record, claim).await?.admitted {
+                return Err(CoreError::conflict(
+                    "paper problem has not passed conjecture audit",
+                ));
+            }
+        }
         crate::model::require_text("toolchain", &toolchain, 2_000)?;
         crate::model::require_text("plain-language reading", &reading, 20_000)?;
         let latest = s.lean_statements.iter().rev().find(|a| &a.claim == claim);
@@ -80,20 +136,22 @@ impl App {
         {
             return Err(CoreError::conflict("this target attempt was superseded"));
         }
-        let file = self
-            .ports
-            .referees
-            .get(id)
-            .await?
-            .ok_or_else(|| CoreError::conflict("no delivered letter"))?;
-        if !file.current().is_some_and(|r| {
-            r.version == version
-                && r.claims_revision == claims_revision
-                && r.letter.done().is_some()
-        }) {
-            return Err(CoreError::conflict(
-                "Lean statements follow the delivered letter",
-            ));
+        if s.kind == SubmissionKind::Conjecture {
+            let file = self
+                .ports
+                .referees
+                .get(id)
+                .await?
+                .ok_or_else(|| CoreError::conflict("no delivered letter"))?;
+            if !file.current().is_some_and(|r| {
+                r.version == version
+                    && r.claims_revision == claims_revision
+                    && r.letter.done().is_some()
+            }) {
+                return Err(CoreError::conflict(
+                    "Lean statements follow the delivered letter",
+                ));
+            }
         }
         let digest = format!("{:x}", Sha256::digest(lean.as_bytes()));
         // A rejection must produce a different target; never re-confirm a rejected digest.
@@ -134,9 +192,7 @@ impl App {
                 "confirm your conjecture in a signed-in browser session",
             ));
         }
-        if s.kind != SubmissionKind::Conjecture
-            || !matches!(s.status, SubmissionStatus::Accepted { .. })
-        {
+        if !matches!(s.status, SubmissionStatus::Accepted { .. }) {
             return Err(CoreError::conflict(
                 "only accepted conjectures have Lean statements to confirm",
             ));

@@ -71,7 +71,7 @@ served from the same origin as the API; there is no private route.
    Papers/notes retain approved proof formalization. Conjectures receive an
    independently elaborated Lean target after the delivered letter; the submitting
    author confirms its exact digest in a cookie session or rejects with a correction
-   for regeneration. A new version voids target confirmation. Attacks are Phase B.
+   for regeneration. A new version voids target confirmation. Attempts use only the confirmed Target.lean.
 
 **Threshold** (`GET /policy`, `api/crates/layer2-core/src/policy.rs`): accept
 when some main result carries an escape witness (judged `content`) and the
@@ -119,7 +119,7 @@ well-posed, open, content reading. Human-stage and endorsement gates are unchang
 | POST | `/submissions/{id}/tasks` | editors; the author opted in | → `{ created, existing }` |
 | GET | `/papers` | anyone | → `Listing<PaperSummary>` |
 | GET | `/papers/{record}` | anyone | → `PublicPaper` |
-| GET | `/conjectures?limit=&before=` | anyone | → `Listing<ConjectureSummary>`; accepted public conjectures, newest first |
+| GET | `/conjectures?limit=&before=&status=open\|solved\|disproved` | anyone | → `Listing<ConjectureSummary>`; submitted conjectures and audited paper problems, newest record/claim first |
 | GET | `/tasks?kind=&status=&submission=&holder=` | signed in | → `Listing<Task>` |
 | GET | `/tasks/{id}` | staff; contributors while the author keeps the paper open | → `TaskContext` |
 | POST | `/tasks/{id}/lease` | signed in, not an author | optional `{ mode: "own_agent"\|"hosted" }` → `Task` |
@@ -167,6 +167,7 @@ type Claim = { id: string /* C1, C2, … */; kind: ClaimKind; label: string; lat
   statement: string /* LaTeX */; role: "main" | "supporting"; has_proof: boolean; section?: string;
   depends_on: string[]; settles?: { name: string; source: Source } };
 type ClaimConfirmation = { id: string; kind: ClaimKind; role: "main" | "supporting";
+  depends_on_conjectures?: { record: string; claim: string }[];
   depends_on?: string[]; settles?: { name: string; source: Source } | null; excluded?: boolean };
 type Source = { kind: "doi" | "arxiv" | "hexagon" | "zenodo" | "oeis" | "url" | "personal" | "named_work"; locator: string; year?: number };
 
@@ -252,7 +253,8 @@ type PublicPaper = { summary: PaperSummary;
   macros?: Record<string, string>;
   new_content?: { claim: string; lemmas: string[] }[];
   lean_statements?: { claim: string; lean: string; digest: string; toolchain: string }[] };
-type ConjectureSummary = { record: string; title: string; statement: string; // whitespace-folded to one line
+type ConjectureSummary = { record: string; claim: string; title: string; statement: string;
+  source: string; status: "open" | "solved" | "disproved"; attempts: number; solver: Entrant | null; // whitespace-folded to one line
   lean_statement_status: "none" | "awaiting_author" | "confirmed" };
 type ConjectureReading = {
   well_posed: boolean; well_posed_reason: string;
@@ -312,6 +314,12 @@ type DonationGrant = { donor: string; monthly_cap: number; model: string; period
   mathematical details and PDF remain private.
 
 
+Public list cards include `new_results` (audited correct main content results,
+excluding known results) and `lean_verified`. Conjecture summaries also carry
+kind, authors, acceptance date, source record/claim, status, attempt count and
+current solver. `lean_verified` there counts successful solution checks of the
+current confirmed target; elaborating a target alone adds no proof count.
+
 ## Referee rounds and sent feedback
 
 A referee round binds one `version` and `claims_revision`. Layer 2 enforces
@@ -336,15 +344,17 @@ A completed letter step atomically stores a sent letter: `round` set, assessment
 = audited verdict, sender = auditor, `edited=false`. No SMTP email is sent.
 Formal probes run after delivery only for accepted papers/notes. Accepted
 conjectures use durable `lean_statement` jobs and the same configured Lean
-workspace/formal timeout. The binary elaborates `theorem wishpool_target :
-<statement> := by sorry`, allowing that single final hole and requiring the
-independent compiler/axiom receipt. Source, digest, toolchain and interpretation
+workspace/formal timeout. The binary elaborates `Target.lean`: `import Mathlib`,
+confirmed definitions, and `def wishpool_target_prop : Prop := <statement>`,
+with no proof holes and an independent compiler/axiom receipt. Source, digest, toolchain and interpretation
 are stored; cookie-only author responses bind the current digest and version.
 Bearer authentication (even alongside a cookie) cannot confirm or reject a target;
 missing provenance also refuses confirmation. Wrong/stale digests return 409,
 Bearer returns 403, and blank rejection corrections return 422. A rejection queues
-regeneration with the author's comment. Only author-confirmed targets may be
-attacked; standalone conjecture `taken_up`/`settled` requests conflict in Phase A. No second letter is
+regeneration with the author's comment. An admitted problem from an accepted public
+paper uses its own independent referee/audit report to prepare a target, including
+older papers without a primary delivered letter. Only author-confirmed targets may be
+solved through verifier attempts; editorial `taken_up`/`settled` follow-ups remain private and do not award solve points. No second letter is
 required; publishing proof files still needs author agreement.
 
 Staff receive the full file. Submitter and linked co-authors receive rounds with
@@ -596,3 +606,82 @@ Named works must occur in the source/report material. Missing, invented,
 unsupported or duplicate audit readings become explicit unchecked readings and
 cannot qualify for admission. Reasons, lists and names are bounded, and no
 bibliographic identifier or witness is invented.
+
+## Solving API
+
+| Method | Path | Who | Body → response |
+|---|---|---|---|
+| POST | `/me/agents` | signed in | `{name}` (unique, at most 40 characters) → 201 `Entrant` |
+| GET | `/me/agents` | signed in | → owned `Entrant[]`, including retired agents |
+| PATCH | `/me/agents/{id}` | owner | `{name}` → `Entrant` |
+| DELETE | `/me/agents/{id}` | owner | → retired `Entrant`; previous credit retained |
+| GET | `/me/notifications` | signed in | → own conjectures' winning-solution notifications |
+| POST | `/submissions/{id}/open-problems/check` | admin | → 202; queue existing accepted public paper problems; failed candidate rounds can retry |
+| GET | `/conjectures/{record}/{claim}` | anyone | → `{summary, macros, target, verified_attempts}`; only admitted public conjectures |
+| GET | `/conjectures/{record}/{claim}/target` | anyone | → exact `Target.lean` attachment; 409 until author confirmation |
+| POST | `/conjectures/{record}/{claim}/attempts` | signed in | JSON `{solution, as_agent?, note?}` → 202 `AttemptView` |
+| GET | `/conjectures/{record}/{claim}/attempts` | anyone | → verified attempts, first verifier timestamp first; `also_verified` identifies later successes |
+| GET | `/conjectures/{record}/{claim}/attempts/mine` | owner | → own attempts, including attempts as owned agents |
+| GET | `/attempts/{id}` | owner/staff before verification; anyone after verification while source remains public/current | → `AttemptView` |
+| GET | `/leaderboard?period=all\|month&entrants=all\|people\|agents` | anyone | → `LeaderboardRow[]` |
+| GET | `/entrants/{id}` | anyone | → public entrant and winning solve/disproof list with links and receipts |
+
+An attempt's `solution` is the full UTF-8 Lean module, at most 1,048,576 bytes.
+`note` is at most 2,000 Unicode characters and remains private. `as_agent` accepts
+an owned active agent id or name. Attempts require an admitted conjecture and an
+author-confirmed current target. Same entrant + target digest + solution digest
+returns the existing attempt without consuming another quota slot. The default
+quota is 20 attempts per entrant/conjecture in the preceding 24 hours, configured
+by `WISHPOOL_ATTEMPTS_PER_DAY`; exhaustion returns 409. Wrong ownership and private
+attempts return `not_found`. New versions invalidate target confirmation and
+stale verifier results. Pending attempts on obsolete inputs become private `superseded`
+records with a reason and no verification receipt; reconciliation does not requeue them.
+No endpoint accepts a client-supplied verification receipt.
+
+```ts
+type Entrant = {
+  id: string; name: string; kind: "person" | "agent";
+  owner?: {id: string; name: string}; retired: boolean; revision: number;
+};
+type VerificationReceipt = {
+  verdict: "proved" | "disproved" | "rejected"; reason: string;
+  target_digest: string; solution_digest: string; toolchain: string;
+  axioms: string[]; checked_at: string; duration: number; // milliseconds
+};
+type AttemptView = {
+  id: string; record: string; claim: string; entrant: Entrant;
+  state: "queued" | "proved" | "disproved" | "rejected" | "superseded";
+  reason: string | null; // superseded input explanation
+  receipt: VerificationReceipt | null; solution: string; note?: string; // owner/staff only
+};
+type PublicAttempt = {id: string; entrant: Entrant; receipt: VerificationReceipt;
+  solution: string; also_verified: boolean};
+type LeaderboardRow = {rank: number; entrant: Entrant; solved: number;
+  disproved: number; score: number; last_solve: string};
+```
+
+Score is solved + disproved, with one winning entrant per conjecture. Equal
+scores sort by earlier last solve, then entrant id. `month` is the current UTC
+calendar month. Pure agents share the same board and show their human owner;
+people using AI remain people. Only the verifier timestamp decides the winner.
+Rejected attempts, notes, referee/audit material, and letters never enter public
+payloads. Author-confirmed S1 `depends_on_conjectures` edges are stored separately
+from local claim dependencies and later counted from public accepted works;
+they do not affect today's score. `downstream` counts distinct referring public
+accepted works, retaining each edge's source and target version/claims revision.
+Renaming or retiring an agent preserves its id and earned credit; public views
+resolve the current name and owner.
+
+A solution imports `Target` (optionally also `Mathlib`) and declares exactly one
+`theorem wishpool_solution : wishpool_target_prop` or
+`theorem wishpool_disproof : ¬ wishpool_target_prop`. Auxiliary lemmas/defs may
+precede it. The verifier builds a fresh workspace copy and independently checks
+the imported target constant and standard axioms. Deadline configuration is
+`WISHPOOL_VERIFIER_TIMEOUT_SECS` (1200 default, 3600 maximum). Local composition
+uses `WISHPOOL_VERIFIER_PROGRAM`; `WISHPOOL_VERIFIER_URL` selects the isolated
+service. Public proofs require this check regardless of what a model reports.
+
+CLI: `conjectures`, `target <record> <claim>` (writes Target.lean),
+`attempt <record> <claim> <file> [--as-agent NAME]`, and `attempt-status <id>`.
+The MCP server exposes the same four tool names; its target tool returns source
+and digest for the agent to save. Existing contribution tasks remain available.

@@ -612,6 +612,13 @@ impl Worker {
             return self.defer_referee(job).await;
         }
         if !round.formal.is_settled() {
+            if matches!(submission.status, SubmissionStatus::Accepted { .. })
+                && round.letter.done().is_some()
+            {
+                self.app
+                    .queue_lean_statements(&self.referee_account, &submission.id)
+                    .await?;
+            }
             if submission.kind == wishpool_core::model::SubmissionKind::Conjecture {
                 if matches!(submission.status, SubmissionStatus::Accepted { .. })
                     && round.letter.done().is_some()
@@ -742,40 +749,73 @@ impl Worker {
     }
 
     pub(super) async fn lean_statement_job(&self, job: &LeasedJob) -> Result<bool, Failure> {
-        use wishpool_core::model::{ClaimRole, LeanStatementResponse, SubmissionKind};
+        use wishpool_core::model::{LeanStatementResponse, SubmissionKind};
         let submission = self
             .app
             .submission(&self.referee_account, &job.submission)
             .await?;
-        if submission.kind != SubmissionKind::Conjecture
-            || !matches!(submission.status, SubmissionStatus::Accepted { .. })
-        {
+        if !matches!(submission.status, SubmissionStatus::Accepted { .. }) {
             return Ok(false);
         }
         let Some(formalizer) = &self.formalizer else {
             return Ok(false);
         };
+        if let Some(old) = submission.lean_statements.iter().find(|a| {
+            a.version == submission.current_version().unwrap().number
+                && a.claims_revision == submission.claims_revision
+                && !a.lean.contains("def wishpool_target_prop")
+                && !matches!(a.response, LeanStatementResponse::Rejected { .. })
+        }) {
+            let work = tempfile::tempdir_in(&self.advisor_work_dir)
+                .map_err(|e| Failure::Transient(e.to_string()))?;
+            let converted = match formalizer
+                .elaborate_target(old.claim.as_str(), &old.lean, work.path())
+                .await
+            {
+                Ok(out) => out
+                    .files
+                    .into_iter()
+                    .find(|f| f.compiled)
+                    .map(|f| (f.lean, out.toolchain)),
+                Err(_) => None,
+            };
+            self.ensure_lease(job).await?;
+            self.app
+                .replace_legacy_target(
+                    &self.referee_account,
+                    &submission.id,
+                    &old.digest,
+                    converted,
+                )
+                .await?;
+            self.jobs.defer(job, std::time::Duration::ZERO).await?;
+            return Ok(true);
+        }
         let file = self
             .app
             .referee(&self.referee_account, &submission.id)
             .await?;
-        let Some(round) = file.rounds.last().filter(|r| {
-            r.version == submission.current_version().unwrap().number
-                && r.claims_revision == submission.claims_revision
-        }) else {
-            return Ok(false);
-        };
-        let Some(report) = round.referee.done() else {
-            return Ok(false);
-        };
-        if round.letter.as_ref().and_then(|s| s.done()).is_none() {
+        let primary_report = file
+            .rounds
+            .last()
+            .filter(|r| {
+                r.version == submission.current_version().unwrap().number
+                    && r.claims_revision == submission.claims_revision
+                    && r.letter.as_ref().and_then(|s| s.done()).is_some()
+            })
+            .and_then(|r| r.referee.done());
+        if submission.kind == SubmissionKind::Conjecture && primary_report.is_none() {
             return Ok(false);
         }
         let version = submission.current_version().unwrap().number;
+        let eligible = self
+            .app
+            .open_problem_files(&self.referee_account, &submission.id)
+            .await?;
         for claim in submission
             .claims
             .iter()
-            .filter(|c| c.kind.is_open() && c.role == ClaimRole::Main)
+            .filter(|c| c.kind.is_open() && eligible.iter().any(|f| f.claim == c.id && f.admitted))
         {
             let latest = submission
                 .lean_statements
@@ -786,6 +826,19 @@ impl Worker {
                 Some(LeanStatementResponse::Rejected { comment, .. }) => Some(comment.clone()),
                 Some(_) => continue,
                 None => None,
+            };
+            // A paper problem has its own audited report. Older accepted papers
+            // need no primary referee letter to prepare that independent target.
+            let report = if submission.kind == SubmissionKind::Conjecture {
+                primary_report
+            } else {
+                eligible
+                    .iter()
+                    .find(|f| f.claim == claim.id && f.admitted)
+                    .and_then(|f| f.report.as_ref())
+            };
+            let Some(report) = report else {
+                continue;
             };
             let (prepared, work, _) = self
                 .advisor_input(&submission, report)
@@ -821,7 +874,7 @@ impl Worker {
                 .find(|f| {
                     f.claim == claim.id.as_str()
                         && f.compiled
-                        && f.theorem.as_deref() == Some("wishpool_target")
+                        && f.theorem.as_deref() == Some("wishpool_target_prop")
                 })
                 .ok_or_else(|| {
                     Failure::Transient("no faithful elaborated Lean statement was returned".into())
@@ -858,7 +911,7 @@ impl Worker {
         Ok(true)
     }
 
-    async fn advisor_input(
+    pub(super) async fn advisor_input(
         &self,
         paper: &Submission,
         report: &wishpool_core::model::RefereeReport,

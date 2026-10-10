@@ -50,11 +50,13 @@ pub struct Composition {
 
 impl Composition {
     pub async fn build(config: &Config) -> anyhow::Result<Self> {
-        let (ports, auth_store, jobs, mongo): StorageParts = match &config.storage {
+        let (mut ports, auth_store, jobs, mongo): StorageParts = match &config.storage {
             Storage::Mongo { uri, database } => {
                 let store = MongoStore::connect(uri, database).await?;
                 let shared = Arc::new(store.clone());
                 let ports = Ports {
+                    solving: shared.clone(),
+                    verifier: Arc::new(wishpool_core::ports::UnavailableVerifier),
                     clock: Arc::new(SystemClock),
                     people: shared.clone(),
                     submissions: shared.clone(),
@@ -84,7 +86,27 @@ impl Composition {
             }
         };
 
-        let app = App::new(ports, Policy::default(), config.bootstrap_admins.clone());
+        let timeout = Duration::from_secs(config.verifier_timeout_secs);
+        if let Some(url) = &config.verifier_url {
+            ports.verifier = Arc::new(crate::verifier::HttpVerifier {
+                url: url.clone(),
+                timeout,
+            });
+        } else if let Some(workspace) = &config.lean_workspace {
+            std::fs::create_dir_all(&config.advisor_work_dir)?;
+            ports.verifier = Arc::new(crate::verifier::ProcessVerifier {
+                program: config.verifier_program.clone().into(),
+                workspace: workspace.into(),
+                scratch: config.advisor_work_dir.clone().into(),
+                timeout,
+            });
+        }
+        let app = App::with_attempt_limit(
+            ports,
+            Policy::default(),
+            config.bootstrap_admins.clone(),
+            config.attempts_per_day,
+        );
 
         let provider = match &config.auth {
             AuthMode::NyxId {

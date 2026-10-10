@@ -1,12 +1,13 @@
 import { useCallback } from 'react';
 import type { SubmissionScope } from '../api/client';
 import { useApi } from '../api/context';
+import { useAsync } from '../api/useAsync';
 import { usePaged } from '../api/usePaged';
 import { hasRole, useSession } from '../auth/session';
 import { SubmissionStatusBadge } from '../components/badges';
 import { Pager } from '../components/Pager';
 import { Async, DateText, Loading, SignInPrompt } from '../components/ui';
-import { formatAuthors, SUBMISSION_KIND_LABELS } from '../lib/labels';
+import { formatAuthors, SUBMISSION_KIND_LABELS, newResults } from '../lib/labels';
 import { Link } from '../routing/router';
 
 const COPY: { [K in SubmissionScope]: { title: string; lede: string; empty: string } } = {
@@ -22,6 +23,30 @@ const COPY: { [K in SubmissionScope]: { title: string; lede: string; empty: stri
   },
 };
 
+function newResultCount(s: import('../api/types').Submission): number {
+  const reports = s.reports.filter((r) => r.claims_revision === s.claims_revision).reverse();
+  const escape = reports.find((r) => r.payload.stage === 'escape')?.payload;
+  const literature = reports.find((r) => r.payload.stage === 'literature')?.payload;
+  if (escape?.stage !== 'escape') return 0;
+  return s.claims.filter(
+    (c) =>
+      c.role === 'main' &&
+      c.has_proof &&
+      c.kind !== 'conjecture' &&
+      c.kind !== 'question' &&
+      !(literature?.stage === 'literature' ? literature.prior : []).some(
+        (p) => p.claim === c.id && p.relation !== 'related',
+      ) &&
+      escape.assessments.some(
+        (a) =>
+          a.claim === c.id &&
+          a.correctness === 'correct' &&
+          a.shape === 'content' &&
+          a.witnesses.length > 0,
+      ),
+  ).length;
+}
+
 export function SubmissionsPage({ scope }: { scope: SubmissionScope }) {
   const { session, person } = useSession();
   const api = useApi();
@@ -34,6 +59,11 @@ export function SubmissionsPage({ scope }: { scope: SubmissionScope }) {
   );
   const paged = usePaged(allowed ? fetchPage : null);
   const copy = COPY[scope];
+  const loadNotifications = useCallback(
+    (signal: AbortSignal) => api.notifications({ signal }),
+    [api],
+  );
+  const notifications = useAsync(scope === 'mine' && person ? loadNotifications : null);
 
   return (
     <div className="page">
@@ -57,6 +87,23 @@ export function SubmissionsPage({ scope }: { scope: SubmissionScope }) {
           The review queue is for editors, reviewer accounts and admins.
         </p>
       ) : null}
+      {notifications.state.status === 'ok' && notifications.state.value.length ? (
+        <section aria-label="Conjecture solutions">
+          <h2>Your conjectures have answers</h2>
+          <ul className="entry-list">
+            {notifications.state.value.map((n) => (
+              <li key={n.attempt}>
+                <Link to={{ kind: 'conjecture', record: n.record, claim: n.claim }}>
+                  {n.record} · {n.claim}
+                </Link>
+                <p>
+                  {n.entrant.name} submitted a verified answer. <DateText iso={n.at} />
+                </p>
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
       <Async state={paged.state} onRetry={paged.reload}>
         {(listing) =>
           listing.items.length === 0 ? (
@@ -72,10 +119,14 @@ export function SubmissionsPage({ scope }: { scope: SubmissionScope }) {
                     <span>{SUBMISSION_KIND_LABELS[s.kind]}</span>
                     <SubmissionStatusBadge status={s.status} />
                     <span>{formatAuthors(s.authors)}</span>
-                    <span>
-                      · version {s.versions.length} · {s.claims.length || s.extracted.length}{' '}
-                      statements
-                    </span>
+                    {newResultCount(s) > 0 ? <span>{newResults(newResultCount(s))}</span> : null}
+                    {s.formalization.items.some((i) => i.state.state === 'verified') ? (
+                      <span>
+                        Lean ✓{' '}
+                        {s.formalization.items.filter((i) => i.state.state === 'verified').length}
+                      </span>
+                    ) : null}
+                    <span>· version {s.versions.length}</span>
                     <span>
                       · updated <DateText iso={s.updated_at} />
                     </span>

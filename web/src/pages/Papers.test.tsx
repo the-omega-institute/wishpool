@@ -133,6 +133,6 @@ describe('public paper page', () => {
       'href',
       '/papers/WP-2026-0001',
     );
-    expect(screen.getByText('1 Lean verified')).toBeInTheDocument();
+    expect(screen.getByText('Lean ✓ 1')).toBeInTheDocument();
   });
 });

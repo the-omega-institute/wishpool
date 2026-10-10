@@ -9,6 +9,7 @@ mod health;
 mod latex;
 mod review;
 mod store;
+mod verifier;
 
 use std::time::Duration;
 

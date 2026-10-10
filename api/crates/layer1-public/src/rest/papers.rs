@@ -298,11 +298,21 @@ async fn paper(State(app): AppState, Path(id): Path<String>) -> ApiResult<impl I
     Ok(Json(app.paper(&RecordId(id)).await?))
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConjectureQuery {
+    limit: Option<u32>,
+    before: Option<String>,
+    status: Option<String>,
+}
 async fn list_conjectures(
     State(app): AppState,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<ConjectureQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    Ok(Json(app.list_conjectures(q.limit, q.before).await?))
+    Ok(Json(
+        app.list_conjectures_by_status(q.limit, q.before, q.status)
+            .await?,
+    ))
 }
 
 #[derive(Deserialize)]

@@ -14,6 +14,7 @@ private review material never enters the public projection.
 | `layer1-public` | 1 | `/api/v1` REST projection, including multipart upload and file download |
 | `layer3-latex` | 3 | unpack `.tex`/`.zip`/`.tar.gz` with limits; find the main file, inline `\input`/`\include`, read title, authors, abstract and statement environments; compile with TeX Live |
 | `layer3-review` | 3 | OpenAI-compatible models through the NyxID LLM gateway (escape proposals, statement judgements, relating search candidates; metered usage); OpenAlex search |
+| `wishpool-verifier` | 3 / binary | stateless Lean module checker, source scan, pinned workspace copy, bounded isolated processes, JSON receipt; no database or credentials |
 | `wishpool` | binary | composition, MongoDB stores and GridFS files, NyxID sign-in and delegated tokens, the paper worker (compile, S2 leads, S3 proposals), the hosted donation worker, lease reconciliation |
 | `sdk/contribute` | client | `wishpool-contribute`: CLI and MCP server for contributors' own agents |
 
@@ -112,17 +113,15 @@ Conjectures and questions the paper poses start in `screening` on
 acceptance. An editor moves each to `taken_up` (opening a `probe` task when
 the author opted in), `not_pursued` with a reason, or `settled` with an
 outcome and evidence. These follow-ups remain private review material.
-Standalone conjectures cannot be taken up or settled in Phase A; attacks are
-Phase B and may use only an author-confirmed target.
+Solving uses the independent verifier, rather than editorial follow-up states.
 
-Accepted standalone conjectures queue durable `lean_statement` work after the
-letter. Codex writes `theorem wishpool_target : <statement> := by sorry` plus
-needed definitions and a plain-language reading. The binary independently
-elaborates the exact file in the existing configured Lean workspace and applies
-the proof forbidden-construct scan to every part except that single final proof
-hole. Namespace/section, command, macro, elaborator and initializer constructs
-are also rejected. The checker requires the target's axiom receipt, allowing
-`sorryAx` only in statement mode; proved artifacts still forbid it.
+Accepted standalone conjectures and audited paper problems queue durable
+`lean_statement` work after the letter. Codex writes `Target.lean` with
+`import Mathlib`, definitions, and `def wishpool_target_prop : Prop := ...`,
+plus a plain-language reading. The binary independently elaborates the file
+with no proof holes and rejects executable syntax and nonstandard axioms.
+Legacy final-theorem targets convert mechanically when possible; every changed
+file returns to author confirmation. Others regenerate with a correction.
 
 Layer 2 stores source, SHA-256 of exact UTF-8 bytes, toolchain, reading and
 version/claims revision. The submitting author must use cookie authentication to
@@ -152,10 +151,11 @@ monthly cap.
 
 MongoDB collections: `people`, `submissions`, `endorsements`, `records`,
 `counters`, `tasks`, `contributions`, `judgements`, `donation_grants`,
-`sessions`, `login_attempts`, `review_jobs`, `referee_files`, and the GridFS bucket `papers`
+`sessions`, `login_attempts`, `review_jobs`, `referee_files`, `solve_files`,
+`agent_entrants`, and the GridFS bucket `papers`
 (sources and PDFs; a source may exceed the 16 MB document limit). Every
 aggregate replace is fenced on its revision. Jobs (`compile`,
-`stage:literature`, `stage:escape`, `referee`, `lean_statement`) are upserted per paper and kind, leased
+`stage:literature`, `stage:escape`, `referee`, `lean_statement`, `open_problems`, `verify_attempt`) are upserted per paper and kind, leased
 for thirty minutes, retried with backoff and parked after three attempts.
 
 ## 7. Untrusted input
@@ -313,3 +313,56 @@ audit and projected probe outcomes, with no advice, drafts, provider metadata or
 Lean files. Strangers get `not_found`. CLI backends use operator credentials and
 are refused on non-loopback binds. Referee rounds are disabled unless an Oracle
 backend is configured, with one startup log message.
+
+## 10. Paper problems, attempts, and scoring
+
+A `SolveFile` binds a source record, claim, paper version, and claims revision.
+For accepted public papers/notes, it holds the candidate's separately sanitized
+referee report, Oracle task handle, and Codex audit. The task reference includes
+those inputs and a review round, so uncertain transport admission reuses the
+same identity. Each claim is independently reviewed against the complete paper
+source. `Policy::admits_open_problem` is the shared well-posed/open/content
+predicate. A request marker saved with new acceptance (or an explicit admin
+trigger or an author's explicit switch to public visibility) lets reconciliation repair missed candidate/target enqueues without
+backfilling unrequested legacy papers. Each admitted paper problem uses its own
+report for target preparation, including old papers without a primary letter.
+Reports stay private. Only admitted candidates appear in public
+conjecture projections. Failed candidates can be retriggered by an admin.
+Version uploads invalidate targets and pending results; a new accepted version
+gets new candidate files. Ordinary paper pages retain immutable publication
+inputs, while conjecture pages bind the current accepted source version.
+
+Attempts store solution blobs in GridFS and metadata/receipts on the
+revision-fenced solve aggregate. Submission performs agent-ownership checks,
+validates size/note limits, enforces the preceding-24-hour entrant quota, and
+reuses an attempt for the same entrant/target/solution digest. Each attempt has
+its own `verify_attempt` job. Queue reconciliation repairs an enqueue-after-save
+crash window. The worker renews and rechecks its lease before recording results,
+and rechecks the target after verification. Client/model success claims never
+cross the verifier port. Rejected attempts stay private; verified ones expose
+only public identity, source, and receipt, without the private submission note.
+
+Obsolete pending attempts are terminal private `superseded` records, with a reason
+and no fabricated verifier receipt. Reconciliation repairs missing job enqueues
+only for current inputs. Public entrant names resolve the latest agent/person
+identity; renaming or retiring an agent preserves credited ids.
+
+The Layer-3 adapter uses a bounded subprocess locally or the isolated verifier
+HTTP service. The verifier clears its compiler environment to PATH and a fresh
+HOME, copies the pinned prepared workspace, verifies toolchain/Mathlib identity,
+and builds Target, Solution, then Check as separate modules. Generated `--setup`
+files resolve only pinned artifacts without inherited LEAN_PATH. Check uses the
+imported root target constant, typed `#check`, and `#print axioms`; only the
+three standard axioms pass. All subprocess output is capped, the whole check
+has a deadline, and Lean concurrency is at most two. The service accepts no
+credentials and serializes checks. Its Deployment has no secrets or service
+account token; NetworkPolicy denies every egress destination.
+
+The earliest receipt timestamp (attempt id on an exact tie) selects one winner
+per confirmed target. Public status, in-app author notifications, profile solve
+lists, and leaderboard credit derive from that same winner. Later successes are
+“also verified”. One board ranks people and owned agents by proved + disproved,
+then earlier last solve and entrant id. Month means the current UTC calendar
+month. Visibility and version fences apply to all public solve projections.
+Author-confirmed cross-work S1 dependencies retain source version and claim
+revision, and a distinct-public-work downstream count; weighting is deferred.

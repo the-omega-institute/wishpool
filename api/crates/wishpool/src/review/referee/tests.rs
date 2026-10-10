@@ -61,9 +61,13 @@ impl Oracle for FakeOracle {
             .lock()
             .await
             .push(request.client_ref.clone());
-        assert!(request.prompt.contains("C1") && request.prompt.contains("C2"));
+        if request.client_ref.starts_with("wishpool:problem:") {
+            assert!(request.prompt.contains("C2") && request.pdf.is_none());
+        } else {
+            assert!(request.prompt.contains("C1") && request.prompt.contains("C2"));
+            assert!(request.pdf.is_some());
+        }
         assert!(request.prompt.contains("\"proved\": false"));
-        assert!(request.pdf.is_some());
         if self.submit_error.swap(0, Ordering::SeqCst) != 0 {
             return Err(ReviewError::Transport("uncertain delivery".into()));
         }
@@ -135,12 +139,12 @@ impl Formalizer for FakeFormalizer {
                     .iter()
                     .map(|t| CheckedFile {
                         claim: t.claim.clone(),
-                        theorem: Some("wishpool_target".into()),
+                        theorem: Some("wishpool_target_prop".into()),
                         lean: format!(
-                            "import Mathlib\ntheorem wishpool_target : {suffix} := by sorry\n"
+                            "import Mathlib\ndef wishpool_target_prop : Prop := {suffix}\n"
                         ),
                         compiled: true,
-                        axioms: vec!["sorryAx".into()],
+                        axioms: vec![],
                         note: "Every natural number equals itself.".into(),
                         log: String::new(),
                     })
@@ -384,6 +388,7 @@ impl World {
             .extracted
             .iter()
             .map(|c| ClaimConfirmation {
+                depends_on_conjectures: vec![],
                 id: c.id.clone(),
                 kind: c.kind,
                 role: c.role,
@@ -457,6 +462,19 @@ impl World {
             .await
             .unwrap();
         self.jobs.claim().await.unwrap().unwrap()
+    }
+
+    async fn claim_referee(&self) -> LeasedJob {
+        loop {
+            let job = self.jobs.claim().await.unwrap().expect("referee queued");
+            if job.kind == JobKind::Referee {
+                return job;
+            }
+            self.jobs
+                .defer(&job, Duration::from_secs(24 * 3600))
+                .await
+                .unwrap();
+        }
     }
 
     async fn file(&self) -> wishpool_core::model::RefereeFile {
@@ -620,7 +638,7 @@ async fn formalization_budget_failure_follows_delivered_letter_and_defers_job() 
     // Submit, report, audit, decision + advice, then deliver letter.
     for _ in 0..5 {
         assert!(w.worker.referee_job(&job).await.unwrap());
-        job = w.worker.jobs.claim().await.unwrap().expect("deferred job");
+        job = w.claim_referee().await;
     }
     let started = tokio::time::Instant::now();
     w.worker.handle(job.clone()).await;
@@ -642,7 +660,7 @@ async fn formalization_budget_failure_follows_delivered_letter_and_defers_job() 
     assert!(round.letter.done().is_some());
     assert_eq!(w.advisor.letters.load(Ordering::SeqCst), 1);
 
-    let deferred = w.worker.jobs.claim().await.unwrap().expect("deferred job");
+    let deferred = w.claim_referee().await;
     assert_eq!(deferred.submission, job.submission);
     assert_eq!(deferred.kind, job.kind);
     assert_eq!(deferred.attempts, job.attempts);
@@ -1400,4 +1418,130 @@ async fn conjecture_pipeline_displays_before_letter_then_generates_and_regenerat
         w.formalizer.corrections.lock().await.as_slice(),
         [None, Some("Keep the zero term explicit".into())]
     );
+}
+
+#[tokio::test]
+async fn accepted_paper_problem_runs_independent_referee_audit_and_author_target_confirmation() {
+    use wishpool_core::{
+        model::{AuthenticationMethod, SubmissionStatus},
+        ports::ReviewQueue,
+    };
+    let problem = serde_json::json!({"recommendation":"accept","summary":"Open question in the paper", "claims":[{"claim":"C2","conjecture":{"well_posed":true,"well_posed_reason":"Defined symbols","status":"open","status_reason":"Not settled in the paper","escape":"content","escape_reason":"Needs a new bound"}}]}).to_string();
+    let w = World::new(
+        vec![
+            completed("accept"),
+            Ok(OracleStatus::Completed {
+                text: problem,
+                model: None,
+            }),
+        ],
+        true,
+    )
+    .await;
+    w.run_round().await;
+    for kind in [
+        JobKind::Referee,
+        JobKind::OpenProblems,
+        JobKind::LeanStatement,
+    ] {
+        if let Some(job) = w.jobs.current(&w.paper.id, kind).await {
+            w.jobs.complete(&job).await.unwrap();
+        }
+    }
+    // Keep this test focused on the independently leased candidate job.
+    while let Some(job) = w.jobs.claim().await.unwrap() {
+        w.jobs.complete(&job).await.unwrap();
+    }
+    let paper = w
+        .worker
+        .app
+        .submission(&w.author, &w.paper.id)
+        .await
+        .unwrap();
+    let SubmissionStatus::Accepted { record } = paper.status else {
+        panic!()
+    };
+    assert!(
+        w.worker
+            .app
+            .list_conjectures(None, None)
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    ReviewQueue::enqueue(&*w.stores, &w.paper.id, JobKind::OpenProblems)
+        .await
+        .unwrap();
+    let mut job = w.jobs.claim().await.unwrap().unwrap();
+    assert_eq!(job.kind, JobKind::OpenProblems);
+    for _ in 0..2 {
+        assert!(w.worker.open_problems_job(&job).await.unwrap());
+        job = w.jobs.claim().await.unwrap().unwrap();
+    }
+    assert!(!w.worker.open_problems_job(&job).await.unwrap());
+    w.jobs.complete(&job).await.unwrap();
+    let files = w
+        .worker
+        .app
+        .open_problem_files(&w.worker.reviewer, &w.paper.id)
+        .await
+        .unwrap();
+    assert_eq!(files.len(), 1);
+    assert!(files[0].admitted && files[0].audit.is_some());
+    let listed = w.worker.app.list_conjectures(None, None).await.unwrap();
+    assert_eq!(listed.items.len(), 1);
+    assert_eq!(listed.items[0].claim.as_str(), "C2");
+    assert!(listed.items[0].source.starts_with("from WP-"));
+    // Staff-triggered candidates also work for old accepted papers with no
+    // delivered primary letter; their own independent report supplies context.
+    let mut primary = wishpool_core::ports::RefereeStore::get(&*w.stores, &w.paper.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let expected = primary.revision;
+    primary.rounds.clear();
+    primary.revision += 1;
+    wishpool_core::ports::RefereeStore::replace(&*w.stores, &primary, expected)
+        .await
+        .unwrap();
+    let target_job = w.jobs.claim().await.unwrap().unwrap();
+    assert_eq!(target_job.kind, JobKind::LeanStatement);
+    w.worker.handle(target_job).await;
+    let current = w
+        .worker
+        .app
+        .submission(&w.author, &w.paper.id)
+        .await
+        .unwrap();
+    assert_eq!(current.lean_statements.len(), 1);
+    assert!(w.worker.app.target(&record, &"C2".into()).await.is_err());
+    w.worker
+        .app
+        .respond_lean_statement(
+            &w.author,
+            AuthenticationMethod::CookieSession,
+            &w.paper.id,
+            &current.lean_statements[0].digest,
+            true,
+            String::new(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        w.worker
+            .app
+            .target(&record, &"C2".into())
+            .await
+            .unwrap()
+            .lean
+            .contains("def wishpool_target_prop")
+    );
+    let before = w.oracle.submitted.load(Ordering::SeqCst);
+    ReviewQueue::enqueue(&*w.stores, &w.paper.id, JobKind::OpenProblems)
+        .await
+        .unwrap();
+    let job = w.jobs.claim().await.unwrap().unwrap();
+    assert!(!w.worker.open_problems_job(&job).await.unwrap());
+    assert_eq!(w.oracle.submitted.load(Ordering::SeqCst), before);
 }

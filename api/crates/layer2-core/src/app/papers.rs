@@ -205,6 +205,8 @@ impl App {
         let now = self.ports.clock.now();
         let version = self.new_version(1, &upload, &read, String::new()).await?;
         let submission = Submission {
+            problem_check_requested: false,
+            conjecture_dependencies: vec![],
             kind: new.kind,
             lean_statements: vec![],
             id: SubmissionId(new_uuid()),
@@ -313,6 +315,32 @@ impl App {
                 )));
             }
         }
+        let mut conjecture_dependencies = vec![];
+        for confirmed in confirmations.iter().filter(|c| !c.excluded) {
+            if confirmed.depends_on_conjectures.len() > 100 {
+                return Err(CoreError::invalid(
+                    "at most 100 conjecture dependencies per claim",
+                ));
+            }
+            for target in &confirmed.depends_on_conjectures {
+                let file = self.solve_file(&target.record, &target.claim).await?;
+                if !file.admitted {
+                    return Err(CoreError::invalid(
+                        "dependency must name an admitted public conjecture",
+                    ));
+                }
+                let edge = ConfirmedDependency {
+                    from: confirmed.id.clone(),
+                    target: target.clone(),
+                    target_version: file.version,
+                    target_claims_revision: file.claims_revision,
+                };
+                if !conjecture_dependencies.contains(&edge) {
+                    conjecture_dependencies.push(edge);
+                }
+            }
+        }
+        submission.conjecture_dependencies = conjecture_dependencies;
         validate_claims(&claims)?;
         let has_main = claims.iter().any(|c| {
             if submission.kind == SubmissionKind::Conjecture {
@@ -492,8 +520,18 @@ impl App {
         if visibility == Visibility::Undecided {
             return Err(CoreError::invalid("choose public or private"));
         }
+        let check_problems = visibility == Visibility::Public
+            && submission.analysis_visibility != Visibility::Public
+            && submission.kind != SubmissionKind::Conjecture;
         submission.analysis_visibility = visibility;
+        submission.problem_check_requested |= check_problems;
         self.save(&mut submission).await?;
+        if check_problems {
+            self.ports
+                .queue
+                .enqueue(id, crate::ports::JobKind::OpenProblems)
+                .await?;
+        }
         Ok(submission)
     }
 

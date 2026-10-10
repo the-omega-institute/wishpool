@@ -90,6 +90,14 @@ pub trait Formalizer: Send + Sync {
     fn engine(&self) -> &str;
     fn model(&self) -> &str;
     async fn formalize(&self, input: &FormalInput, work: &Path) -> ReviewResult<FormalOut>;
+    async fn elaborate_target(
+        &self,
+        _claim: &str,
+        _lean: &str,
+        _work: &Path,
+    ) -> ReviewResult<FormalOut> {
+        Err(ReviewError::Output("target elaboration unavailable".into()))
+    }
 }
 
 pub struct CodexLean {
@@ -145,9 +153,9 @@ impl CodexLean {
             .and_then(|manifest| {
                 manifest["packages"].as_array()?.iter().find_map(|p| {
                     (p["name"] == "mathlib").then(|| {
-                        p["inputRev"]
+                        p["rev"]
                             .as_str()
-                            .or(p["rev"].as_str())
+                            .or(p["inputRev"].as_str())
                             .unwrap_or("unknown")
                             .to_string()
                     })
@@ -200,6 +208,7 @@ impl CodexLean {
         command
             .env("LEAN_PATH", &env.lean_path)
             .current_dir(dir)
+            .args(["-j", "2"])
             .arg(&path);
         let output = match tokio::time::timeout(self.check_timeout, command.output()).await {
             Ok(Ok(output)) => output,
@@ -225,10 +234,16 @@ impl CodexLean {
                     .iter()
                     .filter(|a| {
                         !(STANDARD_AXIOMS.contains(&a.as_str())
-                            || conjecture && a.as_str() == "sorryAx")
+                            || conjecture
+                                && !lean.contains("def wishpool_target_prop")
+                                && a.as_str() == "sorryAx")
                     })
                     .collect();
-                if extra.is_empty() && (!conjecture || axioms.iter().any(|a| a == "sorryAx")) {
+                if extra.is_empty()
+                    && (!conjecture
+                        || lean.contains("def wishpool_target_prop")
+                        || axioms.iter().any(|a| a == "sorryAx"))
+                {
                     file.compiled = true;
                 } else {
                     file.log = format!(
@@ -257,6 +272,25 @@ impl Formalizer for CodexLean {
         self.model.as_deref().unwrap_or("codex-default")
     }
 
+    async fn elaborate_target(
+        &self,
+        claim: &str,
+        lean: &str,
+        work: &Path,
+    ) -> ReviewResult<FormalOut> {
+        let env = self.env().await?;
+        std::fs::create_dir_all(work).map_err(io_error)?;
+        let lean = wishpool_verifier::convert_target(lean).map_err(ReviewError::Output)?;
+        let file = self
+            .check(&env, work, claim, Some("wishpool_target_prop"), &lean, true)
+            .await;
+        Ok(FormalOut {
+            toolchain: env.toolchain,
+            files: vec![file],
+            summary: "Mechanically converted the legacy target into a proposition module.".into(),
+        })
+    }
+
     async fn formalize(&self, input: &FormalInput, work: &Path) -> ReviewResult<FormalOut> {
         let env = self.env().await?;
         let source = work.join("source");
@@ -273,7 +307,7 @@ impl Formalizer for CodexLean {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/sh\nLEAN_PATH='{}' exec '{}' \"$@\"\n",
+                "#!/bin/sh\nLEAN_PATH='{}' exec '{}' -j 2 \"$@\"\n",
                 env.lean_path.replace('\'', ""),
                 env.lean.display()
             ),
@@ -345,6 +379,16 @@ impl Formalizer for CodexLean {
             } else {
                 reported.map(|f| f.theorem.trim()).filter(|t| !t.is_empty())
             };
+            let lean = if input.conjecture {
+                wishpool_verifier::convert_target(&lean).unwrap_or(lean)
+            } else {
+                lean
+            };
+            let theorem = if input.conjecture {
+                Some("wishpool_target_prop")
+            } else {
+                theorem
+            };
             let mut file = self
                 .check(
                     &env,
@@ -413,6 +457,9 @@ fn forbidden(lean: &str) -> Option<String> {
 /// Allow one proof hole only as the final proof of the exact target declaration.
 /// Scan all preceding definitions with the same proof-verification exclusions.
 fn forbidden_target(lean: &str) -> Option<String> {
+    if lean.contains("def wishpool_target_prop : Prop :=") {
+        return wishpool_verifier::validate_target(lean).err();
+    }
     let Some(prefix) = lean.trim_end().strip_suffix(":= by sorry") else {
         return Some("the target must end with exactly `:= by sorry`".into());
     };

@@ -101,6 +101,10 @@ pub enum AdvisorConfig {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub verifier_program: String,
+    pub verifier_url: Option<String>,
+    pub verifier_timeout_secs: u64,
+    pub attempts_per_day: usize,
     pub bind: SocketAddr,
     /// The browser-facing origin, e.g. `https://wishpool.example.org`.
     pub public_url: Url,
@@ -385,6 +389,19 @@ impl Config {
         };
 
         Ok(Self {
+            verifier_program: get("WISHPOOL_VERIFIER_PROGRAM")
+                .unwrap_or_else(|| "wishpool-verifier".into()),
+            verifier_url: get("WISHPOOL_VERIFIER_URL"),
+            verifier_timeout_secs: get("WISHPOOL_VERIFIER_TIMEOUT_SECS")
+                .map(|v| v.parse::<u64>())
+                .transpose()?
+                .unwrap_or(1200)
+                .clamp(1, 3600),
+            attempts_per_day: get("WISHPOOL_ATTEMPTS_PER_DAY")
+                .map(|v| v.parse::<usize>())
+                .transpose()?
+                .unwrap_or(20)
+                .max(1),
             bind,
             public_url,
             storage,

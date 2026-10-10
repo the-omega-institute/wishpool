@@ -607,6 +607,8 @@ impl App {
 
     /// Composition-only: return expired leases to the pool.
     pub async fn reconcile(&self) -> CoreResult<Reconciliation> {
+        self.reconcile_attempts().await?;
+        self.refresh_dependency_counts().await?;
         let now = self.ports.clock.now();
         let mut outcome = Reconciliation::default();
         for mut task in self.ports.tasks.expired_leases(now, 500).await? {

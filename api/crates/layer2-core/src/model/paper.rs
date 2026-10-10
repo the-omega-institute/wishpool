@@ -250,6 +250,12 @@ pub struct PublishedProgress {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Submission {
+    /// Explicitly requested at new acceptance or by staff; legacy documents do
+    /// not opt into a backfill merely because reconciliation visits them.
+    #[serde(default)]
+    pub problem_check_requested: bool,
+    #[serde(default)]
+    pub conjecture_dependencies: Vec<super::ConfirmedDependency>,
     #[serde(default)]
     pub kind: SubmissionKind,
     #[serde(default)]
@@ -354,6 +360,8 @@ impl NewPaper {
 /// The author's confirmation of one extracted statement.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimConfirmation {
+    #[serde(default)]
+    pub depends_on_conjectures: Vec<super::ConjectureRef>,
     pub id: ClaimId,
     pub kind: ClaimKind,
     pub role: ClaimRole,

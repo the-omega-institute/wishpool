@@ -9,6 +9,7 @@ export interface ConfirmRow {
   role: ClaimRole;
   dependsOn: string[];
   excluded: boolean;
+  conjectureInput?: string;
   settles?: Settles;
 }
 
@@ -16,11 +17,20 @@ export interface ConfirmRow {
 export function initialRows(
   extracted: readonly Claim[],
   confirmed: readonly Claim[] = [],
+  dependencies: { from: string; target: { record: string; claim: string } }[] = [],
 ): ConfirmRow[] {
   return extracted.map((c) => {
     const earlier = confirmed.find((x) => x.id === c.id);
     const source = earlier ?? c;
     return {
+      ...(dependencies.some((d) => d.from === c.id)
+        ? {
+            conjectureInput: dependencies
+              .filter((d) => d.from === c.id)
+              .map((d) => `${d.target.record}:${d.target.claim}`)
+              .join(', '),
+          }
+        : {}),
       id: c.id,
       kind: source.kind,
       role: source.role,
@@ -89,6 +99,14 @@ export function buildConfirmations(
   if (kept.length === 0) return fail('Keep at least one statement.');
   const keptIds = new Set(kept.map((r) => r.id));
   for (const r of kept) {
+    if (
+      r.conjectureInput?.trim() &&
+      r.conjectureInput
+        .split(/[\s,]+/)
+        .filter(Boolean)
+        .some((x) => !/^WP-\d{4}-\d{4,}:[A-Za-z0-9_-]{1,32}$/.test(x))
+    )
+      return fail(`Use record:claim references such as WP-2026-0001:C1 for ${r.id}.`);
     if (r.dependsOn.includes(r.id)) return fail(`${r.id} cannot depend on itself.`);
     const missing = r.dependsOn.find((d) => !keptIds.has(d));
     if (missing !== undefined) return fail(`${r.id} depends on ${missing}, which is excluded.`);
@@ -112,6 +130,14 @@ export function buildConfirmations(
         role: r.role,
         depends_on: r.dependsOn,
       };
+      if (r.conjectureInput?.trim())
+        c.depends_on_conjectures = r.conjectureInput
+          .split(/[\s,]+/)
+          .filter(Boolean)
+          .map((x) => {
+            const [record, claim] = x.split(':');
+            return { record: record!, claim: claim! };
+          });
       if (r.settles) {
         c.settles = {
           name: r.settles.name.trim(),

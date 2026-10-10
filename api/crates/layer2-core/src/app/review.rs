@@ -399,7 +399,22 @@ impl App {
             }
         }
         submission.decision = Some(decision);
+        if matches!(submission.status, SubmissionStatus::Accepted { .. })
+            && submission.kind != SubmissionKind::Conjecture
+            && submission.analysis_visibility == Visibility::Public
+        {
+            submission.problem_check_requested = true;
+        }
         self.save(&mut submission).await?;
+        if matches!(submission.status, SubmissionStatus::Accepted { .. })
+            && submission.kind != SubmissionKind::Conjecture
+            && submission.analysis_visibility == Visibility::Public
+        {
+            self.ports
+                .queue
+                .enqueue(&submission.id, crate::ports::JobKind::OpenProblems)
+                .await?;
+        }
         Ok(submission)
     }
 }
